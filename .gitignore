@@ -1,0 +1,12 @@
+# Compilazione
+build/
+build-*/
+out/
+.vs/
+*.log
+*.exe
+*.obj
+*.pdb
+
+# Campioni audio generati durante le prove delle voci (si rifanno con iris_tests --voce-file / --effetto)
+campioni-voce/
