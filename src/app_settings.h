@@ -9,7 +9,6 @@
 struct AppSettings {
     // --- Tu ---------------------------------------------------------------------
     std::string userName;     // come ti chiama Iris (vuoto = non usa il nome)
-    std::string homeCity;     // per il meteo quando non dici la città
 
     // --- Ascolto ----------------------------------------------------------------
     bool wakeWordEnabled = true;          // sempre in ascolto: si sveglia con "Iris"
@@ -35,7 +34,6 @@ struct AppSettings {
     // --- Cervello -------------------------------------------------------------------
     std::string llmModelFile;             // vuoto = Qwen2.5-7B-Instruct-Q4_K_M.gguf
     int gpuMemoryLimitMb = -1;            // -1 = senza limite, 0 = tutto sul processore
-    bool internetEnabled = true;          // ricerche, pagine web, meteo
     bool gameEnabled = true;              // comandi di Star Citizen quando il gioco è aperto
 
     // --- Overlay e finestra -------------------------------------------------------------
@@ -44,6 +42,38 @@ struct AppSettings {
     int overlaySize = 160; // la sfera fluttuante: lato in pixel (a 96 DPI)
     int overlayX = -1, overlayY = -1;
     int windowX = -1, windowY = -1;
+    int windowW = -1, windowH = -1;       // dimensione della finestra (a 96 DPI; -1 = quella di partenza)
+
+    // --- Aggiornamenti ------------------------------------------------------------------
+    bool autoUpdate = true;               // controlla e scarica da solo le versioni nuove (GitHub)
+
+    // --- Avvio e area di notifica (l'avvio con Windows sta nel registro: vedi autostart.h) ---
+    bool greetOnStart = false;            // "Ciao, sono online e pronta" quando i modelli sono caricati
+    bool closeToTray = true;              // la X nasconde la finestra nell'area di notifica (Esci dal menu dell'icona)
+
+    // --- Barra rapida nel gioco (come la barra di citizen-assistant) -----------------------
+    bool quickBarEnabled = true;
+    std::vector<TalkTrigger> quickBarTriggers; // mostra/nascondi la barra (predefinito: Num /)
+    std::vector<TalkTrigger> hideAllTriggers;  // nasconde tutto quello di Iris sullo schermo (predefinito: Num *)
+    // I pannelli sopra il gioco: aperti o no, e dove (-1 = sotto la barra).
+    bool panelMissionsOpen = false, panelRefineryOpen = false, panelLogOpen = false;
+    int panelMissionsX = -1, panelMissionsY = -1;
+    int panelRefineryX = -1, panelRefineryY = -1;
+    int panelLogX = -1, panelLogY = -1;
+
+    // --- Diario di bordo: lettura del Game.log ----------------------------------------------
+    // ATTENZIONE: la lettura del Game.log è vietata dai Termini di Servizio di Star Citizen.
+    // Spenta in partenza; si accende solo dopo l'avviso, consapevolmente e a rischio dell'utente.
+    bool gameLogEnabled = false;
+    bool gameLogAccepted = false;          // avviso letto e accettato (quando l'ha accesa)
+    std::string gameLogPath;               // vuoto = trovalo da solo (LIVE, PTU...)
+    bool gameLogSpeakContracts = true;     // a voce: contratti accettati, completati, falliti
+    bool gameLogSpeakHealth = true;        // a voce: ferite, stati (disidratato...), soccorsi
+    bool gameLogSpeakZones = false;        // a voce: armistizio, spazio monitorato
+    bool gameLogSpeakParty = true;         // a voce: un compagno in quantum verso di te
+
+    // --- Raffineria (timer) ------------------------------------------------------------------
+    bool refinerySpeak = true;             // avvisa a voce quando un ordine è pronto
 
     // --- Chat di gioco (le funzioni di Voice to Chat, stessi nomi delle sue impostazioni) ---
     bool chatEnabled = true;                // detta in chat col suo tasto
@@ -64,10 +94,31 @@ struct AppSettings {
     int ocrTargetLanguageIndex = 0;
     std::string chatFilterTag;
     int ocrRegionX = -1, ocrRegionY = -1, ocrRegionW = -1, ocrRegionH = -1;
+    double ocrRegionAngle = 0.0;            // zona girata (gradi, + = senso orario): l'HUD segue la curva del casco
     int ocrOverlayX = -1, ocrOverlayY = -1; // -1 = sotto la zona letta
     int ocrOverlayOpacity = 235;
     int ocrMaxMessages = 6;
     bool voiceToChatImported = false; // impostazioni di Voice to Chat già importate (una volta sola)
+
+    // --- Mining (Mining Signature Calculator + mining_ocr dentro Iris) ----------------
+    bool miningEnabled = true;                     // letture col tasto, a voce, risultato a schermo
+    std::vector<TalkTrigger> miningScanTriggers;   // leggi la signature (predefinito: Num +)
+    std::vector<TalkTrigger> miningManualTriggers; // inserimento manuale dal tastierino (predefinito: Num -)
+    std::vector<TalkTrigger> miningBorderTriggers; // contorno della zona sì/no
+    std::vector<TalkTrigger> miningToggleTriggers; // mining acceso/spento
+    int miningRegionX = -1, miningRegionY = -1, miningRegionW = -1, miningRegionH = -1;
+    int miningOverlayX = -1, miningOverlayY = -1;  // -1 = accanto alla zona letta
+    int miningOverlayOpacity = 235;                // opacità dello sfondo del riquadro (0 = solo le scritte)
+    int miningOverlayTextOpacity = 255;            // opacità delle scritte
+    int miningOverlaySeconds = 20;                 // quanto resta a schermo il risultato
+    bool miningOverlayBasic = false;               // informazioni base: solo materiale e quantità
+    bool miningShowBorder = true;                  // contorno della zona (fuori dalla zona, non letto)
+    bool miningAuto = false;                       // lettura continua con Star Citizen in primo piano
+    int miningIntervalMs = 1000;
+    bool miningSaveImages = false;                 // immagini dell'ultima lettura in %appdata%\Iris\debug\mining
+    int miningMaxQuantity = 40;                    // rocce/pezzi al massimo in una signature
+    bool miningSpeak = false;                      // dice a voce il minerale trovato (una volta per roccia)
+    bool miningLogCsv = false;                     // registro delle scansioni: anche il CSV per Excel, oltre al JSON
 
     static AppSettings load();
     bool save() const;

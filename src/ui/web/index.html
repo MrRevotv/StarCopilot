@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iris</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="backdrop" aria-hidden="true"></div>
+
+<div class="app">
+  <!-- ================================================================== Barra laterale -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+        <polygon points="20,2 37,11 37,29 20,38 3,29 3,11" class="hex"/>
+        <circle cx="20" cy="20" r="7" class="core"/>
+        <circle cx="20" cy="20" r="12" class="ring"/>
+      </svg>
+      <div>
+        <div class="brand-name">IRIS</div>
+        <div class="brand-sub">Copilota di bordo · <span id="version">—</span></div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-group">Ponte</div>
+      <button class="nav-item" data-page="home"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg><span>Iris</span></button>
+      <div class="nav-group">Operazioni</div>
+      <button class="nav-item" data-page="game"><svg viewBox="0 0 24 24"><path d="M12 2l4 9-4 11-4-11z"/><path d="M8 11H3l5 4M16 11h5l-5 4"/></svg><span>Star Citizen</span><i class="nav-led" id="led-game"></i></button>
+      <button class="nav-item" data-page="mining"><svg viewBox="0 0 24 24"><path d="M6 3h12l4 6-10 12L2 9z"/><path d="M2 9h20M9 3l3 18 3-18"/></svg><span>Mining</span></button>
+      <button class="nav-item" data-page="axis"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18"/><path d="M12 3v18M3 12h18"/><circle cx="15.5" cy="8.5" r="2.2"/></svg><span>Axis Visualizer</span><i class="nav-led" id="led-axis"></i></button>
+      <button class="nav-item" data-page="log"><svg viewBox="0 0 24 24"><path d="M6 3h10l3 3v15H6z"/><path d="M9 8h7M9 12h7M9 16h4"/><path d="M6 3v18"/></svg><span>Diario di bordo</span><i class="nav-led" id="led-log"></i></button>
+      <div class="nav-group">Comunicazioni</div>
+      <button class="nav-item" data-page="chat"><svg viewBox="0 0 24 24"><path d="M4 5h16v10H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg><span>Chat di gioco</span></button>
+      <button class="nav-item" data-page="screen"><svg viewBox="0 0 24 24"><path d="M3 7V3h4M17 3h4v4M21 17v4h-4M7 21H3v-4"/><path d="M7 10h10M7 14h6"/></svg><span>Traduzione chat</span></button>
+      <button class="nav-item" data-page="filtered"><svg viewBox="0 0 24 24"><path d="M3 4h18l-7 8v7l-4 2v-9z"/></svg><span>Messaggi filtrati</span><i class="nav-count" id="count-filtered"></i></button>
+      <div class="nav-group">Sistema</div>
+      <button class="nav-item" data-page="voice"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg><span>Ascolto e voce</span></button>
+      <button class="nav-item" data-page="settings"><svg viewBox="0 0 24 24"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7z"/><circle cx="12" cy="12" r="3.5"/></svg><span>Impostazioni</span><i class="nav-led amber" id="led-update"></i></button>
+    </nav>
+
+    <div class="update-card hidden" id="update-card">
+      <div class="update-title">Aggiornamento <span id="update-card-version"></span></div>
+      <div class="progress hidden" id="update-card-progress"><i></i></div>
+      <div class="update-text" id="update-card-text"></div>
+      <button class="btn primary small" id="update-card-install">Riavvia e aggiorna</button>
+    </div>
+
+    <div class="status" id="status">
+      <div class="status-head"><i class="dot"></i><span class="status-label" id="status-label">AVVIO</span></div>
+      <div class="status-text" id="status-text">Preparo i sistemi…</div>
+    </div>
+  </aside>
+
+  <!-- ================================================================== Pagine -->
+  <main class="main" id="main">
+
+    <!-- ------------------------------------------------------------- Iris -->
+    <section class="page" data-page="home">
+      <header class="page-head">
+        <div><h1>Iris</h1><p>Il ponte di comando: parla con lei o scrivile qui.</p></div>
+        <div class="head-chips" id="home-chips"></div>
+      </header>
+      <div class="home">
+        <div class="panel orb-panel">
+          <canvas id="orb" aria-hidden="true"></canvas>
+          <div class="orb-state" id="orb-state">AVVIO</div>
+          <div class="orb-detail" id="orb-detail"></div>
+          <div class="orb-heard" id="orb-heard"></div>
+          <button class="btn primary hidden" id="retry">Riprova</button>
+        </div>
+        <div class="panel convo-panel">
+          <div class="panel-title">Conversazione <span class="panel-meta">doppio clic su un messaggio per copiarlo</span></div>
+          <div class="convo" id="convo"></div>
+          <form class="composer" id="composer">
+            <input type="text" id="composer-input" maxlength="2000" autocomplete="off" placeholder="Scrivi a Iris…  (Invio per mandare)">
+            <button class="btn primary" type="submit">Invia</button>
+          </form>
+          <div class="btn-row">
+            <button class="btn" id="stop">Zitta</button>
+            <button class="btn" id="new-convo">Nuova conversazione</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Star Citizen -->
+    <section class="page" data-page="game">
+      <header class="page-head">
+        <div><h1>Star Citizen</h1><p>Comandi della nave, rotta sulla mappa stellare, calibrazione.</p></div>
+        <div class="head-chips"><span class="chip" id="game-chip">—</span></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Stato del gioco</div>
+          <div class="callout" id="game-status">—</div>
+          <div class="row"><div class="row-text"><b>Comandi di gioco attivi</b><small>Quando Star Citizen è aperto, Iris preme i tasti per te.</small></div><label class="switch"><input type="checkbox" data-set="gameEnabled"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Modalità prova</b><small>Scrive cosa farebbe, senza premere tasti.</small></div><label class="switch"><input type="checkbox" id="dry-run"><i></i></label></div>
+          <div class="btn-row">
+            <button class="btn" data-action="openProfile">Modifica il profilo a mano</button>
+            <button class="btn" data-action="gameReload">Ricarica</button>
+            <button class="btn" data-action="openOcrImages">Immagini dell'OCR</button>
+          </div>
+          <div class="note bad" id="profile-error"></div>
+          <p class="note">Gioca in finestra senza bordi. Dì «Iris, carrello», «Iris, rotta per Crusader», «Iris, prepara la nave»… (o tieni premuto il tasto per parlare). Le frasi del profilo partono subito; le altre le capisce il modello. Controlla che i tasti del profilo siano i tuoi (in gioco: Opzioni › Comandi).</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Prova un comando</div>
+          <form class="inline-form" id="game-test">
+            <input type="text" maxlength="300" placeholder="es. rotta per Seraphim, carrello, scudi">
+            <button class="btn primary" type="submit">Prova</button>
+          </form>
+          <div class="note" id="game-test-result"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Ultime azioni</div>
+          <div class="log" id="game-log"></div>
+          <div class="btn-row"><button class="btn small" data-action="openUnknownPhrases">Apri le frasi non capite</button></div>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">Comandi <span class="panel-meta" id="cmd-count"></span></div>
+          <div class="cmd-tools">
+            <input type="text" id="cmd-search" maxlength="60" spellcheck="false" placeholder="Cerca una frase o un tasto…" aria-label="Cerca nei comandi">
+            <button class="btn primary" id="cmd-new">+ Nuovo comando</button>
+          </div>
+          <div class="cmd-quick"><span class="field-label">Aggiunta rapida</span><div class="cmd-presets" id="cmd-presets"></div></div>
+          <div class="cmd-list" id="cmd-list"></div>
+          <p class="note">Il tasto è quello che usi tu in gioco (Opzioni › Comandi): premilo e Iris lo scrive da sola, anche con Alt, Ctrl o Shift. Le frasi si dicono dopo «Iris»; i modi diversi di dirle li capisce il modello. Tutto finisce nel profilo dei comandi, che resta modificabile anche a mano.</p>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">Mappa stellare <span class="panel-meta">calibrazione con F8</span></div>
+          <p class="note">Premi Calibra: porto io Star Citizen davanti. Apri la mappa stellare, porta il mouse sul punto e premi F8; per le zone F8 sull'angolo in alto a sinistra e poi su quello in basso a destra. A ogni F8 senti un suono, alla fine torno qui col risultato. Leggi mostra cosa vede l'OCR in quella zona.</p>
+          <div class="zones" id="zones"></div>
+          <div class="readout" id="calibration">Nessuna calibrazione in corso.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Mining -->
+    <section class="page" data-page="mining">
+      <header class="page-head">
+        <div><h1>Mining</h1><p>La signature dello scanner, tradotta in materiale e quantità.</p></div>
+        <div class="head-chips"><span class="chip" id="mining-chip">—</span></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Lettura</div>
+          <div class="reading" id="mining-last"><span class="reading-label">Ultima lettura</span><span class="reading-value">—</span></div>
+          <div class="row"><div class="row-text"><b>Mining attivo</b><small>Tasti, voce («Iris, che minerale è?») e risultato a schermo.</small></div><label class="switch"><input type="checkbox" data-set="miningEnabled"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Zona da leggere</b><small id="mining-region">Nessuna zona scelta.</small></div><button class="btn primary" data-action="chooseMiningRegion">Scegli la zona</button></div>
+          <div class="row"><div class="row-text"><b>Contorno della zona sul gioco</b><small>Sta fuori dalla zona: non viene mai letto.</small></div><label class="switch"><input type="checkbox" data-set="miningShowBorder"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Lettura continua</b><small>Ogni secondo, solo con Star Citizen in primo piano.</small></div><label class="switch"><input type="checkbox" data-set="miningAuto"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Annuncia a voce il minerale</b><small>«Borase per 3»: una volta per roccia, solo se la lettura è certa e senza alternative.</small></div><label class="switch"><input type="checkbox" data-set="miningSpeak"><i></i></label></div>
+          <div class="btn-row"><button class="btn" id="mining-scan">Leggi tra 3 secondi</button><span class="note inline">il tempo di tornare al gioco</span></div>
+          <p class="note">Scegli una zona un po' più larga del badge (segnaposto + numero): il badge lo trova da sola, con qualsiasi colore dell'HUD.</p>
+          <div class="note" id="mining-ocr"></div>
+        </div>
+
+        <div class="panel span-2" id="mlog-panel">
+          <div class="panel-title">Registro delle scansioni <span class="panel-meta">file JSON sul desktop, pronto per il sito</span></div>
+          <div class="row"><div class="row-text"><b>Registra le scansioni</b><small id="mlog-state">Ogni roccia letta (tasto, lettura continua, voce, tastierino, barra rapida) finisce nel registro. Alla fine ti chiedo il luogo e la qualità media e salvo il file sul desktop.</small></div><label class="switch"><input type="checkbox" id="mlog-switch"><i></i></label></div>
+          <div class="mlog-live hidden" id="mlog-live">
+            <div class="mlog-stats" id="mlog-stats"></div>
+            <div class="mlog-totals" id="mlog-totals"></div>
+            <div class="feed mlog-feed" id="mlog-feed"></div>
+            <div class="btn-row">
+              <button class="btn primary" id="mlog-close">Chiudi e salva…</button>
+              <button class="btn small danger" id="mlog-cancel">Annulla il registro</button>
+              <span class="note inline">La stessa roccia letta più volte di seguito conta una volta sola.</span>
+            </div>
+          </div>
+          <div class="mlog-last hidden" id="mlog-last">
+            <span class="field-label">Ultimo file</span><code class="selectable" id="mlog-last-name"></code>
+            <button class="btn small" id="mlog-open">Apri</button><button class="btn small" id="mlog-folder">Mostra nella cartella</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Riquadro a schermo</div>
+          <div class="field"><span class="field-label">Informazioni</span><div class="seg" data-seg="miningOverlayBasic"></div></div>
+          <div data-slider="miningOverlayOpacity"></div>
+          <div data-slider="miningOverlayTextOpacity"></div>
+          <div data-slider="miningOverlaySeconds"></div>
+          <div class="btn-row">
+            <button class="btn" data-action="unlockOverlay" data-which="mining">Sblocca per spostarlo (30 s)</button>
+            <button class="btn" data-action="resetOverlay" data-which="mining">Accanto alla zona</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Raffineria <span class="panel-meta" id="refinery-meta"></span></div>
+          <div class="refinery" id="refinery-list"></div>
+          <form class="refinery-form" id="refinery-form">
+            <label><span>Stazione</span><input type="text" name="place" maxlength="40" placeholder="ARC-L1"></label>
+            <label><span>Manca</span><input type="text" name="duration" maxlength="24" placeholder="3:20"></label>
+            <label class="grow"><span>Nota</span><input type="text" name="note" maxlength="60" placeholder="Quantanium, 32 SCU"></label>
+            <button class="btn primary" type="submit">Avvia</button>
+          </form>
+          <div class="row"><div class="row-text"><b>Avvisa a voce quando è pronto</b><small>Anche a finestra chiusa. A voce: «Iris, raffineria a Levski tra 3 ore e 20».</small></div><label class="switch"><input type="checkbox" data-set="refinerySpeak"><i></i></label></div>
+          <div class="btn-row"><button class="btn small" id="refinery-clear">Togli i pronti</button></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Tasti</div>
+          <div class="keys-table" id="mining-keys"></div>
+          <p class="note">Tastiera o pulsanti del joystick/HOTAS. Mentre scrivi a mano, cifre, Invio, Esc e Backspace NON arrivano al gioco. Se Star Citizen è avviato come amministratore, avvia così anche Iris.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Prova e diagnosi</div>
+          <form class="inline-form" id="mining-test">
+            <input type="text" maxlength="60" placeholder="es. 16960 oppure “2 16,960”">
+            <button class="btn primary" type="submit">Decodifica</button>
+          </form>
+          <div class="log tall" id="mining-history"></div>
+          <div class="row"><div class="row-text"><b>Salva le immagini dell'ultima lettura</b><small>Si sovrascrivono a ogni lettura.</small></div><label class="switch"><input type="checkbox" data-set="miningSaveImages"><i></i></label></div>
+          <div class="btn-row"><button class="btn small" data-action="openMiningImages">Apri la cartella delle immagini</button></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Signature sconosciute</div>
+          <div class="log" id="unknowns"></div>
+          <form class="identify" id="identify">
+            <label><span>Valore</span><input type="text" name="value" maxlength="9" inputmode="numeric"></label>
+            <label class="grow"><span>Materiale</span><input type="text" name="name" maxlength="60"></label>
+            <label><span>Quantità</span><input type="text" name="qty" maxlength="4" inputmode="numeric"></label>
+            <button class="btn primary" type="submit">Identifica</button>
+          </form>
+          <div class="btn-row">
+            <button class="btn small" id="unknown-remove">Togli questo valore</button>
+            <button class="btn small danger" id="unknown-clear">Svuota l'elenco</button>
+          </div>
+          <p class="note">Quando sai cos'era (nello scanner del gioco), scrivi materiale e quantità: Iris calcola la firma base e la aggiunge alla tabella.</p>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">Materiali <span class="panel-meta" id="table-state"></span></div>
+          <p class="note">Una riga per materiale: NOME,FIRMA BASE,TIPO (minerale o salvage). Una signature è firma base × quantità. Importa accetta un CSV, il file «materialsdb» di Mining Signature Calculator o lookup_table.json di mining_ocr.</p>
+          <textarea class="code" id="materials" spellcheck="false" rows="12"></textarea>
+          <div class="btn-row">
+            <button class="btn primary" id="table-save">Salva</button>
+            <button class="btn" id="table-reset">Predefinita</button>
+            <button class="btn" id="table-import">Importa…</button>
+            <button class="btn" data-action="tableExport">Esporta CSV…</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Diario di bordo (Game.log) -->
+    <section class="page" data-page="log">
+      <header class="page-head">
+        <div><h1>Diario di bordo</h1><p>Contratti, zona e salute, letti dal Game.log di Star Citizen. Spento finché non lo attivi tu.</p></div>
+        <div class="head-chips"><span class="chip" id="log-chip">—</span></div>
+      </header>
+      <div class="tos" role="alert">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5"/></svg>
+        <div><b>Attenzione</b><p id="log-tos-text"></p></div>
+      </div>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Lettura del Game.log</div>
+          <div class="row"><div class="row-text"><b>Leggi il Game.log</b><small id="log-state">Spento: il Game.log non viene letto.</small></div><label class="switch danger-switch"><input type="checkbox" id="log-enable"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>File</b><small class="mono-text" id="log-path">—</small></div>
+            <div class="btn-row tight"><button class="btn small" id="log-choose">Scegli…</button><button class="btn small" id="log-auto">Automatico</button></div></div>
+          <p class="note">Sola lettura: niente memoria del gioco, niente tasti, niente file scritti nella cartella del gioco. All'avvio rilegge in silenzio la sessione già scritta; quando il gioco riparte segue il file nuovo. Funziona anche col gioco in italiano.</p>
+        </div>
+
+        <div class="panel log-body">
+          <div class="panel-title">Missioni <span class="panel-meta">«Iris, che missioni ho?»</span></div>
+          <div class="missions" id="log-contracts"></div>
+          <div class="panel-title sub">Obiettivi</div>
+          <div class="objectives" id="log-objectives"></div>
+          <div class="session" id="log-session"></div>
+        </div>
+
+        <div class="panel log-body">
+          <div class="panel-title">Stato</div>
+          <div class="kvs" id="log-status"></div>
+          <div class="panel-title sub">Salute</div>
+          <div class="health" id="log-health"></div>
+        </div>
+
+        <div class="panel span-2 log-body">
+          <div class="panel-title">Eventi <span class="panel-meta">i più nuovi in alto</span></div>
+          <div class="feed-tools"><div class="seg" id="log-filter"></div><button class="btn small" id="log-clear">Svuota</button></div>
+          <div class="feed" id="log-feed"></div>
+        </div>
+
+        <div class="panel log-body">
+          <div class="panel-title">Avvisi a voce</div>
+          <div class="row"><div class="row-text"><b>Contratti</b><small>Accettato, completato, fallito, rifiutato.</small></div><label class="switch"><input type="checkbox" data-set="gameLogSpeakContracts"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Salute</b><small>Ferite, disidratato, fame, soccorsi in arrivo.</small></div><label class="switch"><input type="checkbox" data-set="gameLogSpeakHealth"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Zone</b><small>Armistizio, spazio monitorato, proprietà privata.</small></div><label class="switch"><input type="checkbox" data-set="gameLogSpeakZones"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Gruppo</b><small>Un compagno in quantum verso di te.</small></div><label class="switch"><input type="checkbox" data-set="gameLogSpeakParty"><i></i></label></div>
+        </div>
+
+        <div class="panel log-body">
+          <div class="panel-title">Sopra il gioco</div>
+          <p class="note first">Missioni e Diario stanno anche nella barra rapida: premi il suo tasto in gioco e apri i pannelli che ti servono. Restano dove li trascini.</p>
+          <div class="btn-row"><button class="btn log-bar-show">Mostra la barra rapida</button></div>
+          <p class="note">A voce: «Iris, che missioni ho?», «Iris, sono in zona di armistizio?», «Iris, come sto?».</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Axis Visualizer -->
+    <section class="page" data-page="axis">
+      <header class="page-head">
+        <div><h1>Axis Visualizer</h1><p>Assi, barre e pulsanti di HOTAS, joystick, pad, mouse e tastiera: sopra il gioco e in OBS.</p></div>
+        <div class="head-chips"><span class="chip" id="axis-chip">—</span><span class="chip" id="axis-server-chip">—</span></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Overlay <span class="panel-meta">trascina col tasto centrale · doppio clic centrale per chiudere</span></div>
+          <div class="callout" id="ax-state">—</div>
+          <div class="btn-row">
+            <button class="btn primary" id="ax-open">Apri sul gioco</button>
+            <button class="btn" id="ax-obs" title="Le finestre non compaiono sullo schermo: i numeri vanno solo a OBS">Solo OBS</button>
+            <button class="btn" id="ax-hide">Nascondi</button>
+            <button class="btn danger" id="ax-close">Chiudi</button>
+          </div>
+          <div class="grid-2 ax-overlay-rows">
+            <div class="row" id="ax-auto"><div class="row-text"><b>Si apre col gioco</b><small>Quando parte uno dei giochi del profilo; si chiude quando lo chiudi.</small></div><label class="switch"><input type="checkbox"><i></i></label></div>
+            <div class="row" id="ax-lock"><div class="row-text"><b>Blocca la posizione</b><small>Le finestre non si spostano più col tasto centrale.</small></div><label class="switch"><input type="checkbox"><i></i></label></div>
+          </div>
+          <div class="panel-title sub">Profilo</div>
+          <div class="ax-profile">
+            <label class="field ax-field"><span class="field-label">Attivo</span><select id="ax-profile" aria-label="Profilo"></select></label>
+            <label class="field ax-field grow"><span class="field-label">Nome</span><input type="text" id="ax-profile-name" maxlength="32" spellcheck="false"></label>
+            <button class="btn" id="ax-profile-add">+ Nuovo</button>
+            <button class="btn danger" id="ax-profile-delete">Elimina</button>
+          </div>
+          <form class="inline-form" id="ax-triggers">
+            <input type="text" maxlength="200" spellcheck="false" placeholder="Giochi che aprono questo profilo, es. StarCitizen.exe, DCS.exe">
+            <button class="btn" type="submit">Salva i giochi</button>
+          </form>
+          <div class="note" id="ax-message"></div>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">Moduli <span class="panel-meta">al massimo 10 per profilo · l'anteprima si muove con le periferiche</span></div>
+          <div class="btn-row ax-add">
+            <button class="btn" data-kind="Assi">+ Assi</button>
+            <button class="btn" data-kind="Barre">+ Barre</button>
+            <button class="btn" data-kind="Pulsanti">+ Pulsanti</button>
+            <button class="btn small" id="ax-refresh" title="Cerca di nuovo joystick e pad collegati">Aggiorna le periferiche</button>
+          </div>
+          <div class="ax-modules" id="ax-modules"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Aspetto</div>
+          <div id="ax-look"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">OBS</div>
+          <div class="callout" id="ax-server-state">—</div>
+          <div class="row" id="ax-server"><div class="row-text"><b>Server per OBS</b><small>Solo da questo computer: niente firewall, niente rete.</small></div><label class="switch"><input type="checkbox"><i></i></label></div>
+          <form class="inline-form" id="ax-port">
+            <input type="text" inputmode="numeric" maxlength="5" aria-label="Porta">
+            <button class="btn" type="submit">Cambia porta</button>
+          </form>
+          <div class="field-label ax-urls-title">Una sorgente Browser per finestra</div>
+          <div class="ax-urls" id="ax-urls"></div>
+          <p class="note">In OBS: Fonti › + › Browser, incolla l'indirizzo e metti larghezza e altezza almeno come la finestra. Lo sfondo è trasparente. Tutte le finestre: <code class="selectable" id="ax-index"></code></p>
+          <p class="note">Axis Visualizer usa la porta 8777, Iris la sua (8787): possono restare aperti tutti e due.</p>
+          <div class="panel-title sub">Importa</div>
+          <div class="btn-row"><button class="btn" id="ax-import">Importa da Axis Visualizer</button></div>
+          <p class="note" id="ax-import-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Chat di gioco -->
+    <section class="page" data-page="chat">
+      <header class="page-head">
+        <div><h1>Chat di gioco</h1><p>Parli in italiano, in chat arriva già tradotto.</p></div>
+        <div class="head-chips"><span class="chip" id="chat-chip">—</span></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Dettatura</div>
+          <div class="row"><div class="row-text"><b>Detta in chat</b><small>Tieni premuto il tasto della chat, parla e rilascialo. Oppure «Iris, scrivi in chat: arrivo tra due minuti». Iris scrive solo con il gioco in primo piano.</small></div><label class="switch"><input type="checkbox" data-set="chatEnabled"><i></i></label></div>
+          <div class="callout" id="chat-notice">Nessun messaggio ancora.</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Tasti per dettare</div>
+          <div class="keys" data-keys="chat"></div>
+          <p class="note">Un tasto che usi anche per Iris vale per tutti e due: con Star Citizen in primo piano la frase va in chat, a meno che tu dica «Iris»; fuori dal gioco va a Iris.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Lingue</div>
+          <div class="lang-pair">
+            <label class="field"><span class="field-label">Parlo in</span><select data-set="sourceLanguageIndex" data-num data-list="languages"></select></label>
+            <button class="btn icon" data-action="swapLanguages" title="Scambia">⇄</button>
+            <label class="field"><span class="field-label">Scrivo in chat in</span><select data-set="targetLanguageIndex" data-num data-list="languages"></select></label>
+          </div>
+          <div class="row"><div class="row-text"><b>Gergo da videogiocatore</b><small>«sono a terra» diventa «I'm down».</small></div><label class="switch"><input type="checkbox" data-set="gamingTone"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Invio automatico</b><small>F10 lo accende e lo spegne anche in gioco.</small></div><label class="switch"><input type="checkbox" data-set="autoSend"><i></i></label></div>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">Ultime frasi <span class="panel-meta">doppio clic per copiare la traduzione</span></div>
+          <div class="history" id="chat-history"></div>
+          <form class="inline-form" id="translate-test">
+            <input type="text" maxlength="500" placeholder="Prova: scrivi una frase come se la dicessi (non va nel gioco)">
+            <button class="btn primary" type="submit">Traduci</button>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Scrittura in chat</div>
+          <div class="row"><div class="row-text"><b>Apri la chat prima di scrivere</b></div><label class="switch"><input type="checkbox" data-set="chatOpenEnabled"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Tasto per aprire la chat</b><small id="key-chatOpen">—</small></div><button class="btn small" data-capture="chatOpen">Cambia</button></div>
+          <div class="row"><div class="row-text"><b>Tasto per inviare</b><small id="key-chatSend">—</small></div><button class="btn small" data-capture="chatSend">Cambia</button></div>
+          <div data-slider="chatOpenDelayMs"></div>
+          <div data-slider="typingDelayMs"></div>
+          <div class="row"><div class="row-text"><b>Lettere speciali come Unicode</b><small>Spento: ñ diventa n, va in tutti i giochi. Acceso: la lettera giusta, ma alcuni giochi la ignorano.</small></div><label class="switch"><input type="checkbox" data-set="unicodeFallback"><i></i></label></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Soglia del silenzio</div>
+          <div class="meter" id="threshold-meter"><i class="fill"></i><i class="mark"></i></div>
+          <div data-slider="silenceThreshold"></div>
+          <div class="btn-row"><button class="btn" data-action="calibrateSilence">Calibra (2 s di silenzio)</button></div>
+          <p class="note">Sotto la soglia (la riga bianca) per la chat è silenzio: una pressione del tasto senza parlare non scrive niente.</p>
+          <div class="panel-title sub">Glossario</div>
+          <p class="note">Il gergo della community con la traduzione da usare sempre, una riga per termine (QT=quantum travel). Vale subito.</p>
+          <div class="btn-row"><button class="btn" data-action="openGlossary">Apri il glossario</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Traduzione chat -->
+    <section class="page" data-page="screen">
+      <header class="page-head">
+        <div><h1>Traduzione chat</h1><p>La chat degli altri, letta dallo schermo e tradotta sotto la chat del gioco.</p></div>
+        <div class="head-chips"><span class="chip" id="screen-chip">—</span></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Lettura dello schermo</div>
+          <div class="row"><div class="row-text"><b>Traduci la chat degli altri</b><small>Traduce solo i messaggi NUOVI (quando la chat compare, solo l'ultimo) e li tiene nel riquadro: ognuno nuovo spinge su gli altri.</small></div><label class="switch"><input type="checkbox" data-set="ocrEnabled"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Zona della chat</b><small id="ocr-region">Nessuna zona scelta.</small></div><button class="btn primary" data-action="chooseOcrRegion">Scegli o gira la zona</button></div>
+          <p class="note">La chat dell'HUD segue la curva del casco: nella scelta della zona girala con la rotellina del mouse (← → per i decimi di grado), poi Invio. Prima dell'OCR viene raddrizzata.</p>
+          <label class="field"><span class="field-label">Traduci in</span><select data-set="ocrTargetLanguageIndex" data-num data-list="languages"></select></label>
+          <div class="note" id="ocr-info"></div>
+          <div class="btn-row"><button class="btn small" data-action="openLanguageSettings">Lingue di Windows…</button></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Riquadro della traduzione</div>
+          <div data-slider="ocrMaxMessages"></div>
+          <div data-slider="ocrOverlayOpacity"></div>
+          <div class="btn-row">
+            <button class="btn" data-action="unlockOverlay" data-which="chat">Sblocca per spostarlo (30 s)</button>
+            <button class="btn" data-action="resetOverlay" data-which="chat">Sotto la zona</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Filtro e diagnosi</div>
+          <p class="note">I messaggi di un canale o di un'organizzazione (per esempio LSE) finiscono in Messaggi filtrati. Scrivi il nome senza parentesi; vuoto = nessun filtro.</p>
+          <form class="inline-form" id="filter-form">
+            <input type="text" maxlength="40" placeholder="es. LSE">
+            <button class="btn primary" type="submit">Salva</button>
+          </form>
+          <div class="btn-row"><button class="btn small" data-action="openOcrDebug">File di diagnosi dell'OCR</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Messaggi filtrati -->
+    <section class="page" data-page="filtered">
+      <header class="page-head">
+        <div><h1>Messaggi filtrati</h1><p id="filter-label">—</p></div>
+      </header>
+      <div class="panel">
+        <div class="panel-title">Registro</div>
+        <div class="log huge" id="filtered"></div>
+        <div class="btn-row">
+          <button class="btn" data-action="copyFiltered">Copia tutto</button>
+          <button class="btn danger" id="filtered-clear">Svuota</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Ascolto e voce -->
+    <section class="page" data-page="voice">
+      <header class="page-head">
+        <div><h1>Ascolto e voce</h1><p>Come ti sente Iris, e come ti risponde.</p></div>
+      </header>
+      <div class="grid">
+        <div class="panel span-2">
+          <div class="panel-title">Ascolto</div>
+          <div class="row"><div class="row-text"><b>Sempre in ascolto</b><small>Si sveglia quando dici «Iris». Il microfono resta sul PC: si trascrive tutto qui.</small></div><label class="switch"><input type="checkbox" data-set="wakeWordEnabled"><i></i></label></div>
+          <div class="meter" id="mic-meter"><i class="fill"></i></div>
+          <div class="diag" id="mic-diag">—</div>
+          <label class="field"><span class="field-label">Microfono</span><select id="mic-select"></select></label>
+          <div class="grid-2">
+            <div data-slider="vadThreshold"></div>
+            <div data-slider="endSilenceMs"></div>
+            <div data-slider="followUpSeconds"></div>
+            <div data-slider="micGain"></div>
+          </div>
+          <p class="note">La barra diventa verde quando Iris sente che qualcuno parla. Se si sveglia da sola con i rumori, abbassa la sensibilità; se non ti sente, alzala o alza il volume del microfono.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Tasti per parlare</div>
+          <p class="note">Facoltativi: tieni premuto un tasto (o un pulsante del joystick) mentre parli, senza dire «Iris». Premerlo mentre Iris parla la zittisce.</p>
+          <div class="keys" data-keys="talk"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Voce</div>
+          <div class="row"><div class="row-text"><b>Iris risponde a voce</b></div><label class="switch"><input type="checkbox" data-set="speechEnabled"><i></i></label></div>
+          <div class="field"><span class="field-label">Motore della voce</span><div class="seg" id="engine-seg"><button data-engine="neurale">Neurale · Qwen3-TTS</button><button data-engine="windows">Windows</button></div></div>
+          <label class="field"><span class="field-label">Effetto sulla voce</span><select id="effect-select"></select></label>
+          <div class="field"><span class="field-label">Voce di Windows</span><div class="inline-form"><select id="voice-select"></select><button class="btn" data-action="testVoice">Prova</button></div></div>
+          <label class="field"><span class="field-label">Dove parla</span><select id="output-select"></select></label>
+          <div data-slider="speechRate"></div>
+          <p class="note">La voce neurale genera il parlato sulla scheda video (licenza Apache 2.0). La velocità vale solo per le voci di Windows.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- Impostazioni -->
+    <section class="page" data-page="settings">
+      <header class="page-head">
+        <div><h1>Impostazioni</h1><p>Tu, l'avvio, la barra rapida, il cervello di Iris, la sfera e gli aggiornamenti.</p></div>
+      </header>
+      <div class="grid">
+        <div class="panel">
+          <div class="panel-title">Tu</div>
+          <form class="inline-form" id="name-form">
+            <input type="text" maxlength="60" placeholder="Il tuo nome (come ti chiama Iris)">
+            <button class="btn primary" type="submit">Salva</button>
+          </form>
+          <div class="field"><span class="field-label">Quanto parla</span>
+            <select data-set="replyStyle">
+              <option value="intere">Frasi intere, sempre</option>
+              <option value="gioco">Brevi mentre giochi, intere il resto del tempo</option>
+              <option value="brevi">Brevi, sempre</option>
+            </select>
+          </div>
+          <p class="note">Brevi: poche parole, niente cortesie; i comandi di gioco confermano con una parola («Rotta impostata.») o solo con un suono.</p>
+          <div class="row"><div class="row-text"><b>Memoria</b><small id="memory-count">—</small></div><button class="btn" data-action="openMemory">Apri la memoria</button></div>
+          <p class="note">«Iris, ricordati che…»: lo scrive in memoria.txt e lo saprà anche le prossime volte.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Avvio</div>
+          <div class="row"><div class="row-text"><b>Avvia Iris con Windows</b><small id="autostart-note">Parte nascosta nell'area di notifica, pronta per quando giochi.</small></div><label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>La X la nasconde nell'area di notifica</b><small>Iris resta attiva: tasti, barra rapida, avvisi. Per chiuderla: tasto destro sull'icona › Esci.</small></div><label class="switch"><input type="checkbox" data-set="closeToTray"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Saluto all'avvio</b><small>«Sistemi online, sono pronta» quando i modelli sono caricati.</small></div><label class="switch"><input type="checkbox" data-set="greetOnStart"><i></i></label></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Barra rapida nel gioco</div>
+          <div class="row"><div class="row-text"><b>Barra rapida</b><small>Scende dall'alto col suo tasto: mining, traduzione, assi, sfera, missioni, raffineria, diario. Non toglie il fuoco al gioco.</small></div><label class="switch"><input type="checkbox" data-set="quickBarEnabled"><i></i></label></div>
+          <div class="keys-table" id="bar-keys"></div>
+          <div class="btn-row"><button class="btn" id="bar-show">Mostra / nascondi la barra</button></div>
+          <p class="note">Per cliccare libera il cursore del gioco (mobiGlas o il tasto del cursore). «Nascondi tutto» toglie barra, pannelli, sfera e overlay finché non lo ripremi.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Aggiornamenti</div>
+          <div class="update-box" id="update-box">
+            <div class="update-version"><span>Versione</span><b id="update-current">—</b></div>
+            <div class="update-state" id="update-state">—</div>
+            <div class="progress hidden" id="update-progress"><i></i></div>
+          </div>
+          <div class="row"><div class="row-text"><b>Aggiornamenti automatici</b><small>Controlla GitHub all'avvio e ogni 4 ore, scarica da sola e installa al riavvio.</small></div><label class="switch"><input type="checkbox" data-set="autoUpdate"><i></i></label></div>
+          <div class="btn-row">
+            <button class="btn" data-action="checkUpdate">Controlla ora</button>
+            <button class="btn primary hidden" id="update-install">Riavvia e aggiorna</button>
+            <button class="btn small" data-action="openReleasePage">Pagina della versione</button>
+          </div>
+          <pre class="notes hidden" id="update-notes"></pre>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Cervello e scheda video</div>
+          <label class="field"><span class="field-label">Memoria della scheda video per i modelli</span>
+            <select data-set="gpuMemoryLimitMb" data-num>
+              <option value="-1">Senza limite: tutto sulla scheda (più veloce)</option>
+              <option value="8192">8 GB</option>
+              <option value="6144">6 GB</option>
+              <option value="4096">4 GB</option>
+              <option value="2048">2 GB</option>
+              <option value="0">Niente: tutto sul processore (lento)</option>
+            </select>
+          </label>
+          <div class="readout small" id="gpu-info">Caricamento dei modelli…</div>
+          <p class="note">Se un gioco scatta, abbassa il limite: la parte del modello che non ci sta va sul processore (risposte più lente). I modelli si ricaricano in qualche secondo.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Sfera sopra i giochi</div>
+          <div class="row"><div class="row-text"><b>Mostra la sfera</b><small>Si accende quando ti ascolta, gira ambra quando pensa, pulsa quando parla, diventa rossa se qualcosa non va. I clic la attraversano.</small></div><label class="switch"><input type="checkbox" data-set="overlayEnabled"><i></i></label></div>
+          <div data-slider="overlaySize"></div>
+          <div data-slider="overlayOpacity"></div>
+          <div class="btn-row">
+            <button class="btn" data-action="unlockOverlay" data-which="orb">Sblocca per spostarla (30 s)</button>
+            <button class="btn" data-action="resetOverlay" data-which="orb">Nell'angolo</button>
+          </div>
+        </div>
+
+        <div class="panel span-2">
+          <div class="panel-title">File</div>
+          <div class="btn-row">
+            <button class="btn" data-action="openDataFolder">Cartella dei dati</button>
+            <button class="btn" data-action="openLog">Registro</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div class="modal hidden" id="mlog-modal" role="dialog" aria-modal="true" aria-labelledby="mlog-title">
+  <div class="modal-box panel mlog-box">
+    <div class="panel-title" id="mlog-title">Chiudi il registro</div>
+    <p class="mlog-sum" id="mlog-sum"></p>
+    <label class="field"><span class="field-label">In quale luogo ti trovavi?</span>
+      <input type="text" id="mlog-place" maxlength="80" list="mlog-places" spellcheck="false" placeholder="es. Aaron Halo, Daymar, Lyria"><datalist id="mlog-places"></datalist></label>
+    <label class="field"><span class="field-label">Qualità media dei materiali trovati (0–1000)</span>
+      <input type="text" id="mlog-quality" inputmode="numeric" maxlength="4" placeholder="es. 640"></label>
+    <label class="check"><input type="checkbox" id="mlog-csv"><span>Salva anche per Excel (.csv)</span></label>
+    <div class="callout bad hidden" id="mlog-error"></div>
+    <div class="btn-row right"><button class="btn" type="button" id="mlog-resume">Continua a registrare</button><button class="btn primary" type="button" id="mlog-save">Salva sul desktop</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="cmd-modal" role="dialog" aria-modal="true" aria-labelledby="cmd-title">
+  <div class="modal-box panel cmd-box">
+    <div class="panel-title" id="cmd-title">Nuovo comando</div>
+    <div class="field" id="cmd-type-field"><span class="field-label">Cosa fa</span><div class="seg" id="cmd-type"></div><small class="cmd-hint" id="cmd-type-hint"></small></div>
+    <div class="callout hidden" id="cmd-special"></div>
+    <div class="field"><span class="field-label">Cosa dici (dopo «Iris»)</span>
+      <div class="phrase-box" id="cmd-phrases"><input type="text" id="cmd-phrase-input" maxlength="80" spellcheck="false" aria-label="Nuova frase"></div>
+    </div>
+    <div class="field" id="cmd-keys-field"><span class="field-label" id="cmd-keys-label">Tasto</span>
+      <div class="steps" id="cmd-steps"></div>
+      <button class="btn small" type="button" id="cmd-add-step">+ Aggiungi un tasto</button>
+    </div>
+    <div class="field hidden" id="cmd-hold-field"></div>
+    <label class="field"><span class="field-label">Risposta a voce (facoltativa)</span><input type="text" id="cmd-say" maxlength="80" placeholder="es. Porte."></label>
+    <div class="callout bad hidden" id="cmd-error"></div>
+    <div class="btn-row right"><button class="btn" type="button" id="cmd-cancel">Annulla</button><button class="btn primary" type="button" id="cmd-save">Salva</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="modal" role="dialog" aria-modal="true">
+  <div class="modal-box panel">
+    <div class="panel-title" id="modal-title">Conferma</div>
+    <p id="modal-text"></p>
+    <div class="btn-row right" id="modal-buttons"></div>
+  </div>
+</div>
+
+<script src="axis.js"></script>
+<script src="log.js"></script>
+<script src="commands.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

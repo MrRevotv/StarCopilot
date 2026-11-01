@@ -35,6 +35,8 @@ namespace AppPaths {
         }
     }
 
+    bool dataDirOverridden() { return !g_dataDirOverride.empty(); }
+
     bool ensureDirectoriesExist() {
         for (const std::wstring& dir : { appDataRoot() + L"\\Iris", getAppDataDir(), appDataRoot() + L"\\VoiceToChat", getModelsDir() }) {
             if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;

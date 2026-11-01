@@ -172,7 +172,13 @@ private:
         std::string prefix, body;
         std::string translated;
     };
-    std::vector<ShownMessage> m_shown;
+    // Il riquadro ha la sua memoria: i messaggi già tradotti, dal più vecchio al
+    // più nuovo, al massimo ocrMaxMessages. Si traducono solo quelli che
+    // compaiono dopo l'ultimo in memoria (quando la chat compare, solo l'ultimo
+    // che si vede); ognuno nuovo entra in fondo e spinge su gli altri.
+    std::deque<ShownMessage> m_memory;
+    std::vector<ShownMessage> m_waiting; // nuovi letti una volta: si traducono se la lettura dopo li conferma
+    std::string m_memoryFor;             // zona e lingua per cui vale la memoria
     bool m_screenAwaiting = false;
     int m_emptyReads = 0;
     int m_ocrMaxDimension = 0;

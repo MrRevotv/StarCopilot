@@ -23,6 +23,20 @@ if not exist external\whisper.cpp\CMakeLists.txt (
     exit /b 1
 )
 
+rem L'interfaccia e' una pagina HTML dentro WebView2 (gia' in Windows 10/11):
+rem servono solo gli header e la libreria statica, scaricati una volta da NuGet.
+if not exist external\webview2\build\native\include\WebView2.h (
+    echo Scarico il kit di WebView2 ^(1.0.3912.50^)...
+    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force external\webview2 | Out-Null; Invoke-WebRequest 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.3912.50' -OutFile external\webview2\webview2.zip; Expand-Archive -Force external\webview2\webview2.zip external\webview2; Remove-Item external\webview2\webview2.zip" || exit /b 1
+)
+
+rem L'OCR del mining (PP-OCR) usa ONNX Runtime caricato al volo: per compilare serve solo
+rem il suo header C, della stessa versione della DLL che Iris scarica (1.20.1).
+if not exist external\onnxruntime\include\onnxruntime_c_api.h (
+    echo Scarico l'header di ONNX Runtime ^(1.20.1^)...
+    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force external\onnxruntime\include | Out-Null; Invoke-WebRequest 'https://raw.githubusercontent.com/microsoft/onnxruntime/v1.20.1/include/onnxruntime/core/session/onnxruntime_c_api.h' -OutFile external\onnxruntime\include\onnxruntime_c_api.h" || exit /b 1
+)
+
 if not defined VULKAN_SDK (
     for /d %%d in ("C:\VulkanSDK\*") do set "VULKAN_SDK=%%d"
 )

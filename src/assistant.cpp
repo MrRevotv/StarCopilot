@@ -3,6 +3,7 @@
 #include "gpu.h"
 #include "log.h"
 #include "model_downloader.h"
+#include "ppocr.h"
 #include "speech_text.h"
 #include "speech_utils.h"
 #include "text_utils.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 
@@ -138,6 +140,42 @@ void Assistant::start() {
         m_chat.setNotice(on ? "Invio automatico in chat ATTIVO (F10)" : "Invio automatico in chat SPENTO: il messaggio resta da inviare (F10)");
         m_tts.chime(on ? TtsEngine::Chime::Confirm : TtsEngine::Chime::Error);
     });
+
+    // Il mining: letture col tasto o a voce, risultato a schermo (non serve il modello).
+    MiningScanner::Host miningHost;
+    miningHost.settings = [this]() { return settings(); };
+    miningHost.notify = [this](MiningScanner::Event e) { notify(e == MiningScanner::Event::Data ? Event::MiningData : Event::Mining); };
+    miningHost.speak = [this](const std::string& text) {
+        if (settings().speechEnabled) say(text);
+    };
+    m_miningLog.load();
+    m_mining.setOnReading([this](const MiningScanner::Reading& r) {
+        if (!m_miningLog.active()) return;
+        MiningLog::Entry e;
+        e.epoch = (long long)std::time(nullptr);
+        e.value = r.decoded.value;
+        e.source = r.source;
+        const auto& m = r.decoded.matches;
+        if (m.empty()) {
+            e.outcome = "sconosciuto";
+        } else if (m.size() > 1) {
+            e.outcome = "ambiguo";
+            for (const auto& x : m) e.alternatives.push_back({ MiningLog::gameName(x.name), x.name, x.kind, x.quantity });
+        } else {
+            e.outcome = r.decoded.corrected ? "probabile" : "certo";
+            e.label = m[0].name;
+            e.material = MiningLog::gameName(m[0].name);
+            e.kind = m[0].kind;
+            e.quantity = m[0].quantity;
+            if (const Mining::OreInfo* info = Mining::oreInfo(m[0].name)) e.rarity = TextUtils::toLower(Mining::rarityName(info->rarity));
+        }
+        if (m_miningLog.add(e)) notify(Event::MiningLog);
+    });
+    m_mining.start(std::move(miningHost));
+    applyMiningKeys(s);
+    m_refinery.load();
+    applyGameLog(s);
+
     m_hotkeys.start();
 
     // La chat di gioco, con i modelli di Iris.
@@ -170,7 +208,6 @@ void Assistant::start() {
     m_worker = std::thread(&Assistant::workerLoop, this);
     m_speechThread = std::thread(&Assistant::speechLoop, this);
     m_listenThread = std::thread(&Assistant::listenLoop, this);
-    m_timerThread = std::thread(&Assistant::timerLoop, this);
     m_startupRunning = true;
     m_startup = std::thread(&Assistant::startupThread, this);
 }
@@ -231,8 +268,21 @@ void Assistant::startupThread() {
     }
     refreshState();
     Log::info("Iris pronta");
-    if (s.speechEnabled) {
+    // Il saluto all'avvio solo se lo vuoi (Impostazioni): di base Iris si accende in silenzio.
+    if (s.speechEnabled && s.greetOnStart) {
         say(s.userName.empty() ? "Sistemi online. Sono pronta." : "Ciao " + s.userName + ", sono online e pronta.");
+    }
+
+    // L'OCR del mining (PP-OCR, quello di Citizen Assistant): 24 MB, una volta sola, dopo che
+    // Iris è già pronta. Se non si scarica il mining legge con l'OCR di Windows, come prima.
+    if (!PpOcr::filesPresent() && !m_stopping) {
+        std::string error;
+        if (PpOcr::ensureFiles(nullptr, &m_stopping, error)) {
+            std::string loadError;
+            if (!PpOcr::load(loadError)) Log::warn("OCR del mining: " + loadError);
+        } else if (!m_stopping) {
+            Log::warn("OCR del mining non scaricato (" + error + "): resta l'OCR di Windows");
+        }
     }
 }
 
@@ -406,19 +456,18 @@ void Assistant::shutdown() {
     Log::info("Chiusura");
     m_cancel = true;
     m_hotkeys.stop();
+    m_gameLog.stop();
+    m_mining.shutdown();
     m_chat.shutdown();
     m_tts.stop();
     { std::lock_guard<std::mutex> lock(m_jobMutex); }
     m_jobCv.notify_all();
     { std::lock_guard<std::mutex> lock(m_speechMutex); }
     m_speechCv.notify_all();
-    { std::lock_guard<std::mutex> lock(m_timerMutex); }
-    m_timerCv.notify_all();
     if (m_startup.joinable()) m_startup.join();
     if (m_listenThread.joinable()) m_listenThread.join();
     if (m_speechThread.joinable()) m_speechThread.join();
     if (m_worker.joinable()) m_worker.join();
-    if (m_timerThread.joinable()) m_timerThread.join();
     m_tts.shutdown();
     std::lock_guard<std::mutex> lock(m_audioMutex);
     m_audio.close();
@@ -472,9 +521,25 @@ void Assistant::applyChanges(const AppSettings& before, const AppSettings& after
     }
     const bool screenChanged = before.ocrEnabled != after.ocrEnabled || before.ocrRegionX != after.ocrRegionX ||
                                before.ocrRegionY != after.ocrRegionY || before.ocrRegionW != after.ocrRegionW ||
-                               before.ocrRegionH != after.ocrRegionH || before.ocrTargetLanguageIndex != after.ocrTargetLanguageIndex ||
+                               before.ocrRegionH != after.ocrRegionH || before.ocrRegionAngle != after.ocrRegionAngle ||
+                               before.ocrTargetLanguageIndex != after.ocrTargetLanguageIndex ||
                                before.ocrMaxMessages != after.ocrMaxMessages || before.chatFilterTag != after.chatFilterTag;
     if (screenChanged) m_chat.screenSettingsChanged(after.ocrEnabled);
+    const bool miningKeys = !(before.miningScanTriggers == after.miningScanTriggers) || !(before.miningManualTriggers == after.miningManualTriggers) ||
+                            !(before.miningBorderTriggers == after.miningBorderTriggers) ||
+                            !(before.miningToggleTriggers == after.miningToggleTriggers) || before.miningEnabled != after.miningEnabled;
+    const bool barKeys = !(before.quickBarTriggers == after.quickBarTriggers) || !(before.hideAllTriggers == after.hideAllTriggers) ||
+                         before.quickBarEnabled != after.quickBarEnabled;
+    if (miningKeys || barKeys) applyMiningKeys(after);
+    if (before.gameLogEnabled != after.gameLogEnabled || before.gameLogAccepted != after.gameLogAccepted || before.gameLogPath != after.gameLogPath) {
+        applyGameLog(after);
+    }
+    const bool miningLoop = before.miningEnabled != after.miningEnabled || before.miningAuto != after.miningAuto ||
+                            before.miningIntervalMs != after.miningIntervalMs || before.miningRegionX != after.miningRegionX ||
+                            before.miningRegionY != after.miningRegionY || before.miningRegionW != after.miningRegionW ||
+                            before.miningRegionH != after.miningRegionH;
+    if (miningLoop) m_mining.settingsChanged();
+    if (before.miningEnabled && !after.miningEnabled) m_mining.cancelManualInput();
     if (before.micGain != after.micGain) m_audio.setGain(after.micGain);
     if (before.voiceName != after.voiceName) m_tts.setVoice(after.voiceName);
     if (before.speechRate != after.speechRate) m_tts.setRate(after.speechRate);
@@ -965,13 +1030,12 @@ Agent::Persona Assistant::persona() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     Agent::Persona p;
     p.userName = m_settings.userName;
-    p.internet = m_settings.internetEnabled;
     p.memory = m_memory;
     return p;
 }
 
 void Assistant::workerLoop() {
-    // ShellExecute (aprire programmi) e il volume di Windows vogliono COM su questo thread.
+    // COM su questo thread: lo usano alcune API di Windows chiamate dai comandi di gioco.
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     while (true) {
         std::string job;
@@ -1042,6 +1106,8 @@ void Assistant::processCommand(const std::string& text) {
         m_chat.sendText(chatText);
         return;
     }
+    // Mining: "che minerale è?" legge lo schermo, "signature 16960" decodifica il valore. Istantaneo, senza modello.
+    if (s.miningEnabled && runMiningCommand(s, text)) return;
     // Star Citizen aperto: prima il dizionario dei comandi (istantaneo, funziona anche col modello ancora in caricamento).
     if (s.gameEnabled) {
         m_game.reloadIfChanged();
@@ -1221,11 +1287,46 @@ void Assistant::testGameCommand(const std::string& text) {
 }
 
 std::vector<std::string> Assistant::extraToolDefinitions() {
-    if (!gameActive()) return {};
-    return { m_game.toolDefinition() };
+    std::vector<std::string> tools;
+    if (gameActive()) tools.push_back(m_game.toolDefinition());
+    using json = nlohmann::json;
+    tools.push_back(json{ { "type", "function" },
+                          { "function",
+                            { { "name", "refinery_timer" },
+                              { "description", "Star Citizen refinery work orders: start a countdown that alerts the user when an order is ready, "
+                                               "list the running ones (time left), or remove one. Use it for 'avvisami quando la raffineria finisce', "
+                                               "'quanto manca alla raffineria'." },
+                              { "parameters",
+                                { { "type", "object" },
+                                  { "properties",
+                                    { { "action", { { "type", "string" }, { "enum", { "add", "list", "remove" } } } },
+                                      { "duration", { { "type", "string" }, { "description", "add: time left as said by the user, e.g. '3 ore e 20 minuti', '2h15'" } } },
+                                      { "place", { { "type", "string" }, { "description", "station/refinery name, if said" } } },
+                                      { "note", { { "type", "string" }, { "description", "add: material or note, if said" } } } } },
+                                  { "required", { "action" } } } } } } }
+                        .dump());
+    if (settings().gameLogEnabled) {
+        tools.push_back(json{ { "type", "function" },
+                              { "function",
+                                { { "name", "game_status" },
+                                  { "description", "What Iris knows from the Star Citizen game log: active contracts and objectives, zone (armistice, "
+                                                   "monitored space, jurisdiction, last location), injuries and status effects, last ship flown, "
+                                                   "session counters. Use it for questions about missions, where the user is, or their health." },
+                                  { "parameters", { { "type", "object" }, { "properties", json::object() } } } } } }
+                            .dump());
+    }
+    return tools;
 }
 
 bool Assistant::runExtraTool(const std::string& name, const std::string& argumentsJson, const std::atomic<bool>* cancel, std::string& result) {
+    if (name == "refinery_timer") {
+        result = refineryTool(argumentsJson);
+        return true;
+    }
+    if (name == "game_status") {
+        result = gameStatusText();
+        return true;
+    }
     if (name != "game_command") return false;
     if (!gameActive()) {
         result = "Errore: il gioco non è aperto (o i comandi di gioco sono spenti).";
@@ -1243,51 +1344,7 @@ bool Assistant::runExtraTool(const std::string& name, const std::string& argumen
     return true;
 }
 
-// --- Timer e memoria ---------------------------------------------------------------------
-
-void Assistant::addTimer(int seconds, const std::string& label) {
-    {
-        std::lock_guard<std::mutex> lock(m_timerMutex);
-        m_timers.push_back({ Clock::now() + std::chrono::seconds(seconds), label, seconds });
-    }
-    m_timerCv.notify_all();
-    Log::info("Timer: " + std::to_string(seconds) + " s " + label);
-}
-
-int Assistant::cancelTimers() {
-    std::lock_guard<std::mutex> lock(m_timerMutex);
-    int n = (int)m_timers.size();
-    m_timers.clear();
-    m_timerCv.notify_all();
-    return n;
-}
-
-void Assistant::timerLoop() {
-    std::unique_lock<std::mutex> lock(m_timerMutex);
-    while (!m_stopping) {
-        if (m_timers.empty()) {
-            m_timerCv.wait(lock);
-            continue;
-        }
-        auto next = std::min_element(m_timers.begin(), m_timers.end(), [](const Timer& a, const Timer& b) { return a.at < b.at; });
-        if (Clock::now() < next->at) {
-            m_timerCv.wait_until(lock, next->at);
-            continue;
-        }
-        Timer t = *next;
-        m_timers.erase(next);
-        lock.unlock();
-        const std::string what = t.label.empty() ? "Il timer è finito." : "Il timer per " + t.label + " è finito.";
-        m_tts.chime(TtsEngine::Chime::Timer);
-        if (settings().speechEnabled) say(what);
-        addEntry(Entry::Kind::Info, "Timer scaduto" + (t.label.empty() ? std::string() : ": " + t.label));
-        lock.lock();
-    }
-}
-
-std::string Assistant::homeCity() {
-    return settings().homeCity;
-}
+// --- Memoria --------------------------------------------------------------------------------
 
 void Assistant::loadMemory() {
     std::ifstream f(AppPaths::memoryPath(), std::ios::binary);
@@ -1316,4 +1373,213 @@ void Assistant::remember(const std::string& fact) {
     }
     loadMemory();
     Log::info("Memoria: " + fact);
+}
+
+// --- Mining -------------------------------------------------------------------------
+
+bool Assistant::runMiningCommand(const AppSettings& s, const std::string& text) {
+    const Mining::VoiceCommand vc = Mining::parseVoice(text);
+    if (vc.kind == Mining::VoiceKind::None) return false;
+    addEntry(Entry::Kind::User, text);
+    if (vc.kind == Mining::VoiceKind::Scan) {
+        if (s.miningRegionW <= 0 || s.miningRegionH <= 0) {
+            addEntry(Entry::Kind::Info, "Mining: scegli prima la zona da leggere (pagina Mining).");
+            m_tts.chime(TtsEngine::Chime::Error);
+            return true;
+        }
+        m_mining.scan("voce");
+        addEntry(Entry::Kind::Tool, "Mining: leggo la signature, il risultato è a schermo.");
+    } else {
+        m_mining.submitValue(vc.value, "voce");
+        const Mining::Decoded d = Mining::decodeValue(vc.value, m_mining.materials(), s.miningMaxQuantity);
+        addEntry(Entry::Kind::Tool, "Mining: " + Mining::summary(d));
+    }
+    // Il risultato si legge a schermo: Iris non parla, solo il suono di conferma.
+    m_tts.chime(TtsEngine::Chime::Confirm);
+    return true;
+}
+
+void Assistant::applyMiningKeys(const AppSettings& s) {
+    std::vector<HotkeyListener::Action> actions;
+    if (s.miningEnabled) {
+        actions.push_back({ s.miningScanTriggers, [this]() { m_mining.scan("tasto"); } });
+        actions.push_back({ s.miningManualTriggers, [this]() { m_mining.beginManualInput(); } });
+    }
+    actions.push_back({ s.miningBorderTriggers, [this]() { updateSettings([](AppSettings& x) { x.miningShowBorder = !x.miningShowBorder; }); } });
+    actions.push_back({ s.miningToggleTriggers, [this]() {
+                           bool on = false;
+                           updateSettings([&](AppSettings& x) {
+                               x.miningEnabled = !x.miningEnabled;
+                               on = x.miningEnabled;
+                           });
+                           m_tts.chime(on ? TtsEngine::Chime::Confirm : TtsEngine::Chime::Error);
+                       } });
+    // La barra rapida: la mostra e la nasconde la finestra (thread dell'interfaccia).
+    if (s.quickBarEnabled) {
+        actions.push_back({ s.quickBarTriggers, [this]() { notify(Event::QuickBar); } });
+        actions.push_back({ s.hideAllTriggers, [this]() { notify(Event::HideAll); } });
+    }
+    m_hotkeys.setActions(std::move(actions));
+}
+
+// --- Diario di bordo (Game.log) ---------------------------------------------------------------
+
+void Assistant::applyGameLog(const AppSettings& s) {
+    if (s.gameLogEnabled && s.gameLogAccepted) {
+        m_gameLog.start(TextUtils::utf8ToWide(s.gameLogPath), [this](const GameLog::Event& e, bool live) { onGameLogEvent(e, live); },
+                        [this]() { notify(Event::GameLog); });
+        Log::info("Diario di bordo: lettura del Game.log attivata dall'utente (avviso accettato)");
+    } else if (m_gameLog.running()) {
+        m_gameLog.stop();
+        Log::info("Diario di bordo: lettura del Game.log spenta");
+    }
+    notify(Event::GameLog);
+}
+
+namespace {
+    // "Mese Scoperta RSI: Liv. Giallo - Supporta Nave" -> "Liv. Giallo - Supporta Nave": a voce basta l'ultima parte.
+    std::string shortName(const std::string& name) {
+        const size_t c = name.rfind(": ");
+        return c == std::string::npos ? name : name.substr(c + 2);
+    }
+}
+
+void Assistant::onGameLogEvent(const GameLog::Event& e, bool live) {
+    if (!live) return; // la rilettura della sessione già scritta non si annuncia
+    const AppSettings s = settings();
+    std::string text;
+    using GameLog::Kind;
+    switch (e.kind) {
+    case Kind::Contract:
+        if (!s.gameLogSpeakContracts) break;
+        if (e.action == "accepted") text = "Contratto accettato: " + shortName(e.subject) + ".";
+        else if (e.action == "completed") text = "Contratto completato: " + shortName(e.subject) + ".";
+        else if (e.action == "failed") text = "Contratto fallito: " + shortName(e.subject) + ".";
+        else if (e.action == "refused") text = TextUtils::containsIgnoreCase(e.subject, "limit") ? "Contratto rifiutato: hai troppi contratti attivi." : "Contratto non accettato.";
+        break;
+    case Kind::Health:
+        if (!s.gameLogSpeakHealth) break;
+        if (e.action == "injury") text = "Attenzione: " + TextUtils::toLower(e.subject) + (e.detail.empty() ? "" : ", " + e.detail) + ".";
+        else if (e.action == "effect") {
+            if (e.subject == "disidratato") text = "Sei disidratato: bevi qualcosa.";
+            else if (e.subject == "affamato" || e.subject == "fame") text = "Hai fame: mangia qualcosa.";
+            else if (e.subject == "sete") text = "Hai sete: bevi qualcosa.";
+            else text = "Attenzione: " + e.subject + ".";
+        } else if (e.action == "emergency") text = "Soccorsi in arrivo.";
+        break;
+    case Kind::Zone:
+        if (!s.gameLogSpeakZones) break;
+        if (e.action == "armistice_in") text = "Zona di armistizio.";
+        else if (e.action == "armistice_out") text = "Fuori dalla zona di armistizio.";
+        else if (e.action == "monitored_out") text = "Fuori dallo spazio monitorato.";
+        else if (e.action == "monitored_down") text = "Spazio monitorato disattivato.";
+        else if (e.action == "monitored_up") text = "Spazio monitorato ripristinato.";
+        else if (e.action == "private_in") text = "Proprietà privata.";
+        break;
+    case Kind::Party:
+        if (s.gameLogSpeakParty && e.action == "qt") text = e.subject + " è in quantum verso di te.";
+        break;
+    default:
+        break;
+    }
+    if (!text.empty() && s.speechEnabled) say(text);
+}
+
+std::string Assistant::gameStatusText() {
+    const AppSettings s = settings();
+    if (!s.gameLogEnabled) return "Il diario di bordo (lettura del Game.log) è spento: l'utente può attivarlo nella pagina Diario di bordo.";
+    const GameLog::State st = m_gameLog.state();
+    const GameLog::Watcher::Status ws = m_gameLog.status();
+    std::string out;
+    if (!ws.found) out += "Game.log non trovato (il gioco non è installato dove lo cerco o non è mai partito). ";
+    if (!st.handle.empty()) out += "Giocatore: " + st.handle + ". ";
+    if (st.contracts.empty()) out += "Nessun contratto in corso. ";
+    else {
+        out += std::to_string(st.contracts.size()) + " contratti in corso: ";
+        for (size_t i = 0; i < st.contracts.size(); ++i) out += (i ? "; " : "") + st.contracts[i].name;
+        out += ". ";
+    }
+    if (!st.objectives.empty()) {
+        out += "Obiettivi: ";
+        for (size_t i = 0; i < st.objectives.size(); ++i) out += (i ? "; " : "") + st.objectives[i].text;
+        out += ". ";
+    }
+    if (!st.jurisdiction.empty()) out += "Giurisdizione: " + st.jurisdiction + ". ";
+    if (!st.location.empty()) out += "Ultima località: " + st.location + ". ";
+    if (st.armistice >= 0) out += st.armistice ? "In zona di armistizio. " : "Fuori dalle zone di armistizio. ";
+    if (st.monitored >= 0) out += st.monitored ? "In spazio monitorato. " : "Fuori dallo spazio monitorato. ";
+    if (!st.lastShip.empty()) out += "Ultima nave pilotata: " + st.lastShip + ". ";
+    const long long now = (long long)std::time(nullptr);
+    std::string health;
+    for (const auto& m : st.health) {
+        if (m.epoch && now - m.epoch > 30 * 60) continue; // le ferite di più di mezz'ora fa non contano più
+        health += (health.empty() ? "" : "; ") + m.text;
+    }
+    if (!health.empty()) out += "Salute: " + health + ". ";
+    out += "Sessione: " + std::to_string(st.completed) + " contratti completati, " + std::to_string(st.failed) + " falliti.";
+    return out;
+}
+
+std::string Assistant::operatorName() {
+    const std::string handle = settings().gameLogEnabled ? m_gameLog.state().handle : std::string();
+    return handle.empty() ? settings().userName : handle;
+}
+
+std::string Assistant::knownPlace() {
+    if (!settings().gameLogEnabled) return {};
+    const GameLog::State st = m_gameLog.state();
+    return !st.location.empty() ? st.location : st.jurisdiction;
+}
+
+// --- Raffineria --------------------------------------------------------------------------------
+
+void Assistant::tickRefinery() {
+    const long long now = (long long)std::time(nullptr);
+    const std::vector<Refinery::Job> done = m_refinery.takeFinished(now);
+    if (done.empty()) return;
+    const AppSettings s = settings();
+    for (const auto& j : done) {
+        const std::string where = j.place.empty() ? "" : " a " + j.place;
+        addEntry(Entry::Kind::Tool, "Raffineria: ordine pronto" + where + (j.note.empty() ? "" : " (" + j.note + ")"));
+        // Finito mentre Iris era spenta da un pezzo: solo scritto, niente voce all'avvio.
+        if (now - j.end > 10 * 60) continue;
+        if (s.refinerySpeak && s.speechEnabled) say("Ordine di raffineria pronto" + where + ".");
+        else m_tts.chime(TtsEngine::Chime::Confirm);
+    }
+    notify(Event::Refinery);
+}
+
+std::string Assistant::refineryTool(const std::string& argumentsJson) {
+    nlohmann::json a = nlohmann::json::parse(argumentsJson, nullptr, false);
+    auto field = [&](const char* k) { return a.is_object() && a.contains(k) && a[k].is_string() ? TextUtils::trim(a[k].get<std::string>()) : std::string(); };
+    const std::string action = field("action");
+    const long long now = (long long)std::time(nullptr);
+    if (action == "add") {
+        const auto seconds = Refinery::parseDuration(field("duration"));
+        if (!seconds) return "Errore: durata non capita (\"" + field("duration") + "\"). Chiedi quanto manca, per esempio \"3 ore e 20 minuti\".";
+        m_refinery.add(field("place"), field("note"), *seconds, now);
+        addEntry(Entry::Kind::Tool, "Raffineria: timer " + Refinery::formatRemaining(*seconds) + (field("place").empty() ? "" : " a " + field("place")));
+        notify(Event::Refinery);
+        return "Fatto: ti avviso tra " + Refinery::spokenDuration(*seconds) + (field("place").empty() ? "" : " (" + field("place") + ")") + ".";
+    }
+    std::vector<Refinery::Job> jobs = m_refinery.jobs();
+    if (action == "remove") {
+        const std::string place = field("place");
+        for (const auto& j : jobs) {
+            if (place.empty() ? j.done(now) : TextUtils::containsIgnoreCase(j.place, place)) {
+                m_refinery.remove(j.id);
+                notify(Event::Refinery);
+                return "Tolto il timer" + (j.place.empty() ? std::string() : " di " + j.place) + ".";
+            }
+        }
+        return "Errore: nessun timer da togliere" + (place.empty() ? std::string() : " per " + place) + ".";
+    }
+    if (jobs.empty()) return "Nessun ordine di raffineria in corso.";
+    std::string out = std::to_string(jobs.size()) + (jobs.size() == 1 ? " ordine: " : " ordini: ");
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const auto& j = jobs[i];
+        out += (i ? "; " : "") + (j.place.empty() ? std::string("senza nome") : j.place) + (j.note.empty() ? "" : " (" + j.note + ")") + ", " +
+               (j.done(now) ? std::string("pronto") : "pronto tra " + Refinery::spokenDuration(j.end - now));
+    }
+    return out + ".";
 }

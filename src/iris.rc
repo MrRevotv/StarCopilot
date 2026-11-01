@@ -1,11 +1,24 @@
 #include <windows.h>
+#include "version.h"
 
 // Icona del programma (finestra, barra delle applicazioni, file .exe).
 1 ICON "iris.ico"
 
+// L'interfaccia (servita a WebView2 come https://iris.example/...).
+INDEX_HTML RCDATA "ui\\web\\index.html"
+APP_CSS RCDATA "ui\\web\\app.css"
+APP_JS RCDATA "ui\\web\\app.js"
+AXIS_JS RCDATA "ui\\web\\axis.js"
+LOG_JS RCDATA "ui\\web\\log.js"
+COMMANDS_JS RCDATA "ui\\web\\commands.js"
+
+// Le pagine del server per OBS dell'Axis Visualizer (http://localhost:porta/...).
+AXIS_OVERLAY_HTML RCDATA "ui\\axis\\overlay.html"
+AXIS_INDEX_HTML RCDATA "ui\\axis\\index.html"
+
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION IRIS_VERSION_MAJOR,IRIS_VERSION_MINOR,IRIS_VERSION_PATCH,0
+ PRODUCTVERSION IRIS_VERSION_MAJOR,IRIS_VERSION_MINOR,IRIS_VERSION_PATCH,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -17,11 +30,11 @@ BEGIN
         BLOCK "041004b0"
         BEGIN
             VALUE "FileDescription", "Iris"
-            VALUE "FileVersion", "0.1.0"
+            VALUE "FileVersion", IRIS_VERSION_STRING
             VALUE "InternalName", "iris"
             VALUE "OriginalFilename", "iris.exe"
             VALUE "ProductName", "Iris"
-            VALUE "ProductVersion", "0.1.0"
+            VALUE "ProductVersion", IRIS_VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"

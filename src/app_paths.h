@@ -14,6 +14,7 @@ namespace AppPaths {
 
     // Impostazioni, memoria e registro in un'altra cartella: per le prove.
     void setDataDirOverride(const std::wstring& dir);
+    bool dataDirOverridden();
 
     // Crea le cartelle se non esistono. false solo in caso di errore vero.
     bool ensureDirectoriesExist();
