@@ -7,6 +7,7 @@
 #include <dinput.h>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -20,10 +21,21 @@
 //    finestra, che legge l'elenco, non può restare bloccata ad aspettare
 //    DirectInput (che a sua volta potrebbe aspettare la finestra).
 namespace {
+    // Un asse letto: quale campo di DIJOYSTATE2 e l'intervallo dei valori.
+    struct AxisReader {
+        int kind = 0;   // 0 X, 1 Y, 2 Z, 3 Rx, 4 Ry, 5 Rz, 6 slider
+        int slider = 0; // quale slider (0 o 1)
+        LONG min = -10000, max = 10000;
+    };
+
     struct DeviceState {
         JoystickInput::DeviceInfo info;
         bool buttons[128] = {};
         bool connected = false;
+        JoystickInput::Layout layout;
+        std::vector<AxisReader> readers; // in parallelo a layout.axisNames
+        std::vector<double> axes;
+        std::vector<int> hats;
     };
 
     std::mutex g_pollMutex;
@@ -54,6 +66,79 @@ namespace {
         return DIENUM_CONTINUE;
     }
 
+    // Gli oggetti della periferica: assi (nell'ordine di DirectInput, come Axis Visualizer),
+    // nomi dei pulsanti e quanti cappelli.
+    struct ObjectScan {
+        IDirectInputDevice8W* dev = nullptr;
+        JoystickInput::Layout layout;
+        std::vector<AxisReader> readers;
+        int sliders = 0;
+    };
+
+    BOOL CALLBACK objectCallback(LPCDIDEVICEOBJECTINSTANCEW obj, LPVOID ctx) {
+        auto* scan = static_cast<ObjectScan*>(ctx);
+        const std::string name = TextUtils::trim(TextUtils::wideToUtf8(obj->tszName));
+        if (DIDFT_GETTYPE(obj->dwType) & DIDFT_AXIS) {
+            AxisReader r;
+            const GUID& t = obj->guidType;
+            const char* fallback = "Asse";
+            if (t == GUID_XAxis) r.kind = 0, fallback = "Asse X";
+            else if (t == GUID_YAxis) r.kind = 1, fallback = "Asse Y";
+            else if (t == GUID_ZAxis) r.kind = 2, fallback = "Asse Z";
+            else if (t == GUID_RxAxis) r.kind = 3, fallback = "Rotazione X";
+            else if (t == GUID_RyAxis) r.kind = 4, fallback = "Rotazione Y";
+            else if (t == GUID_RzAxis) r.kind = 5, fallback = "Rotazione Z";
+            else if (t == GUID_Slider) {
+                r.kind = 6;
+                r.slider = scan->sliders++;
+                fallback = "Slider";
+                if (r.slider >= 2) return DIENUM_CONTINUE; // DIJOYSTATE2 ne ha due
+            } else {
+                return DIENUM_CONTINUE;
+            }
+            // Un intervallo simmetrico: il centro è 0 su ogni periferica.
+            DIPROPRANGE range{};
+            range.diph.dwSize = sizeof(range);
+            range.diph.dwHeaderSize = sizeof(range.diph);
+            range.diph.dwObj = obj->dwType;
+            range.diph.dwHow = DIPH_BYID;
+            range.lMin = -10000;
+            range.lMax = 10000;
+            if (FAILED(scan->dev->SetProperty(DIPROP_RANGE, &range.diph)) && SUCCEEDED(scan->dev->GetProperty(DIPROP_RANGE, &range.diph))) {
+                r.min = range.lMin;
+                r.max = range.lMax;
+            }
+            scan->layout.axisNames.push_back(name.empty() ? fallback : name);
+            scan->layout.axisKinds.push_back(r.kind);
+            scan->readers.push_back(r);
+        } else if (DIDFT_GETTYPE(obj->dwType) & DIDFT_BUTTON) {
+            if (scan->layout.buttonNames.size() < 128) {
+                scan->layout.buttonNames.push_back(name.empty() ? "Pulsante " + std::to_string(scan->layout.buttonNames.size() + 1) : name);
+            }
+        } else if (DIDFT_GETTYPE(obj->dwType) & DIDFT_POV) {
+            scan->layout.hats = std::min(4, scan->layout.hats + 1);
+        }
+        return DIENUM_CONTINUE;
+    }
+
+    LONG readAxis(const DIJOYSTATE2& s, const AxisReader& r) {
+        switch (r.kind) {
+        case 0: return s.lX;
+        case 1: return s.lY;
+        case 2: return s.lZ;
+        case 3: return s.lRx;
+        case 4: return s.lRy;
+        case 5: return s.lRz;
+        default: return s.rglSlider[std::clamp(r.slider, 0, 1)];
+        }
+    }
+
+    double normalize(LONG v, LONG min, LONG max) {
+        if (max <= min) return 0;
+        const double center = (min + max) / 2.0, half = (max - min) / 2.0;
+        return std::clamp((v - center) / half, -1.0, 1.0);
+    }
+
     void releaseHandle(IDirectInputDevice8W* dev) {
         if (!dev) return;
         dev->Unacquire();
@@ -69,6 +154,7 @@ namespace {
 
         std::vector<std::string> order;
         std::vector<JoystickInput::DeviceInfo> opened;
+        std::vector<ObjectScan> scans;
         for (const auto& inst : found) {
             const std::string id = guidToString(inst.guidInstance);
             order.push_back(id);
@@ -84,6 +170,11 @@ namespace {
             DIDEVCAPS caps{};
             caps.dwSize = sizeof(caps);
             dev->GetCapabilities(&caps);
+            ObjectScan scan;
+            scan.dev = dev;
+            dev->EnumObjects(objectCallback, &scan, DIDFT_AXIS | DIDFT_BUTTON | DIDFT_POV);
+            scan.dev = nullptr;
+            scans.push_back(std::move(scan));
             dev->Acquire();
             g_handles[id] = dev;
 
@@ -97,11 +188,16 @@ namespace {
 
         std::lock_guard<std::mutex> lock(g_mutex);
         g_order = order;
-        for (const auto& info : opened) {
+        for (size_t i = 0; i < opened.size(); ++i) {
+            const auto& info = opened[i];
             DeviceState& s = g_state[info.id];
             s = DeviceState{};
             s.info = info;
             s.connected = true;
+            s.layout = scans[i].layout;
+            s.readers = scans[i].readers;
+            s.axes.assign(s.readers.size(), 0.0);
+            s.hats.assign((size_t)s.layout.hats, -1);
             g_knownNames[info.id] = info.name;
         }
     }
@@ -168,6 +264,7 @@ void poll() {
         std::string id;
         bool ok = false;
         bool buttons[128] = {};
+        DIJOYSTATE2 state{};
     };
     std::vector<Reading> readings;
     readings.reserve(g_handles.size());
@@ -187,6 +284,7 @@ void poll() {
         r.ok = SUCCEEDED(hr);
         if (r.ok) {
             for (int b = 0; b < 128; ++b) r.buttons[b] = (state.rgbButtons[b] & 0x80) != 0;
+            r.state = state;
         }
         readings.push_back(std::move(r));
     }
@@ -198,6 +296,13 @@ void poll() {
             DeviceState& s = g_state[r.id];
             if (r.ok) {
                 std::copy(std::begin(r.buttons), std::end(r.buttons), std::begin(s.buttons));
+                for (size_t a = 0; a < s.readers.size() && a < s.axes.size(); ++a) {
+                    s.axes[a] = normalize(readAxis(r.state, s.readers[a]), s.readers[a].min, s.readers[a].max);
+                }
+                for (size_t h = 0; h < s.hats.size() && h < 4; ++h) {
+                    const DWORD pov = r.state.rgdwPOV[h];
+                    s.hats[h] = LOWORD(pov) == 0xFFFF || pov > 36000 ? -1 : (int)(pov / 100 % 360);
+                }
                 continue;
             }
             // Scollegata: la si riapre quando torna.
@@ -242,6 +347,45 @@ std::string nameOf(const std::string& deviceId) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_knownNames.find(deviceId);
     return it == g_knownNames.end() ? std::string() : it->second;
+}
+
+bool layoutOf(const std::string& deviceId, Layout& out) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_state.find(deviceId);
+    if (it == g_state.end()) return false;
+    out = it->second.layout;
+    return true;
+}
+
+bool snapshot(const std::string& deviceId, Snapshot& out) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_state.find(deviceId);
+    if (it == g_state.end() || !it->second.connected) {
+        out = Snapshot{};
+        return false;
+    }
+    const DeviceState& s = it->second;
+    out.connected = true;
+    out.axes = s.axes;
+    out.buttons.assign(s.buttons, s.buttons + std::min<size_t>(128, s.layout.buttonNames.size()));
+    out.hats = s.hats;
+    return true;
+}
+
+std::string toAxisId(const std::string& deviceId) {
+    std::string out;
+    for (char c : deviceId) {
+        if (c != '{' && c != '}') out += (char)std::tolower((unsigned char)c);
+    }
+    return out;
+}
+
+std::string fromAxisId(const std::string& axisGuid) {
+    std::string out = "{";
+    for (char c : axisGuid) {
+        if (c != '{' && c != '}') out += (char)std::toupper((unsigned char)c);
+    }
+    return out + "}";
 }
 
 } // namespace JoystickInput

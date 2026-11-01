@@ -323,3 +323,57 @@ bool windowElevated(HWND window) {
 }
 
 } // namespace GameInput
+
+namespace GameInput {
+
+std::string nameForVirtualKey(int vk) {
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return std::string(1, (char)vk);
+    if (vk >= VK_F1 && vk <= VK_F12) return "F" + std::to_string(vk - VK_F1 + 1);
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return "Num" + std::to_string(vk - VK_NUMPAD0);
+    switch (vk) {
+    case VK_ADD: return "NumPlus";
+    case VK_SUBTRACT: return "NumMinus";
+    case VK_MULTIPLY: return "NumMultiply";
+    case VK_DIVIDE: return "NumDivide";
+    case VK_DECIMAL: return "NumPeriod";
+    case VK_SPACE: return "Space";
+    case VK_RETURN: return "Enter";
+    case VK_ESCAPE: return "Escape";
+    case VK_TAB: return "Tab";
+    case VK_BACK: return "Backspace";
+    case VK_CAPITAL: return "CapsLock";
+    case VK_NUMLOCK: return "NumLock";
+    case VK_SCROLL: return "ScrollLock";
+    case VK_LSHIFT: return "LShift";
+    case VK_RSHIFT: return "RShift";
+    case VK_LCONTROL: return "LCtrl";
+    case VK_RCONTROL: return "RCtrl";
+    case VK_LMENU: return "LAlt";
+    case VK_RMENU: return "RAlt";
+    case VK_UP: return "Up";
+    case VK_DOWN: return "Down";
+    case VK_LEFT: return "Left";
+    case VK_RIGHT: return "Right";
+    case VK_HOME: return "Home";
+    case VK_END: return "End";
+    case VK_PRIOR: return "PageUp";
+    case VK_NEXT: return "PageDown";
+    case VK_INSERT: return "Insert";
+    case VK_DELETE: return "Delete";
+    default: break;
+    }
+    // Gli altri (accentate, punteggiatura...): il tasto fisico, qualunque sia la tastiera.
+    const UINT scan = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+    if (scan == 0) return {};
+    for (const auto& e : kKeys) {
+        if (e.scan == scan) return e.name;
+    }
+    return {};
+}
+
+bool sameCombo(const std::string& a, const std::string& b) {
+    const auto x = parseCombo(a), y = parseCombo(b);
+    return !x.empty() && x == y;
+}
+
+} // namespace GameInput

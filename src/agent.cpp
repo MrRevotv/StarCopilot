@@ -51,8 +51,9 @@ void Agent::reset() {
 std::string Agent::systemPrompt() const {
     const std::string who = m_persona.userName.empty() ? "dell'utente" : "di " + m_persona.userName;
     std::string s =
-        "Sei Iris, l'assistente vocale personale " + who +
-        ", e vivi sul suo PC Windows. Ti ispiri a J.A.R.V.I.S. di Iron Man: competente, rapida, cortese, con un filo di ironia elegante.\n"
+        "Sei Iris, l'assistente di gioco " + who +
+        " per Star Citizen: copilota di bordo, comandi della nave, chat e mining. Ti ispiri a J.A.R.V.I.S. di Iron Man: competente, "
+        "rapida, cortese, con un filo di ironia elegante.\n"
         "Oggi è " + todayItalian() + ". Ogni messaggio dell'utente comincia con l'ora attuale tra parentesi quadre: tienine conto, "
         "ma non ripeterla se non serve.\n\n"
         "Come rispondi:\n";
@@ -67,21 +68,9 @@ std::string Agent::systemPrompt() const {
     s += "- Niente elenchi puntati, titoli, grassetto, emoji o indirizzi web: le tue parole vengono lette da una voce sintetica.\n"
         "- Scrivi numeri e orari in modo che si leggano bene (\"21 gradi\", \"alle 18 e 30\").\n"
         "- La richiesta arriva da un riconoscimento vocale e può contenere parole sbagliate: capisci l'intenzione più probabile.\n";
-    if (m_persona.internet) {
-        s += "- Le tue conoscenze si fermano al 2023: di quello che è successo dopo non sai niente. Per qualsiasi domanda su fatti, "
-             "persone, risultati sportivi, notizie, prezzi, prodotti, orari o eventi chiama SEMPRE web_search prima di rispondere, "
-             "anche se credi di sapere la risposta: non rispondere mai a memoria su queste cose. Anche cariche e ruoli (presidenti, "
-             "capi di governo, papi, allenatori, campioni in carica, CEO) possono essere cambiati dopo il 2023: cercali sempre.\n"
-             "- Per il meteo chiama SEMPRE get_weather, una volta per ogni città, anche se nella conversazione c'è già il meteo di "
-             "un'altra città o dello stesso giorno. Per le notizie del giorno usa get_news.\n"
-             "- Numeri e dati (gradi, prezzi, punteggi, date) vanno presi solo dai risultati degli strumenti: mai inventati.\n"
-             "- Dopo una ricerca rispondi con le informazioni trovate, in breve, senza dire \"secondo i risultati\".\n";
-    } else {
-        s += "- Internet è disattivato: se non sai una cosa, dillo con sincerità.\n";
-    }
-    s += "- Per le azioni sul PC (programmi, siti, volume, musica, timer) usa lo strumento e poi conferma con poche parole. Non "
-         "chiedere conferma: se un nome è storpiato scegli l'interpretazione più probabile e agisci (Facebook, YouTube e gli altri "
-         "siti si aprono con open_website).\n"
+    s += "- Ti occupi solo del gioco. Non hai internet e non controlli Windows: non apri programmi o siti, non regoli volume o "
+         "musica, non imposti timer, non dai meteo o notizie. Se te lo chiedono, dillo in una frase e ricorda cosa sai fare.\n"
+         "- Non inventare dati che non hai (prezzi aggiornati, patch, eventi): se non sei sicura dillo con sincerità.\n"
          "- Se l'utente ti chiede di ricordare qualcosa usa remember.";
     if (!m_persona.game.empty()) {
         s += "\n- " + m_persona.game + " è aperto e l'utente sta giocando: per comandare la nave (tasti, rotta sulla mappa stellare) "
@@ -99,7 +88,7 @@ std::string Agent::systemPrompt() const {
 Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const std::atomic<bool>* cancel, std::string& answer) {
     answer.clear();
     const std::string userMessage = "[" + nowHHMM() + "] " + userText;
-    const std::vector<std::string> tools = m_tools.definitions(m_persona.internet);
+    const std::vector<std::string> tools = m_tools.definitions();
     const std::string system = systemPrompt();
 
     while (m_history.size() > kMaxExchanges) m_history.erase(m_history.begin());
@@ -191,7 +180,7 @@ Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const
                 const std::string what = Tools::describe(call.name, call.argumentsJson);
                 Log::info("Strumento: " + call.name + " " + call.argumentsJson);
                 if (cb.onTool) cb.onTool(what);
-                std::string result = m_tools.run(call.name, call.argumentsJson, m_persona.internet, cancel);
+                std::string result = m_tools.run(call.name, call.argumentsJson, cancel);
                 if (cancel && cancel->load()) return Result::Cancelled;
                 Log::info("Risultato di " + call.name + ": " + std::to_string(result.size()) + " caratteri");
                 turn.push_back({ ChatFormat::Message::Role::Tool, result });

@@ -1,0 +1,8 @@
+#pragma once
+
+// Generato da CMake dal file VERSION: non modificarlo a mano.
+// La versione la usano l'exe (Proprietà > Dettagli) e l'aggiornamento automatico.
+#define IRIS_VERSION_STRING "@IRIS_VERSION@"
+#define IRIS_VERSION_MAJOR @IRIS_VERSION_MAJOR@
+#define IRIS_VERSION_MINOR @IRIS_VERSION_MINOR@
+#define IRIS_VERSION_PATCH @IRIS_VERSION_PATCH@

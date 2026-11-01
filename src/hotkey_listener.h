@@ -64,6 +64,15 @@ public:
     // come push-to-talk registrerebbe a ogni clic. Esc annulla.
     static bool captureNextInput(TalkTrigger& out, std::atomic<bool>& cancel, int timeoutMs, bool allowJoystick);
 
+    // Azioni a pressione singola con tasti di tastiera O pulsanti di joystick
+    // (il mining: "leggi la signature", "inserimento manuale"...). Il callback
+    // parte quando un tasto della lista viene premuto (non mentre lo tieni giù).
+    struct Action {
+        std::vector<TalkTrigger> triggers;
+        std::function<void()> callback;
+    };
+    void setActions(std::vector<Action> actions);
+
     void start();
     void stop();
 
@@ -82,6 +91,8 @@ private:
     std::vector<TalkTrigger> m_triggers;
     std::vector<TalkTrigger> m_chatTriggers;
     std::vector<Toggle> m_toggles;
+    std::vector<Action> m_actions;
+    std::vector<bool> m_actionWasDown;
     std::atomic<bool> m_running{ false };
     std::atomic<bool> m_paused{ false };
     std::atomic<bool> m_waitRelease{ false };

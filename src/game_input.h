@@ -25,6 +25,11 @@ namespace GameInput {
     std::vector<unsigned short> parseCombo(const std::string& combo);
     // I nomi dei tasti accettati (per l'aiuto).
     std::vector<std::string> keyNames();
+    // Il nome nel profilo di un tasto di Windows (codice virtuale): 'N' -> "N", VK_ADD -> "NumPlus",
+    // VK_LMENU -> "LAlt". Vuoto se il profilo non lo sa scrivere.
+    std::string nameForVirtualKey(int vk);
+    // Due combinazioni uguali anche se scritte diverse ("Alt+N" e "LAlt+n").
+    bool sameCombo(const std::string& a, const std::string& b);
 
     // Tutte le funzioni qui sotto: con dryRun non premono niente.
     void pressCombo(const std::string& combo, int holdMs, int gapMs, bool dryRun);

@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Iris · Axis Visualizer — overlay</title>
+<style>
+    html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;   /* OBS ci mette sotto il gioco */
+        overflow: hidden;
+    }
+
+    #board {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+    }
+
+    canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="board"></div>
+
+<script>
+"use strict";
+
+// La finestra dell'overlay che questa pagina rappresenta: la scrive il server.
+const KEY = "__KEY__";
+
+// Le stesse misure del disegno su Windows: cambiarle qui e non di la' vorrebbe dire
+// vedere due overlay diversi.
+const PAD = 10, TITLE_H = 13, CORNER = 7;
+const BAR_ROW = 26, VALUE_ROW = 16, TRAIL_SAMPLES = 26;
+const ROW_H = 18, ROW_GAP = 6, VALUE_W = 44, NAME_W = 96;
+const CELL_H = 24, CELL_GAP = 5, HAT_SIZE = 46, HAT_GAP = 10;
+
+// La misura di riferimento su cui sono tarate le costanti qui sopra. Quando le scritte
+// crescono, crescono con loro anche le misure che esistono per contenerle: e' la stessa
+// regola che applica il disegno su Windows, e le due devono restare uguali o i moduli in
+// OBS verrebbero diversi da quelli sullo schermo.
+const FONT_BASE = 11;
+let font = FONT_BASE, bold = false;
+let barRow = BAR_ROW, rowH = ROW_H, valueW = VALUE_W, nameW = NAME_W;
+
+function applyFont(l) {
+    font = l && l.font > 0 ? l.font : FONT_BASE;
+    bold = !!(l && l.bold);
+
+    const s = font / FONT_BASE;
+    barRow = Math.round(BAR_ROW * s);
+    rowH = Math.round(ROW_H * s);
+    valueW = Math.round(VALUE_W * s);
+    nameW = Math.round(NAME_W * s);
+}
+
+const FONT = 'px Consolas, "Cascadia Mono", "Courier New", monospace';
+
+const board = document.getElementById("board");
+
+let layout = null;      // com'e' fatta la finestra: arriva una volta sola
+let values = null;      // i numeri dell'ultimo fotogramma
+let panes = [];         // canvas + stato locale, uno per modulo
+let lastFrame = 0;
+
+// ------------------------------------------------------------------ colori
+
+function rgba(hex, alpha) {
+    const n = parseInt(hex.slice(1), 16);
+    return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + alpha + ")";
+}
+
+// Nero o bianco, secondo quale dei due si legge meglio sul colore dato. Stessa formula del
+// disegno su Windows, altrimenti il testo dentro una casella accesa cambierebbe colore.
+function contrast(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    const luminance = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+    return luminance > 0.55 ? "#04181C" : "#FFFFFF";
+}
+
+function theme(p) {
+    return {
+        bg: rgba(p.bg, p.bgAlpha),
+        dot: p.dot,
+        dotSoft: rgba(p.dot, 0.2),
+        bar: p.barColor,
+        accent: p.accent,
+        text: "#FFFFFF",
+        muted: "rgba(255,255,255,0.6)",
+        inverted: contrast(p.dot),
+        frame: rgba(p.accent, 0.4),
+        rule: rgba(p.accent, 0.2),
+        track: "rgba(255,255,255,0.24)",
+        cell: rgba(p.accent, 0.35),
+        grid: "rgba(255,255,255,0.3)",
+        barDash: rgba(p.barColor, 0.5)
+    };
+}
+
+// ------------------------------------------------------------------ pennelli
+
+function line(ctx, x1, y1, x2, y2, color, dash) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    if (dash) ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function strokeRect(ctx, x, y, w, h, color) {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
+}
+
+function fillRect(ctx, x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, w, h);
+}
+
+function circle(ctx, x, y, r, fill, stroke) {
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(0, r), 0, Math.PI * 2);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke(); }
+}
+
+function text(ctx, content, x, y, size, color, baseline) {
+    ctx.font = (bold ? "bold " : "") + size + FONT;
+    ctx.fillStyle = color;
+    ctx.textBaseline = baseline || "top";
+    ctx.fillText(content, x, y);
+}
+
+function width(ctx, content, size) {
+    ctx.font = (bold ? "bold " : "") + size + FONT;
+    return ctx.measureText(content).width;
+}
+
+// Il testo di WPF occupa in altezza poco piu' della sua dimensione: serve a centrarlo
+// verticalmente come fa il disegno su Windows.
+function textHeight(size) { return size * 1.36; }
+
+function percent(value) {
+    // Il "+" guarda il numero gia' arrotondato, non il valore: e' quello che fa il formato
+    // "+0;-0;0" del C#, che sceglie la sezione dopo aver arrotondato. Un -0,4% e' "0%" per
+    // tutti e due, e lo zero negativo che esce da Math.round si scrive comunque "0".
+    const n = Math.round(value * 100);
+    return (n > 0 ? "+" : "") + n + "%";
+}
+
+function ellipsis(ctx, content, size, max) {
+    if (width(ctx, content, size) <= max) return content;
+    let cut = content;
+    while (cut.length > 1 && width(ctx, cut + "…", size) > max) cut = cut.slice(0, -1);
+    return cut + "…";
+}
+
+// ------------------------------------------------------------------ il modulo intero
+
+function drawPane(pane, dt) {
+    const p = pane.layout, ctx = pane.ctx, t = pane.theme;
+
+    ctx.setTransform(pane.scale, 0, 0, pane.scale, 0, 0);
+    ctx.clearRect(0, 0, p.w, p.h);
+    ctx.globalAlpha = layout.opacity;
+
+    if (p.bgAlpha > 0) fillRect(ctx, 0, 0, p.w, p.h, t.bg);
+    if (p.frame) drawFrame(ctx, t, p.w, p.h);
+
+    let top = PAD;
+    if (p.titleBand > 0) {
+        drawTitle(ctx, p, t, PAD, top, p.w - 2 * PAD);
+        top += p.titleBand;
+    }
+
+    const area = { x: PAD, y: top, w: p.w - 2 * PAD, h: p.h - top - PAD };
+    if (area.w <= 0 || area.h <= 0) return;
+
+    if (p.kind === "assi") drawAxes(ctx, pane, area, dt);
+    else if (p.kind === "barre") drawBars(ctx, pane, area);
+    else if (p.kind === "pulsanti") drawButtons(ctx, pane, area);
+}
+
+// Cornice sottile con gli angoli marcati: il segno dei pannelli da strumentazione.
+function drawFrame(ctx, t, w, h) {
+    strokeRect(ctx, 0.5, 0.5, Math.max(1, w - 1), Math.max(1, h - 1), t.rule);
+
+    const x0 = 0.5, y0 = 0.5, x1 = w - 0.5, y1 = h - 0.5;
+    line(ctx, x0, y0, x0 + CORNER, y0, t.frame);
+    line(ctx, x0, y0, x0, y0 + CORNER, t.frame);
+    line(ctx, x1, y0, x1 - CORNER, y0, t.frame);
+    line(ctx, x1, y0, x1, y0 + CORNER, t.frame);
+    line(ctx, x0, y1, x0 + CORNER, y1, t.frame);
+    line(ctx, x0, y1, x0, y1 - CORNER, t.frame);
+    line(ctx, x1, y1, x1 - CORNER, y1, t.frame);
+    line(ctx, x1, y1, x1, y1 - CORNER, t.frame);
+}
+
+function drawTitle(ctx, p, t, left, top, w) {
+    // La misura arriva da chi disegna su Windows: il browser misura il testo qualche pixel
+    // diverso, e su un titolo centrato quei pixel si vedrebbero.
+    const tw = p.titleWidth || width(ctx, p.title, font);
+    let x = left;
+    if (p.align === "right") x = left + w - tw;
+    else if (p.align === "center") x = left + (w - tw) / 2;
+    x = Math.max(left, x);
+
+    text(ctx, p.title, x, top, font, t.accent);
+
+    // Filetto che riempie lo spazio rimasto, come le intestazioni del pannello.
+    const ruleY = Math.round(top + textHeight(font) / 2) + 0.5;
+    if (x > left + 6) line(ctx, left, ruleY, x - 6, ruleY, t.rule);
+    if (x + tw + 6 < left + w) line(ctx, x + tw + 6, ruleY, left + w, ruleY, t.rule);
+}
+
+// ------------------------------------------------------------------ ASSI
+
+function drawAxes(ctx, pane, area, dt) {
+    const p = pane.layout, t = pane.theme;
+    const x = pane.values[0] || 0, y = pane.values[1] || 0, z = pane.values[2] || 0;
+
+    const side = area.w;
+    const plot = { x: area.x, y: area.y, w: side, h: side };
+
+    const dotR = p.dotRadius || 0;
+    const cx = plot.x + plot.w / 2, cy = plot.y + plot.h / 2;
+    const reach = plot.w / 2 - dotR;
+
+    strokeRect(ctx, plot.x + 0.5, plot.y + 0.5, plot.w - 1, plot.h - 1, t.rule);
+
+    if (p.grid) {
+        line(ctx, cx, plot.y + 4, cx, plot.y + plot.h - 4, t.grid, true);
+        line(ctx, plot.x + 4, cy, plot.x + plot.w - 4, cy, t.grid, true);
+    }
+
+    drawEdgeTicks(ctx, t, plot);
+
+    const dotX = cx + x * reach, dotY = cy + y * reach;
+
+    if (p.trailSeconds > 0.01) {
+        advanceTrail(pane, dt, x, y);
+        for (let i = pane.trail.length - 1; i >= 0; i--) {
+            const weight = 1 - i / TRAIL_SAMPLES;
+            const r = dotR * 0.9 * weight;
+            if (r < 0.7) continue;
+            circle(ctx, cx + pane.trail[i][0] * reach, cy + pane.trail[i][1] * reach, r, t.dotSoft);
+        }
+    }
+
+    // Riferimenti dal puntino ai bordi: aiutano a leggere la posizione da lontano.
+    line(ctx, plot.x + 1, dotY, plot.x + plot.w - 1, dotY, t.track);
+    line(ctx, dotX, plot.y + 1, dotX, plot.y + plot.h - 1, t.track);
+
+    circle(ctx, dotX, dotY, dotR * 1.9, t.dotSoft);
+    circle(ctx, dotX, dotY, dotR, t.dot);
+
+    let next = plot.y + plot.h;
+    if (p.hasBar) {
+        drawAxisBar(ctx, t, p, area.x, next, area.w, z);
+        next += barRow;
+    }
+
+    if (p.showValues) {
+        // Solo X e Y: il terzo asse il suo numero ce l'ha gia' accanto alla barra.
+        const content = p.tags[0] + " " + percent(x) + "   " + p.tags[1] + " " + percent(y);
+        text(ctx, content, area.x, next, font, t.muted);
+    }
+}
+
+// Tacche a un quarto, a meta' e a tre quarti su ogni lato: la scala del riquadro.
+function drawEdgeTicks(ctx, t, plot) {
+    for (let i = 1; i <= 3; i++) {
+        const fraction = i / 4;
+        const len = i === 2 ? 6 : 3;
+        const x = plot.x + plot.w * fraction;
+        const y = plot.y + plot.h * fraction;
+
+        line(ctx, x, plot.y, x, plot.y + len, t.frame);
+        line(ctx, x, plot.y + plot.h, x, plot.y + plot.h - len, t.frame);
+        line(ctx, plot.x, y, plot.x + len, y, t.frame);
+        line(ctx, plot.x + plot.w, y, plot.x + plot.w - len, y, t.frame);
+    }
+}
+
+// La scia campiona a intervalli regolari invece che a ogni fotogramma: cosi' ha la stessa
+// lunghezza a 60 e a 240 fps, e dura quanto l'utente ha impostato.
+function advanceTrail(pane, dt, x, y) {
+    pane.trailClock += dt;
+    const step = pane.layout.trailSeconds / TRAIL_SAMPLES;
+    if (pane.trailClock < step) return;
+
+    pane.trailClock = 0;
+    pane.trail.unshift([x, y]);
+    if (pane.trail.length > TRAIL_SAMPLES) pane.trail.length = TRAIL_SAMPLES;
+}
+
+function drawAxisBar(ctx, t, p, left, top, w, z) {
+    const readout = percent(z);
+    const readoutW = width(ctx, readout, font);
+
+    // Lo spazio ai due lati e' quello misurato su Windows, cosi' la barra finisce nello stesso
+    // punto nei due disegni. E' uguale a destra e a sinistra: lo zero cade sulla verticale del
+    // puntino. Vedi AxisPane.DrawBar, che disegna la stessa barra.
+    const gutter = p.barGutter || readoutW;
+    const tag = ellipsis(ctx, p.barTag || "", font, gutter);
+
+    const center = left + w / 2;
+    const half = Math.max(5, w / 2 - gutter - 8);
+    const x0 = center - half, x1 = center + half;
+    const y = Math.round(top + barRow / 2) + 0.5;
+
+    line(ctx, x0, y, x1, y, t.barDash, true);
+
+    // Tacche di inizio, centro e fondo corsa.
+    [x0, center, x1].forEach(function (x) {
+        line(ctx, x, y - 4, x, y + 4, t.frame);
+    });
+
+    const value = center + z * half;
+    const fillW = Math.abs(value - center);
+    if (fillW > 0) fillRect(ctx, Math.min(center, value), y - 2, fillW, 4, t.bar);
+
+    circle(ctx, value, y, 5, t.bar);
+
+    // Nome a filo a sinistra e percentuale a filo a destra, come nel riquadro qui sopra.
+    text(ctx, tag, left, y, font, t.muted, "middle");
+    text(ctx, readout, left + w - readoutW, y, font, t.muted, "middle");
+}
+
+// ------------------------------------------------------------------ BARRE
+
+function drawBars(ctx, pane, area) {
+    const p = pane.layout, t = pane.theme;
+
+    if (!p.rows || p.rows.length === 0) {
+        text(ctx, "NESSUN ASSE", area.x, area.y, font, t.muted);
+        return;
+    }
+
+    const nameWidth = Math.min(nameW, Math.max(40, area.w * 0.35));
+    const trackLeft = area.x + nameWidth + 8;
+    const trackWidth = Math.max(20, area.x + area.w - valueW - 6 - trackLeft);
+
+    for (let i = 0; i < p.rows.length; i++) {
+        const top = area.y + i * (rowH + ROW_GAP);
+        const value = pane.values[i] || 0;
+
+        text(ctx, ellipsis(ctx, p.rows[i], font, nameWidth), area.x, top + rowH / 2, font, t.muted, "middle");
+
+        drawTrack(ctx, t, trackLeft, top, trackWidth, value);
+
+        const readout = percent(value);
+        text(ctx, readout, area.x + area.w - width(ctx, readout, font), top + rowH / 2, font, t.text, "middle");
+    }
+}
+
+// Il pieno parte dal centro, non da sinistra: su un asse che va da -1 a 1 e' la lettura giusta.
+function drawTrack(ctx, t, left, top, w, value) {
+    const y = Math.round(top + rowH / 2) + 0.5;
+    const center = left + w / 2;
+
+    line(ctx, left, y, left + w, y, t.track);
+    line(ctx, center, y - 5, center, y + 5, t.frame);
+    line(ctx, left, y - 3, left, y + 3, t.frame);
+    line(ctx, left + w, y - 3, left + w, y + 3, t.frame);
+
+    const end = center + value * (w / 2);
+    const fillW = Math.abs(end - center);
+    if (fillW >= 1) fillRect(ctx, Math.min(center, end), y - 3, fillW, 6, t.dot);
+
+    fillRect(ctx, end - 1.5, y - 6, 3, 12, t.dot);
+}
+
+// ------------------------------------------------------------------ PULSANTI
+
+function drawButtons(ctx, pane, area) {
+    const p = pane.layout, t = pane.theme;
+    const chips = p.chips || [];
+
+    if (chips.length === 0 && !p.hats && !p.wheel) {
+        text(ctx, "NESSUN PULSANTE SCELTO", area.x, area.y, font, t.muted);
+        return;
+    }
+
+    for (let i = 0; i < chips.length; i++)
+        drawChip(ctx, t, chips[i], area, pane.values[i] || 0);
+
+    const rowsHeight = p.rowsHeight || 0;
+    const top = area.y + rowsHeight + (rowsHeight > 0 ? CELL_GAP : 0);
+    let left = area.x;
+
+    const hats = p.hats || 0;
+    for (let i = 0; i < hats; i++) {
+        drawHat(ctx, t, left, top, pane.values[chips.length + i]);
+        left += HAT_SIZE + HAT_GAP;
+    }
+
+    if (p.wheel) {
+        const base = chips.length + hats;
+        drawWheel(ctx, t, left, top, pane.values[base] || 0, pane.values[base + 1] || 0);
+    }
+}
+
+function drawChip(ctx, t, chip, area, heat) {
+    const x = area.x + chip.x, y = area.y + chip.y;
+
+    strokeRect(ctx, x + 0.5, y + 0.5, chip.w - 1, chip.h - 1, t.cell);
+    text(ctx, chip.text, x + (chip.w - width(ctx, chip.text, font)) / 2, y + chip.h / 2, font, t.muted, "middle");
+
+    if (heat <= 0.001) return;
+
+    // La casella accesa sta sopra a quella spenta e sfuma nel rilascio.
+    const alpha = ctx.globalAlpha;
+    ctx.globalAlpha = alpha * Math.min(1, heat);
+    fillRect(ctx, x, y, chip.w, chip.h, t.dot);
+    text(ctx, chip.text, x + (chip.w - width(ctx, chip.text, font)) / 2, y + chip.h / 2, font, t.inverted, "middle");
+    ctx.globalAlpha = alpha;
+}
+
+// Il cappello come lo si vede sulla cloche: otto posizioni in cerchio, si accende quella premuta.
+function drawHat(ctx, t, left, top, angle) {
+    const cx = left + HAT_SIZE / 2, cy = top + HAT_SIZE / 2;
+    const ring = HAT_SIZE / 2 - 6;
+
+    circle(ctx, cx, cy, ring, null, t.rule);
+    circle(ctx, cx, cy, 3, null, t.cell);
+
+    for (let step = 0; step < 8; step++) {
+        const degrees = step * 45;
+        const radians = (degrees - 90) * Math.PI / 180;
+        const x = cx + Math.cos(radians) * ring, y = cy + Math.sin(radians) * ring;
+
+        const active = angle >= 0 && Math.abs(((angle - degrees + 540) % 360) - 180) < 1;
+        if (active) circle(ctx, x, y, 5, t.dot);
+        else circle(ctx, x, y, 3, null, t.cell);
+    }
+}
+
+// Due frecce che lampeggiano nel verso in cui gira la rotella.
+function drawWheel(ctx, t, left, top, up, down) {
+    const cx = left + HAT_SIZE / 2, cy = top + HAT_SIZE / 2;
+
+    strokeRect(ctx, cx - 7, cy - 11, 14, 22, t.cell);
+    line(ctx, cx, cy - 4, cx, cy + 4, t.cell);
+
+    drawArrow(ctx, t, cx, top + 1, true, up);
+    drawArrow(ctx, t, cx, top + HAT_SIZE - 1, false, down);
+}
+
+function drawArrow(ctx, t, x, y, up, heat) {
+    const direction = up ? 1 : -1;
+
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - 6, y + 8 * direction);
+    ctx.lineTo(x + 6, y + 8 * direction);
+    ctx.closePath();
+
+    ctx.strokeStyle = t.cell;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    if (heat <= 0.001) return;
+
+    const alpha = ctx.globalAlpha;
+    ctx.globalAlpha = alpha * Math.min(1, heat);
+    ctx.fillStyle = t.dot;
+    ctx.fill();
+    ctx.globalAlpha = alpha;
+}
+
+// ------------------------------------------------------------------ pagina e collegamento
+
+function rebuild() {
+    board.innerHTML = "";
+    panes = [];
+
+    if (!layout) return;
+
+    applyFont(layout);
+
+    board.style.gap = layout.gap + "px";
+    board.style.maxWidth = layout.maxWidth > 0 ? layout.maxWidth + "px" : "none";
+
+    const scale = window.devicePixelRatio || 1;
+
+    for (const p of layout.panes) {
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(p.w * scale);
+        canvas.height = Math.round(p.h * scale);
+        canvas.style.width = p.w + "px";
+        canvas.style.height = p.h + "px";
+        board.appendChild(canvas);
+
+        panes.push({
+            layout: p,
+            ctx: canvas.getContext("2d"),
+            theme: theme(p),
+            values: [],
+            trail: [],
+            trailClock: 0,
+            scale: scale
+        });
+    }
+}
+
+function frame(now) {
+    const dt = lastFrame ? Math.min(0.25, (now - lastFrame) / 1000) : 1 / 60;
+    lastFrame = now;
+
+    if (layout) {
+        for (let i = 0; i < panes.length; i++) {
+            panes[i].values = (values && values[i]) || panes[i].values;
+
+            // Un errore su un modulo non deve fermare tutti gli altri, e soprattutto non deve
+            // fermare il ciclo: in una diretta un overlay congelato si vede molto piu' di un
+            // riquadro sbagliato. L'errore si annuncia una volta sola, nel titolo della pagina,
+            // che in OBS non si vede.
+            try {
+                drawPane(panes[i], dt);
+            } catch (error) {
+                if (!panes[i].broken) {
+                    panes[i].broken = true;
+                    document.title = "ERRORE NEL MODULO " + (i + 1) + ": " + error.message;
+                }
+            }
+        }
+    }
+
+    requestAnimationFrame(frame);
+}
+
+function clear() {
+    layout = null;
+    values = null;
+    board.innerHTML = "";
+    panes = [];
+}
+
+function connect() {
+    const socket = new WebSocket("ws://" + location.host + "/" + KEY);
+
+    socket.onmessage = function (event) {
+        const message = JSON.parse(event.data);
+
+        if (message.t === "l") {
+            layout = message.w;
+            rebuild();
+        } else if (message.t === "v") {
+            values = message.v;
+        } else if (message.t === "none" || message.t === "off") {
+            // Overlay chiuso o finestra che non esiste piu': la pagina resta vuota, e in OBS
+            // vuol dire trasparente. Niente scritte: finirebbero nella registrazione.
+            if (layout) clear();
+        }
+    };
+
+    // OBS cambia scena, il programma si riavvia: si riprova finche' non torna.
+    socket.onclose = function () { setTimeout(connect, 1000); };
+    socket.onerror = function () { try { socket.close(); } catch (e) { } };
+}
+
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

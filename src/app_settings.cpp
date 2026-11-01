@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -50,18 +51,52 @@ namespace {
 
 AppSettings AppSettings::load() {
     std::ifstream file(AppPaths::settingsPath(), std::ios::binary);
-    AppSettings s;
+    std::string content;
     if (file.is_open()) {
         std::stringstream buffer;
         buffer << file.rdbuf();
-        s = parse(buffer.str());
+        content = buffer.str();
     }
+    // Anche senza file: parse() mette i valori predefiniti che dipendono dal file (tasti del mining).
+    AppSettings s = parse(content);
     s.sanitize();
     return s;
 }
 
+namespace {
+    // "keyboard,107" / "joystick2,<id>,<pulsante>,<nome>" -> tasto. false se non si capisce.
+    bool parseTrigger(const std::string& v, TalkTrigger& t) {
+        if (TextUtils::startsWith(v, "keyboard,")) {
+            t.type = TalkTrigger::Type::Keyboard;
+            t.vk = toInt(v.substr(9), 0);
+            return t.vk > 0 && t.vk <= 254;
+        }
+        if (TextUtils::startsWith(v, "joystick2,")) {
+            auto p = splitN(v.substr(10), 3);
+            if (p.size() < 2) return false;
+            t.type = TalkTrigger::Type::Joystick;
+            t.joystickId = p[0];
+            t.buttonIndex = toInt(p[1], 0);
+            if (p.size() > 2) t.joystickName = p[2];
+            return true;
+        }
+        return false;
+    }
+
+    TalkTrigger keyTrigger(int vk) {
+        TalkTrigger t;
+        t.type = TalkTrigger::Type::Keyboard;
+        t.vk = vk;
+        return t;
+    }
+}
+
 AppSettings AppSettings::parse(const std::string& content) {
     AppSettings s;
+    // Mining: tasti predefiniti come in Mining Signature Calculator (Num + legge, Num - a mano),
+    // finché il file non dice altro (miningConfigured).
+    bool miningConfigured = false;
+    bool quickBarConfigured = false; // tasti della barra rapida già scelti (anche vuoti)
     std::istringstream file(content);
     std::string line;
     while (std::getline(file, line)) {
@@ -73,7 +108,6 @@ AppSettings AppSettings::parse(const std::string& content) {
         const std::string v = line.substr(eq + 1);
 
         if (key == "userName") s.userName = v;
-        else if (key == "homeCity") s.homeCity = v;
         else if (key == "wakeWordEnabled") s.wakeWordEnabled = toBool(v);
         else if (key == "deviceName") { if (!v.empty()) s.deviceNames.push_back(v); }
         else if (key == "micGain") s.micGain = (float)toDouble(v, 1.0);
@@ -90,7 +124,6 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "speechRate") s.speechRate = toDouble(v, 1.1);
         else if (key == "llmModelFile") s.llmModelFile = v;
         else if (key == "gpuMemoryLimitMb") s.gpuMemoryLimitMb = toInt(v, -1);
-        else if (key == "internetEnabled") s.internetEnabled = toBool(v);
         else if (key == "gameEnabled") s.gameEnabled = toBool(v);
         else if (key == "overlayEnabled") s.overlayEnabled = toBool(v);
         else if (key == "overlayOpacity") s.overlayOpacity = toInt(v, 230);
@@ -99,6 +132,9 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "overlayY") s.overlayY = toInt(v, -1);
         else if (key == "windowX") s.windowX = toInt(v, -1);
         else if (key == "windowY") s.windowY = toInt(v, -1);
+        else if (key == "windowW") s.windowW = toInt(v, -1);
+        else if (key == "windowH") s.windowH = toInt(v, -1);
+        else if (key == "autoUpdate") s.autoUpdate = toBool(v);
         // Chat di gioco (stesse chiavi di Voice to Chat)
         else if (key == "chatEnabled") s.chatEnabled = toBool(v);
         else if (key == "sourceLang") s.sourceLanguageIndex = toInt(v, 0);
@@ -119,11 +155,67 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "ocrRegionY") s.ocrRegionY = toInt(v, -1);
         else if (key == "ocrRegionW") s.ocrRegionW = toInt(v, -1);
         else if (key == "ocrRegionH") s.ocrRegionH = toInt(v, -1);
+        else if (key == "ocrRegionAngle") s.ocrRegionAngle = toDouble(v, 0.0);
         else if (key == "ocrOverlayX") s.ocrOverlayX = toInt(v, -1);
         else if (key == "ocrOverlayY") s.ocrOverlayY = toInt(v, -1);
         else if (key == "ocrOverlayOpacity") s.ocrOverlayOpacity = toInt(v, 235);
         else if (key == "ocrMaxMessages") s.ocrMaxMessages = toInt(v, 6);
         else if (key == "voiceToChatImported") s.voiceToChatImported = toBool(v);
+        // Mining
+        else if (key == "miningConfigured") miningConfigured = toBool(v);
+        else if (key == "miningEnabled") s.miningEnabled = toBool(v);
+        else if (key == "miningRegionX") s.miningRegionX = toInt(v, -1);
+        else if (key == "miningRegionY") s.miningRegionY = toInt(v, -1);
+        else if (key == "miningRegionW") s.miningRegionW = toInt(v, -1);
+        else if (key == "miningRegionH") s.miningRegionH = toInt(v, -1);
+        else if (key == "miningOverlayX") s.miningOverlayX = toInt(v, -1);
+        else if (key == "miningOverlayY") s.miningOverlayY = toInt(v, -1);
+        else if (key == "miningOverlayOpacity") s.miningOverlayOpacity = toInt(v, 235);
+        else if (key == "miningOverlayTextOpacity") s.miningOverlayTextOpacity = toInt(v, 255);
+        else if (key == "miningOverlaySeconds") s.miningOverlaySeconds = toInt(v, 20);
+        else if (key == "miningOverlayBasic") s.miningOverlayBasic = toBool(v);
+        else if (key == "miningShowBorder") s.miningShowBorder = toBool(v);
+        else if (key == "miningAuto") s.miningAuto = toBool(v);
+        else if (key == "miningIntervalMs") s.miningIntervalMs = toInt(v, 1000);
+        else if (key == "miningSaveImages") s.miningSaveImages = toBool(v);
+        else if (key == "miningMaxQuantity") s.miningMaxQuantity = toInt(v, 40);
+        else if (key == "miningSpeak") s.miningSpeak = toBool(v);
+        else if (key == "miningLogCsv") s.miningLogCsv = toBool(v);
+        // Avvio, barra rapida, diario di bordo, raffineria
+        else if (key == "greetOnStart") s.greetOnStart = toBool(v);
+        else if (key == "closeToTray") s.closeToTray = toBool(v);
+        else if (key == "quickBarConfigured") quickBarConfigured = toBool(v);
+        else if (key == "quickBarEnabled") s.quickBarEnabled = toBool(v);
+        else if (key == "panelMissionsOpen") s.panelMissionsOpen = toBool(v);
+        else if (key == "panelRefineryOpen") s.panelRefineryOpen = toBool(v);
+        else if (key == "panelLogOpen") s.panelLogOpen = toBool(v);
+        else if (key == "panelMissionsX") s.panelMissionsX = toInt(v, -1);
+        else if (key == "panelMissionsY") s.panelMissionsY = toInt(v, -1);
+        else if (key == "panelRefineryX") s.panelRefineryX = toInt(v, -1);
+        else if (key == "panelRefineryY") s.panelRefineryY = toInt(v, -1);
+        else if (key == "panelLogX") s.panelLogX = toInt(v, -1);
+        else if (key == "panelLogY") s.panelLogY = toInt(v, -1);
+        else if (key == "gameLogEnabled") s.gameLogEnabled = toBool(v);
+        else if (key == "gameLogAccepted") s.gameLogAccepted = toBool(v);
+        else if (key == "gameLogPath") s.gameLogPath = v;
+        else if (key == "gameLogSpeakContracts") s.gameLogSpeakContracts = toBool(v);
+        else if (key == "gameLogSpeakHealth") s.gameLogSpeakHealth = toBool(v);
+        else if (key == "gameLogSpeakZones") s.gameLogSpeakZones = toBool(v);
+        else if (key == "gameLogSpeakParty") s.gameLogSpeakParty = toBool(v);
+        else if (key == "refinerySpeak") s.refinerySpeak = toBool(v);
+        else if (key == "quickBarTrigger" || key == "hideAllTrigger") {
+            TalkTrigger t;
+            if (!parseTrigger(v, t)) continue;
+            (key == "quickBarTrigger" ? s.quickBarTriggers : s.hideAllTriggers).push_back(t);
+        }
+        else if (key == "miningScanTrigger" || key == "miningManualTrigger" || key == "miningBorderTrigger" || key == "miningToggleTrigger") {
+            TalkTrigger t;
+            if (!parseTrigger(v, t)) continue;
+            if (key == "miningScanTrigger") s.miningScanTriggers.push_back(t);
+            else if (key == "miningManualTrigger") s.miningManualTriggers.push_back(t);
+            else if (key == "miningBorderTrigger") s.miningBorderTriggers.push_back(t);
+            else s.miningToggleTriggers.push_back(t);
+        }
         else if (key == "trigger" || key == "chatTrigger") {
             TalkTrigger t;
             if (TextUtils::startsWith(v, "keyboard,")) {
@@ -143,6 +235,14 @@ AppSettings AppSettings::parse(const std::string& content) {
             }
             (key == "trigger" ? s.triggers : s.chatTriggers).push_back(t);
         }
+    }
+    if (!miningConfigured) {
+        s.miningScanTriggers = { keyTrigger(VK_ADD) };
+        s.miningManualTriggers = { keyTrigger(VK_SUBTRACT) };
+    }
+    if (!quickBarConfigured) {
+        s.quickBarTriggers = { keyTrigger(VK_DIVIDE) };
+        s.hideAllTriggers = { keyTrigger(VK_MULTIPLY) };
     }
     return s;
 }
@@ -179,7 +279,6 @@ void AppSettings::importVoiceToChat(const std::string& voiceToChatContent) {
 std::string AppSettings::serialize() const {
     std::ostringstream o;
     o << "userName=" << oneLine(userName) << "\n";
-    o << "homeCity=" << oneLine(homeCity) << "\n";
     o << "wakeWordEnabled=" << (wakeWordEnabled ? 1 : 0) << "\n";
     for (const auto& d : deviceNames) o << "deviceName=" << oneLine(d) << "\n";
     o << "micGain=" << micGain << "\n";
@@ -196,7 +295,6 @@ std::string AppSettings::serialize() const {
     o << "speechRate=" << speechRate << "\n";
     o << "llmModelFile=" << oneLine(llmModelFile) << "\n";
     o << "gpuMemoryLimitMb=" << gpuMemoryLimitMb << "\n";
-    o << "internetEnabled=" << (internetEnabled ? 1 : 0) << "\n";
     o << "gameEnabled=" << (gameEnabled ? 1 : 0) << "\n";
     o << "overlayEnabled=" << (overlayEnabled ? 1 : 0) << "\n";
     o << "overlayOpacity=" << overlayOpacity << "\n";
@@ -205,6 +303,9 @@ std::string AppSettings::serialize() const {
     o << "overlayY=" << overlayY << "\n";
     o << "windowX=" << windowX << "\n";
     o << "windowY=" << windowY << "\n";
+    o << "windowW=" << windowW << "\n";
+    o << "windowH=" << windowH << "\n";
+    o << "autoUpdate=" << (autoUpdate ? 1 : 0) << "\n";
     auto writeTriggers = [&](const char* key, const std::vector<TalkTrigger>& list) {
         for (const auto& t : list) {
             if (t.type == TalkTrigger::Type::Keyboard) {
@@ -236,11 +337,60 @@ std::string AppSettings::serialize() const {
     o << "ocrRegionY=" << ocrRegionY << "\n";
     o << "ocrRegionW=" << ocrRegionW << "\n";
     o << "ocrRegionH=" << ocrRegionH << "\n";
+    o << "ocrRegionAngle=" << ocrRegionAngle << "\n";
     o << "ocrOverlayX=" << ocrOverlayX << "\n";
     o << "ocrOverlayY=" << ocrOverlayY << "\n";
     o << "ocrOverlayOpacity=" << ocrOverlayOpacity << "\n";
     o << "ocrMaxMessages=" << ocrMaxMessages << "\n";
     o << "voiceToChatImported=" << (voiceToChatImported ? 1 : 0) << "\n";
+    // Mining
+    o << "miningConfigured=1\n";
+    o << "miningEnabled=" << (miningEnabled ? 1 : 0) << "\n";
+    writeTriggers("miningScanTrigger", miningScanTriggers);
+    writeTriggers("miningManualTrigger", miningManualTriggers);
+    writeTriggers("miningBorderTrigger", miningBorderTriggers);
+    writeTriggers("miningToggleTrigger", miningToggleTriggers);
+    o << "miningRegionX=" << miningRegionX << "\n";
+    o << "miningRegionY=" << miningRegionY << "\n";
+    o << "miningRegionW=" << miningRegionW << "\n";
+    o << "miningRegionH=" << miningRegionH << "\n";
+    o << "miningOverlayX=" << miningOverlayX << "\n";
+    o << "miningOverlayY=" << miningOverlayY << "\n";
+    o << "miningOverlayOpacity=" << miningOverlayOpacity << "\n";
+    o << "miningOverlayTextOpacity=" << miningOverlayTextOpacity << "\n";
+    o << "miningOverlaySeconds=" << miningOverlaySeconds << "\n";
+    o << "miningOverlayBasic=" << (miningOverlayBasic ? 1 : 0) << "\n";
+    o << "miningShowBorder=" << (miningShowBorder ? 1 : 0) << "\n";
+    o << "miningAuto=" << (miningAuto ? 1 : 0) << "\n";
+    o << "miningIntervalMs=" << miningIntervalMs << "\n";
+    o << "miningSaveImages=" << (miningSaveImages ? 1 : 0) << "\n";
+    o << "miningMaxQuantity=" << miningMaxQuantity << "\n";
+    o << "miningSpeak=" << (miningSpeak ? 1 : 0) << "\n";
+    o << "miningLogCsv=" << (miningLogCsv ? 1 : 0) << "\n";
+    // Avvio, barra rapida, diario di bordo, raffineria
+    o << "greetOnStart=" << (greetOnStart ? 1 : 0) << "\n";
+    o << "closeToTray=" << (closeToTray ? 1 : 0) << "\n";
+    o << "quickBarConfigured=1\n";
+    o << "quickBarEnabled=" << (quickBarEnabled ? 1 : 0) << "\n";
+    writeTriggers("quickBarTrigger", quickBarTriggers);
+    writeTriggers("hideAllTrigger", hideAllTriggers);
+    o << "panelMissionsOpen=" << (panelMissionsOpen ? 1 : 0) << "\n";
+    o << "panelRefineryOpen=" << (panelRefineryOpen ? 1 : 0) << "\n";
+    o << "panelLogOpen=" << (panelLogOpen ? 1 : 0) << "\n";
+    o << "panelMissionsX=" << panelMissionsX << "\n";
+    o << "panelMissionsY=" << panelMissionsY << "\n";
+    o << "panelRefineryX=" << panelRefineryX << "\n";
+    o << "panelRefineryY=" << panelRefineryY << "\n";
+    o << "panelLogX=" << panelLogX << "\n";
+    o << "panelLogY=" << panelLogY << "\n";
+    o << "gameLogEnabled=" << (gameLogEnabled ? 1 : 0) << "\n";
+    o << "gameLogAccepted=" << (gameLogAccepted ? 1 : 0) << "\n";
+    o << "gameLogPath=" << oneLine(gameLogPath) << "\n";
+    o << "gameLogSpeakContracts=" << (gameLogSpeakContracts ? 1 : 0) << "\n";
+    o << "gameLogSpeakHealth=" << (gameLogSpeakHealth ? 1 : 0) << "\n";
+    o << "gameLogSpeakZones=" << (gameLogSpeakZones ? 1 : 0) << "\n";
+    o << "gameLogSpeakParty=" << (gameLogSpeakParty ? 1 : 0) << "\n";
+    o << "refinerySpeak=" << (refinerySpeak ? 1 : 0) << "\n";
     return o.str();
 }
 
@@ -267,8 +417,18 @@ void AppSettings::sanitize() {
     typingDelayMs = std::clamp(typingDelayMs, 0, 200);
     ocrOverlayOpacity = std::clamp(ocrOverlayOpacity, 60, 255);
     ocrMaxMessages = std::clamp(ocrMaxMessages, 1, 20);
+    // Leggermente girata (la curva del casco), a decimi di grado.
+    ocrRegionAngle = std::isfinite(ocrRegionAngle) ? std::clamp(std::round(ocrRegionAngle * 10.0) / 10.0, -20.0, 20.0) : 0.0;
+    if (ocrRegionW <= 0 || ocrRegionH <= 0) ocrRegionAngle = 0.0;
     if (chatOpenKeyVk <= 0 || chatOpenKeyVk > 254) chatOpenKeyVk = 0x0D;
     if (chatSendKeyVk <= 0 || chatSendKeyVk > 254) chatSendKeyVk = 0x0D;
+    // Mining
+    miningOverlayOpacity = std::clamp(miningOverlayOpacity, 0, 255);          // sfondo: anche niente
+    miningOverlayTextOpacity = std::clamp(miningOverlayTextOpacity, 51, 255); // scritte: almeno il 20%
+    miningOverlaySeconds = std::clamp(miningOverlaySeconds, 3, 120);
+    miningIntervalMs = std::clamp(miningIntervalMs, 300, 5000);
+    miningMaxQuantity = std::clamp(miningMaxQuantity, 5, 200);
+    if (miningRegionW <= 0 || miningRegionH <= 0) miningRegionX = miningRegionY = miningRegionW = miningRegionH = -1;
 }
 
 bool AppSettings::save() const {

@@ -83,3 +83,31 @@ struct GameProfile {
 
 // Toglie commenti e virgole finali, per leggere i JSON scritti a mano.
 std::string relaxedJson(const std::string& text);
+
+// --- L'editor dei comandi (pagina Star Citizen) ----------------------------------------------------
+
+// Un tasto di un comando: il nome nel profilo ("landing_gear") e/o la combinazione ("N", "LAlt+N").
+struct CommandStep {
+    std::string name;
+    std::string combo;
+};
+
+// Un comando come lo scrive l'editor. index = -1: nuovo.
+struct CommandEdit {
+    int index = -1;
+    std::string intent;               // "press", "hold", "sequence" (i comandi speciali: solo frasi e conferma)
+    std::vector<std::string> phrases;
+    std::vector<CommandStep> steps;   // uno per press/hold, in ordine per sequence
+    int holdMs = 800;
+    std::string say;
+};
+
+// Comandi di Iris con una logica sua (rotta, salto quantico, mappa...): se ne cambiano le frasi, non si tolgono.
+bool isSpecialIntent(const std::string& intent);
+// I tasti di un comando, per l'editor.
+std::vector<CommandStep> commandSteps(const GameProfile& profile, const GameCommand& command);
+// Applica l'editor al profilo: frasi pulite e senza doppioni (anche con gli altri comandi), tasti
+// validi; un tasto nuovo prende un nome dalla prima frase, uno già nel profilo si riusa.
+// false + error (in italiano, da mostrare) se qualcosa non va: il profilo non cambia.
+bool applyCommandEdit(GameProfile& profile, const CommandEdit& edit, std::string& error);
+bool removeCommand(GameProfile& profile, int index, std::string& error);

@@ -3,10 +3,14 @@
 #include "agent.h"
 #include "game_chat.h"
 #include "game_controller.h"
+#include "game_log.h"
+#include "mining_log.h"
+#include "refinery.h"
 #include "app_settings.h"
 #include "audio_capture.h"
 #include "hotkey_listener.h"
 #include "llm_engine.h"
+#include "mining_scanner.h"
 #include "neural_voice.h"
 #include "tools.h"
 #include "tts_engine.h"
@@ -31,7 +35,9 @@
 //  - trascrizione: whisper su ogni frase, poi "è per Iris?" (parola "Iris",
 //    finestra di ascolto aperta, tasto per parlare);
 //  - lavoro: le richieste, una alla volta (modello + strumenti + voce);
-//  - timer; tasti (HotkeyListener); voce (TtsEngine).
+//  - tasti (HotkeyListener); voce (TtsEngine).
+// Iris è un'assistente di GIOCO: comandi della nave, chat, mining e memoria.
+// Niente controlli di Windows (programmi, siti, volume, musica, timer, internet).
 // La finestra legge lo stato con i metodi qui sotto; il "listener" la avvisa
 // quando qualcosa cambia (da qualunque thread: deve solo fare PostMessage).
 class Assistant : public ToolHost {
@@ -53,7 +59,12 @@ public:
     };
 
     // ChatHistory, Screen, Filtered: dalla chat di gioco (GameChat).
-    enum class Event { Status, Conversation, Settings, Heard, ChatHistory, Screen, Filtered };
+    // Mining: una lettura nuova o l'inserimento manuale (il riquadro a schermo);
+    // MiningData: tabella dei materiali o sconosciute cambiate (la pagina Mining).
+    // GameLog: il diario di bordo è cambiato. Refinery: i timer della raffineria. QuickBar / HideAll: i tasti
+    // della barra rapida (mostra/nascondi la barra, nascondi tutto quello di Iris sullo schermo).
+    // MiningLog: il registro delle scansioni del mining è cambiato.
+    enum class Event { Status, Conversation, Settings, Heard, ChatHistory, Screen, Filtered, Mining, MiningData, GameLog, Refinery, QuickBar, HideAll, MiningLog };
     using Listener = std::function<void(Event)>;
 
     Assistant();
@@ -103,11 +114,23 @@ public:
     GameChat& chat() { return m_chat; }
     // "scrivi in chat: ..." -> il testo da scrivere (vuoto se non è un comando di chat).
     static std::string chatCommandText(const std::string& command);
+    // Il mining (Mining Signature Calculator dentro Iris): letture, tabella, sconosciute.
+    MiningScanner& mining() { return m_mining; }
+    // Il diario di bordo (Game.log, solo se l'utente l'ha attivato) e i timer della raffineria.
+    GameLog::Watcher& gameLog() { return m_gameLog; }
+    Refinery::Timers& refinery() { return m_refinery; }
+    // Il registro delle scansioni del mining (file sul desktop alla chiusura).
+    MiningLog::Recorder& miningLog() { return m_miningLog; }
+    void miningLogChanged() { notify(Event::MiningLog); }
+    // Chi sta minando, per il registro: il nome nel gioco (dal diario di bordo) o quello in Iris.
+    std::string operatorName();
+    // Dove sei secondo il diario di bordo (località o giurisdizione), se acceso. Vuoto se non si sa.
+    std::string knownPlace();
+    void refineryChanged() { notify(Event::Refinery); }
+    // Ogni secondo, dal thread della finestra: gli ordini appena pronti si annunciano.
+    void tickRefinery();
 
     // ToolHost
-    void addTimer(int seconds, const std::string& label) override;
-    int cancelTimers() override;
-    std::string homeCity() override;
     void remember(const std::string& fact) override;
     std::vector<std::string> extraToolDefinitions() override;
     bool runExtraTool(const std::string& name, const std::string& argumentsJson, const std::atomic<bool>* cancel, std::string& result) override;
@@ -121,12 +144,6 @@ private:
         bool sharedKey = false;           // tasto in comune con la chat: con "Iris" è per lei, se no va in chat
         bool startedAwake = false;        // cominciata con la finestra di ascolto aperta
         bool startedWhileSpeaking = false; // cominciata mentre Iris parlava (forse è la sua voce)
-    };
-
-    struct Timer {
-        Clock::time_point at;
-        std::string label;
-        int seconds = 0;
     };
 
     // Avvio e modelli
@@ -162,11 +179,19 @@ private:
     void processCommand(const std::string& text);
     // Comando di gioco riconosciuto dal dizionario: tasti subito, senza modello.
     void runGameCommand(const std::string& text, const Cmd::Match& match);
+    // "Iris, che minerale è?" / "Iris, signature 16960": true se era un comando del mining.
+    bool runMiningCommand(const AppSettings& s, const std::string& text);
+    // I tasti del mining (leggi, a mano, contorno, acceso/spento) e della barra rapida verso HotkeyListener.
+    void applyMiningKeys(const AppSettings& s);
+    // Il diario di bordo: acceso solo se l'utente l'ha attivato dopo l'avviso.
+    void applyGameLog(const AppSettings& s);
+    void onGameLogEvent(const GameLog::Event& e, bool live);
+    std::string refineryTool(const std::string& argumentsJson);
+    std::string gameStatusText();
     bool gameActive(); // comandi di gioco accesi e gioco aperto
     bool briefReplies(); // risposte brevi adesso (sempre, o mentre giochi: vedi AppSettings::replyStyle)
     Agent::Persona persona() const;
 
-    void timerLoop();
     void loadMemory();
 
     // Voce: tutto quello che Iris dice passa da qui (e si ricorda, per riconoscere la sua eco).
@@ -203,6 +228,10 @@ private:
     LlmEngine m_llm;
     GameChat m_chat{ m_whisper, m_llm };
     GameController m_game;
+    MiningScanner m_mining;
+    GameLog::Watcher m_gameLog;
+    Refinery::Timers m_refinery;
+    MiningLog::Recorder m_miningLog;
     NeuralVoice m_neural;
     TtsEngine m_tts;
     Tools m_tools{ *this };
@@ -246,10 +275,4 @@ private:
     std::atomic<bool> m_busy{ false };
     std::atomic<bool> m_cancel{ false };
     Clock::time_point m_lastInteraction = Clock::now();
-
-    // Timer
-    std::thread m_timerThread;
-    std::mutex m_timerMutex;
-    std::condition_variable m_timerCv;
-    std::vector<Timer> m_timers;
 };

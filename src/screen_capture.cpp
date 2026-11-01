@@ -101,6 +101,70 @@ Image capture(int x, int y, int width, int height) {
     return img;
 }
 
+std::vector<Point> rotatedCorners(int x, int y, int width, int height, double degrees) {
+    const double a = degrees * 3.14159265358979323846 / 180.0, c = std::cos(a), s = std::sin(a);
+    const double cx = x + width / 2.0, cy = y + height / 2.0, hw = width / 2.0, hh = height / 2.0;
+    const double dx[4] = { -hw, hw, hw, -hw }, dy[4] = { -hh, -hh, hh, hh };
+    std::vector<Point> out(4);
+    for (int i = 0; i < 4; ++i) out[i] = Point{ cx + dx[i] * c - dy[i] * s, cy + dx[i] * s + dy[i] * c };
+    return out;
+}
+
+Bounds rotatedBounds(int x, int y, int width, int height, double degrees) {
+    const std::vector<Point> p = rotatedCorners(x, y, width, height, degrees);
+    double x1 = p[0].x, y1 = p[0].y, x2 = p[0].x, y2 = p[0].y;
+    for (const auto& q : p) {
+        x1 = std::min(x1, q.x);
+        y1 = std::min(y1, q.y);
+        x2 = std::max(x2, q.x);
+        y2 = std::max(y2, q.y);
+    }
+    Bounds b;
+    b.x = (int)std::floor(x1);
+    b.y = (int)std::floor(y1);
+    b.width = (int)std::ceil(x2) - b.x;
+    b.height = (int)std::ceil(y2) - b.y;
+    return b;
+}
+
+Image straighten(const Image& source, double centerX, double centerY, int width, int height, double degrees) {
+    Image out;
+    if (width <= 0 || height <= 0 || source.empty()) return out;
+    out.width = width;
+    out.height = height;
+    out.pixels.assign((size_t)width * height * 4, 0);
+    const double a = degrees * 3.14159265358979323846 / 180.0, c = std::cos(a), s = std::sin(a);
+    auto at = [&](int px, int py, int ch) -> double {
+        if (px < 0 || py < 0 || px >= source.width || py >= source.height) return 0.0;
+        return source.pixels[((size_t)py * source.width + px) * 4 + ch];
+    };
+    for (int v = 0; v < height; ++v) {
+        for (int u = 0; u < width; ++u) {
+            // Il centro del pixel (u, v) della zona, girato, nelle coordinate di source.
+            const double dx = u + 0.5 - width / 2.0, dy = v + 0.5 - height / 2.0;
+            const double sx = centerX + dx * c - dy * s - 0.5, sy = centerY + dx * s + dy * c - 0.5;
+            const int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+            const double fx = sx - x0, fy = sy - y0;
+            uint8_t* p = &out.pixels[((size_t)v * width + u) * 4];
+            for (int ch = 0; ch < 3; ++ch) {
+                const double value = at(x0, y0, ch) * (1 - fx) * (1 - fy) + at(x0 + 1, y0, ch) * fx * (1 - fy) +
+                                     at(x0, y0 + 1, ch) * (1 - fx) * fy + at(x0 + 1, y0 + 1, ch) * fx * fy;
+                p[ch] = (uint8_t)std::clamp((int)std::lround(value), 0, 255);
+            }
+            p[3] = 255;
+        }
+    }
+    return out;
+}
+
+Image captureRotated(int x, int y, int width, int height, double degrees) {
+    if (std::fabs(degrees) < 0.05) return capture(x, y, width, height);
+    const Bounds b = rotatedBounds(x, y, width, height, degrees);
+    const Image shot = capture(b.x, b.y, b.width, b.height);
+    if (shot.empty()) return shot;
+    return straighten(shot, x + width / 2.0 - b.x, y + height / 2.0 - b.y, width, height, degrees);
+}
+
 Image prepareForOcr(const Image& src, int scale, int maxDimension) {
     if (src.empty()) return src;
     // Mai oltre il lato massimo dell'OCR (altrimenti rifiuta l'immagine).

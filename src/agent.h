@@ -10,7 +10,7 @@
 #include <vector>
 
 // La conversazione con Iris: il modello risponde, se serve usa gli strumenti
-// (fino a qualche giro: cerca, legge, poi risponde) e le frasi della risposta
+// (fino a qualche giro: comando di gioco, poi risponde) e le frasi della risposta
 // escono una alla volta verso la voce.
 //
 // Della conversazione si tengono domande, richieste di strumenti (con i
@@ -30,7 +30,6 @@ public:
     struct Persona {
         std::string userName;
         std::vector<std::string> memory; // cose da ricordare (memoria.txt)
-        bool internet = true;
         std::string game; // nome del gioco aperto (vuoto = nessuno): si usa game_command
         bool brief = false; // risposte di poche parole (mentre giochi, o se l'hai scelto sempre)
     };

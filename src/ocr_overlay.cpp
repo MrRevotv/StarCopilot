@@ -25,6 +25,7 @@ namespace {
     int g_savedX = -1, g_savedY = -1;
     bool g_locked = true;
     bool g_moved = false;
+    bool g_dragging = false; // tra WM_ENTERSIZEMOVE e WM_EXITSIZEMOVE: la posizione la decide il mouse
     bool g_hiddenFromCapture = false;
     int g_secondsLeft = 0;
     std::function<void(int, int)> g_onMoved;
@@ -132,7 +133,8 @@ namespace {
             x = std::clamp(x, (int)mon.left, std::max((int)mon.left, (int)mon.right - width));
             y = std::clamp(y, (int)mon.top, std::max((int)mon.top, (int)mon.bottom - height));
         }
-        SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+        // Mentre lo trascini (e arriva un messaggio) cambia la misura, non la posizione.
+        SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | (g_dragging ? SWP_NOMOVE : 0));
         updateCaptureVisibility(); // anche se si è spostata solo la zona
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
@@ -146,17 +148,21 @@ namespace {
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 
+    // Il riquadro è stato lasciato in un punto nuovo: da lì in poi la posizione è quella.
+    void saveMovedPosition() {
+        if (!g_moved) return;
+        g_moved = false;
+        RECT r;
+        if (!GetWindowRect(g_hwnd, &r)) return;
+        g_savedX = r.left;
+        g_savedY = r.top;
+        if (g_onMoved) g_onMoved(r.left, r.top);
+    }
+
     void relock() {
         KillTimer(g_hwnd, kUnlockTimer);
         setLocked(true);
-        if (g_moved) {
-            g_moved = false;
-            RECT r;
-            GetWindowRect(g_hwnd, &r);
-            g_savedX = r.left;
-            g_savedY = r.top;
-            if (g_onMoved) g_onMoved(r.left, r.top);
-        }
+        saveMovedPosition();
         if (!g_shown) ShowWindow(g_hwnd, SW_HIDE);
         else layout();
     }
@@ -214,15 +220,26 @@ namespace {
         case WM_NCHITTEST:
             if (!g_locked) return HTCAPTION;
             break;
+        case WM_ENTERSIZEMOVE:
+            g_dragging = true;
+            break;
         case WM_MOVING:
             g_moved = true;
+            break;
+        case WM_EXITSIZEMOVE:
+            g_dragging = false;
+            saveMovedPosition();
+            if (!g_locked && g_secondsLeft <= 0) relock(); // il tempo è finito mentre lo trascinavi
+            else layout();
             break;
         case WM_WINDOWPOSCHANGED: // anche mentre lo trascini
             updateCaptureVisibility();
             break;
         case WM_TIMER:
             if (w == kUnlockTimer) {
-                if (--g_secondsLeft <= 0) relock();
+                if (g_secondsLeft > 0) --g_secondsLeft;
+                // Non si blocca a metà di un trascinamento: aspetta che lo lasci.
+                if (g_secondsLeft <= 0 && !g_dragging) relock();
                 else InvalidateRect(hwnd, nullptr, FALSE);
             } else if (w == kTopmostTimer && IsWindowVisible(hwnd)) {
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);

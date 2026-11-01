@@ -15,6 +15,15 @@ void HotkeyListener::registerToggleKey(int vk, std::function<void()> cb) {
     m_toggles.push_back({ vk, false, std::move(cb) });
 }
 
+void HotkeyListener::setActions(std::vector<Action> actions) {
+    // Un tasto già tenuto giù nel momento del cambio non fa partire l'azione.
+    std::vector<bool> down;
+    for (const auto& a : actions) down.push_back(anyDown(a.triggers));
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_actions = std::move(actions);
+    m_actionWasDown = std::move(down);
+}
+
 void HotkeyListener::setTalkTriggers(const std::vector<TalkTrigger>& triggers) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_triggers = triggers;
@@ -205,6 +214,13 @@ void HotkeyListener::loop() {
                 bool tDown = (GetAsyncKeyState(t.vk) & 0x8000) != 0;
                 if (tDown && !t.wasDown && !m_paused) fire.push_back(t.callback);
                 t.wasDown = tDown;
+            }
+            // Le azioni: lo stato si segue anche in pausa, così il tasto appena scelto
+            // (ancora premuto quando la pausa finisce) non parte da solo.
+            for (size_t i = 0; i < m_actions.size() && i < m_actionWasDown.size(); ++i) {
+                const bool aDown = anyDown(m_actions[i].triggers);
+                if (aDown && !m_actionWasDown[i] && !m_paused) fire.push_back(m_actions[i].callback);
+                m_actionWasDown[i] = aDown;
             }
         }
         for (auto& f : fire) if (f) f();

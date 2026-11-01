@@ -1,13 +1,18 @@
 #include "region_selector.h"
+#include "screen_capture.h"
 #include "ui/ui.h"
 
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 namespace {
     constexpr const wchar_t* kClassName = L"VoiceToChatRegionSelector";
+    constexpr double kMaxAngle = 20.0;
 
     struct State {
         HDC shot = nullptr;      // lo schermo com'era
@@ -17,14 +22,38 @@ namespace {
         int width = 0, height = 0;
         POINT start{}, current{};
         bool dragging = false;
+        bool editing = false; // rettangolo fatto, si può girare: Invio conferma (solo con rotatable)
         bool done = false;
         bool cancelled = false;
+        bool rotatable = false;
+        double angle = 0.0;
+        const RegionSelector::Options* options = nullptr;
     };
     State* g_state = nullptr;
 
     RECT selection(const State& s) {
         return RECT{ std::min(s.start.x, s.current.x), std::min(s.start.y, s.current.y), std::max(s.start.x, s.current.x),
                      std::max(s.start.y, s.current.y) };
+    }
+
+    bool rotated(const State& s) { return s.rotatable && std::fabs(s.angle) >= 0.05; }
+
+    // Quello che occupa a schermo la zona (girata), con l'etichetta delle misure sotto.
+    RECT shownArea(const State& s, const RECT& r, UINT dpi) {
+        const ScreenCapture::Bounds b = ScreenCapture::rotatedBounds(r.left, r.top, r.right - r.left, r.bottom - r.top, rotated(s) ? s.angle : 0.0);
+        RECT u{ b.x, b.y, b.x + b.width, b.y + b.height };
+        const int margin = Ui::px(48, dpi);
+        InflateRect(&u, margin, margin);
+        u.right += Ui::px(200, dpi);
+        return u;
+    }
+
+    std::wstring angleText(double angle) {
+        wchar_t buf[32];
+        swprintf(buf, 32, L"%+.1f°", angle);
+        std::wstring t = buf;
+        std::replace(t.begin(), t.end(), L'.', L','); // all'italiana
+        return t;
     }
 
     // Rettangolo arrotondato in GDI semplice: qui si disegna con l'origine
@@ -57,18 +86,45 @@ namespace {
         BitBlt(dc, p.left, p.top, pw, ph, s.dimmed, p.left, p.top, SRCCOPY);
         const UINT dpi = Ui::dpiOf(hwnd);
 
-        if (s.dragging || s.done) {
+        if (s.dragging || s.editing || s.done) {
             RECT r = selection(s);
-            BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, s.shot, r.left, r.top, SRCCOPY);
-            RECT frame = r;
-            InflateRect(&frame, 2, 2);
-            for (int i = 0; i < 2; ++i) {
-                FrameRect(dc, &frame, Ui::brush(Ui::Color::Accent));
-                InflateRect(&frame, -1, -1);
+            int labelTop = r.bottom, labelBottomLimit = r.top, labelLeft = r.left;
+            if (!rotated(s)) {
+                BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, s.shot, r.left, r.top, SRCCOPY);
+                RECT frame = r;
+                InflateRect(&frame, 2, 2);
+                for (int i = 0; i < 2; ++i) {
+                    FrameRect(dc, &frame, Ui::brush(Ui::Color::Accent));
+                    InflateRect(&frame, -1, -1);
+                }
+            } else {
+                // La zona girata: chiara dentro il quadrilatero, con il bordo.
+                const auto corners = ScreenCapture::rotatedCorners(r.left, r.top, r.right - r.left, r.bottom - r.top, s.angle);
+                POINT pts[4];
+                for (int i = 0; i < 4; ++i) pts[i] = POINT{ (LONG)std::lround(corners[i].x), (LONG)std::lround(corners[i].y) };
+                const ScreenCapture::Bounds b = ScreenCapture::rotatedBounds(r.left, r.top, r.right - r.left, r.bottom - r.top, s.angle);
+                HRGN clip = CreatePolygonRgn(pts, 4, WINDING);
+                OffsetRgn(clip, -p.left, -p.top); // le regioni di ritaglio sono in pixel del DC, senza l'origine spostata
+                SelectClipRgn(dc, clip);
+                BitBlt(dc, b.x, b.y, b.width, b.height, s.shot, b.x, b.y, SRCCOPY);
+                SelectClipRgn(dc, nullptr);
+                DeleteObject(clip);
+                HPEN pen = CreatePen(PS_SOLID, 2, Ui::Color::Accent);
+                HGDIOBJ oldPen = SelectObject(dc, pen);
+                HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Polygon(dc, pts, 4);
+                SelectObject(dc, oldBrush);
+                SelectObject(dc, oldPen);
+                DeleteObject(pen);
+                labelTop = b.y + b.height;
+                labelBottomLimit = b.y;
+                labelLeft = b.x;
             }
             std::wstring size = std::to_wstring(r.right - r.left) + L" × " + std::to_wstring(r.bottom - r.top);
-            RECT label{ r.left, r.bottom + Ui::px(6, dpi), r.left + Ui::px(160, dpi), r.bottom + Ui::px(28, dpi) };
-            if (label.bottom > s.height) OffsetRect(&label, 0, -(r.bottom - r.top) - Ui::px(36, dpi));
+            if (s.rotatable) size += L"  ·  " + angleText(s.angle);
+            const int labelW = Ui::px(s.rotatable ? 200 : 160, dpi);
+            RECT label{ labelLeft, labelTop + Ui::px(6, dpi), labelLeft + labelW, labelTop + Ui::px(28, dpi) };
+            if (label.bottom > s.height) OffsetRect(&label, 0, -(labelTop - labelBottomLimit) - Ui::px(36, dpi));
             roundBox(dc, label, Ui::px(4, dpi), Ui::Color::Nav, Ui::Color::Nav);
             Ui::drawText(dc, size, label, Ui::font(Ui::Font::Bold, dpi), Ui::Color::Text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -77,7 +133,7 @@ namespace {
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi);
         POINT origin{ GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        const int bw = Ui::px(640, dpi), bh = Ui::px(64, dpi);
+        const int bw = Ui::px(700, dpi), bh = Ui::px(s.rotatable ? 84 : 64, dpi);
         const int bx = (mi.rcMonitor.left + mi.rcMonitor.right) / 2 - bw / 2 - origin.x;
         const int by = mi.rcMonitor.top + Ui::px(28, dpi) - origin.y;
         RECT banner{ bx, by, bx + bw, by + bh };
@@ -85,11 +141,16 @@ namespace {
         if (IntersectRect(&dummy, &banner, &p)) {
             roundBox(dc, banner, Ui::px(10, dpi), Ui::Color::Nav, Ui::Color::Accent);
             RECT t1{ banner.left, banner.top + Ui::px(10, dpi), banner.right, banner.top + Ui::px(34, dpi) };
-            Ui::drawText(dc, L"Trascina un rettangolo intorno alla chat del gioco", t1, Ui::font(Ui::Font::Bold, dpi), Ui::Color::Text,
-                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            RECT t2{ banner.left, banner.top + Ui::px(34, dpi), banner.right, banner.bottom - Ui::px(8, dpi) };
-            Ui::drawText(dc, L"Comprendi i nomi dei giocatori. Esc o tasto destro per annullare.", t2, Ui::font(Ui::Font::Small, dpi),
-                         Ui::Color::TextDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Ui::drawText(dc, s.options->title, t1, Ui::font(Ui::Font::Bold, dpi), Ui::Color::Text, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            RECT t2{ banner.left, banner.top + Ui::px(34, dpi), banner.right, banner.top + Ui::px(56, dpi) };
+            Ui::drawText(dc, s.options->hint, t2, Ui::font(Ui::Font::Small, dpi), Ui::Color::TextDim, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (s.rotatable) {
+                RECT t3{ banner.left, banner.top + Ui::px(56, dpi), banner.right, banner.bottom - Ui::px(8, dpi) };
+                const wchar_t* how = s.editing ? L"Rotellina del mouse (o ← →) per girarla come la chat · Invio per confermare · trascina per rifarla"
+                                               : L"Poi potrai girarla con la rotellina del mouse, se la chat è storta";
+                Ui::drawText(dc, how, t3, Ui::font(Ui::Font::Small, dpi), s.editing ? Ui::Color::Accent : Ui::Color::TextDim,
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         }
         SetViewportOrgEx(dc, 0, 0, nullptr);
         BitBlt(hdc, p.left, p.top, pw, ph, dc, 0, 0, SRCCOPY);
@@ -101,11 +162,21 @@ namespace {
 
     void invalidateSelection(HWND hwnd, const RECT& before, const RECT& after) {
         // Solo la parte che cambia (più l'etichetta con le misure): niente sfarfallio.
-        RECT u;
+        const UINT dpi = Ui::dpiOf(hwnd);
+        RECT a = shownArea(*g_state, before, dpi), b = shownArea(*g_state, after, dpi), u;
+        UnionRect(&u, &a, &b);
+        InvalidateRect(hwnd, &u, FALSE);
+    }
+
+    // Gira la zona di `delta` gradi.
+    void turn(HWND hwnd, double delta) {
+        State& s = *g_state;
+        if (!s.rotatable || !(s.dragging || s.editing)) return;
+        const RECT r = selection(s);
+        const RECT before = shownArea(s, r, Ui::dpiOf(hwnd));
+        s.angle = std::clamp(std::round((s.angle + delta) * 10.0) / 10.0, -kMaxAngle, kMaxAngle);
+        RECT after = shownArea(s, r, Ui::dpiOf(hwnd)), u;
         UnionRect(&u, &before, &after);
-        const int margin = Ui::px(48, Ui::dpiOf(hwnd));
-        InflateRect(&u, margin, margin);
-        u.right += Ui::px(160, Ui::dpiOf(hwnd));
         InvalidateRect(hwnd, &u, FALSE);
     }
 
@@ -115,6 +186,7 @@ namespace {
         case WM_LBUTTONDOWN:
             s->start = s->current = POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
             s->dragging = true;
+            s->editing = false;
             SetCapture(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -130,14 +202,30 @@ namespace {
                 s->current = POINT{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
                 s->dragging = false;
                 ReleaseCapture();
-                s->done = true;
+                if (s->rotatable) {
+                    // Si può ancora girare: conferma con Invio.
+                    const RECT r = selection(*s);
+                    s->editing = (r.right - r.left) >= 40 && (r.bottom - r.top) >= 20;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else {
+                    s->done = true;
+                }
             }
             return 0;
+        case WM_MOUSEWHEEL: {
+            const int notches = GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA;
+            turn(hwnd, notches * ((GET_KEYSTATE_WPARAM(w) & MK_SHIFT) ? 0.1 : 0.5));
+            return 0;
+        }
         case WM_RBUTTONUP:
             s->cancelled = true;
             return 0;
         case WM_KEYDOWN:
             if (w == VK_ESCAPE) s->cancelled = true;
+            else if (w == VK_RETURN && s->editing) s->done = true;
+            else if (w == VK_LEFT) turn(hwnd, -0.1);
+            else if (w == VK_RIGHT) turn(hwnd, 0.1);
+            else if (w == 'R' || w == '0' || w == VK_NUMPAD0) turn(hwnd, -s->angle); // di nuovo dritta
             return 0;
         case WM_CAPTURECHANGED:
             if (s->dragging && (HWND)l != hwnd) s->cancelled = true;
@@ -160,13 +248,22 @@ namespace {
 
 namespace RegionSelector {
 
-bool selectRegion(HINSTANCE instance, RECT& out) {
+bool selectRegion(HINSTANCE instance, RECT& out, const Options& options, double* angle) {
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
     State state;
     state.width = vw;
     state.height = vh;
+    state.options = &options;
+    state.rotatable = options.rotatable;
+    state.angle = options.rotatable ? std::clamp(options.angle, -kMaxAngle, kMaxAngle) : 0.0;
+    if (options.rotatable && options.initial.right - options.initial.left >= 40 && options.initial.bottom - options.initial.top >= 20) {
+        // La zona di prima, pronta da girare.
+        state.start = POINT{ options.initial.left - vx, options.initial.top - vy };
+        state.current = POINT{ options.initial.right - vx, options.initial.bottom - vy };
+        state.editing = true;
+    }
     HDC screen = GetDC(nullptr);
     state.shot = CreateCompatibleDC(screen);
     state.dimmed = CreateCompatibleDC(screen);
@@ -222,6 +319,7 @@ bool selectRegion(HINSTANCE instance, RECT& out) {
             RECT r = selection(state);
             out = RECT{ vx + r.left, vy + r.top, vx + r.right, vy + r.bottom };
             ok = (out.right - out.left) >= 40 && (out.bottom - out.top) >= 20;
+            if (ok && angle) *angle = state.rotatable ? state.angle : 0.0;
         }
         DestroyWindow(hwnd);
     }
