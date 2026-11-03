@@ -1962,24 +1962,69 @@ static void testGameLog() {
     // Avvio con Windows: il comando nel registro (non si tocca il registro vero nelle prove).
     CHECK(Autostart::commandFor(L"C:\\Giochi\\Iris\\iris.exe") == L"\"C:\\Giochi\\Iris\\iris.exe\" --avvio-windows");
 
-    // Impostazioni nuove: tasti della barra di base, saluto spento, diario spento finché non lo accetti.
+    // Impostazioni nuove: la ruota con Shift+Tab (solo in gioco), saluto spento, diario spento finché non lo accetti.
     AppSettings fresh = AppSettings::parse("");
     CHECK(!fresh.greetOnStart);
     CHECK(fresh.closeToTray);
     CHECK(!fresh.gameLogEnabled && !fresh.gameLogAccepted);
-    CHECK(fresh.quickBarTriggers.size() == 1 && fresh.quickBarTriggers[0].vk == VK_DIVIDE);
+    CHECK(fresh.quickBarTriggers.size() == 1 && fresh.quickBarTriggers[0].vk == VK_TAB && fresh.quickBarTriggers[0].mods == TalkTrigger::Shift);
+    CHECK(fresh.wheelGameOnly);
     CHECK(fresh.hideAllTriggers.size() == 1 && fresh.hideAllTriggers[0].vk == VK_MULTIPLY);
+    CHECK_STR(HotkeyListener::describeTrigger(fresh.quickBarTriggers[0]), "Shift+Tab");
     fresh.quickBarTriggers.clear(); // tolto dall'utente: deve restare tolto
     fresh.gameLogEnabled = fresh.gameLogAccepted = true;
     fresh.gameLogPath = "D:\\SC\\LIVE\\Game.log";
     fresh.panelRefineryOpen = true;
     fresh.panelLogX = 1200;
+    fresh.wheelGameOnly = false;
     const AppSettings back = AppSettings::parse(fresh.serialize());
     CHECK(back.quickBarTriggers.empty());
+    CHECK(!back.wheelGameOnly);
     CHECK(back.gameLogEnabled && back.gameLogAccepted);
     CHECK_STR(back.gameLogPath, "D:\\SC\\LIVE\\Game.log");
     CHECK(back.panelRefineryOpen);
     CHECK_EQ(back.panelLogX, 1200);
+
+    // Le impostazioni della barra di prima (Num /): la ruota passa a Shift+Tab, "nascondi tutto" resta com'era.
+    const AppSettings old = AppSettings::parse("quickBarConfigured=1\nquickBarTrigger=keyboard,111\nhideAllTrigger=keyboard,120\n");
+    CHECK(old.quickBarTriggers.size() == 1 && old.quickBarTriggers[0].vk == VK_TAB && old.quickBarTriggers[0].mods == TalkTrigger::Shift);
+    CHECK(old.hideAllTriggers.size() == 1 && old.hideAllTriggers[0].vk == VK_F9);
+
+    // Combinazioni con i modificatori: si salvano, si rileggono, si distinguono dal tasto da solo.
+    AppSettings combo = AppSettings::parse("");
+    TalkTrigger ctrlF1;
+    ctrlF1.vk = VK_F1;
+    ctrlF1.mods = TalkTrigger::Ctrl | TalkTrigger::Shift;
+    TalkTrigger plainF1;
+    plainF1.vk = VK_F1;
+    combo.quickBarTriggers = { ctrlF1 };
+    combo.triggers = { plainF1 };
+    const AppSettings comboBack = AppSettings::parse(combo.serialize());
+    CHECK(comboBack.quickBarTriggers.size() == 1 && comboBack.quickBarTriggers[0] == ctrlF1);
+    CHECK(comboBack.triggers.size() == 1 && comboBack.triggers[0] == plainF1 && comboBack.triggers[0].mods == 0);
+    CHECK(!(ctrlF1 == plainF1));
+    CHECK_STR(HotkeyListener::describeTrigger(ctrlF1), "Ctrl+Shift+F1");
+    CHECK(combo.serialize().find("quickBarTrigger=keyboard,112,3\n") != std::string::npos);
+    CHECK(combo.serialize().find("trigger=keyboard,112\n") != std::string::npos);
+}
+
+// --- La ruota: quale voce sta nella direzione del mouse ----------------------------------------------------
+static void testWheel() {
+    std::printf("\n[ruota]\n");
+    // 9 voci da 40 gradi, la prima in alto, poi in senso orario (y verso il basso, come lo schermo).
+    CHECK_EQ(QuickBar::sectorAt(0, -100, 9, 50), 0);   // su
+    CHECK_EQ(QuickBar::sectorAt(100, 0, 9, 50), 2);    // destra: 90 gradi -> la terza voce (80-120 = 2)
+    CHECK_EQ(QuickBar::sectorAt(5, 100, 9, 50), 4);    // giù, appena a destra: 177 gradi, voce 4 (140-180)
+    CHECK_EQ(QuickBar::sectorAt(-5, 100, 9, 50), 5);   // giù, appena a sinistra: 183 gradi, voce 5 (180-220)
+    CHECK_EQ(QuickBar::sectorAt(-100, 0, 9, 50), 7);   // sinistra: 270 gradi (260-300 = 7)
+    CHECK_EQ(QuickBar::sectorAt(-50, -100, 9, 50), 8); // a sinistra dell'alto (-27 gradi): l'ultima voce
+    CHECK_EQ(QuickBar::sectorAt(-30, -100, 9, 50), 0); // -17 gradi: ancora la prima (-20..20)
+    CHECK_EQ(QuickBar::sectorAt(30, -100, 9, 50), 0);  // poco a destra dell'alto: ancora la prima
+    CHECK_EQ(QuickBar::sectorAt(10, 10, 9, 50), -1);   // nel centro
+    CHECK_EQ(QuickBar::sectorAt(0, -100, 0, 50), -1);  // nessuna voce
+    // Al bordo tra due voci (20 gradi) vince quella dopo, senza buchi.
+    const double a = 20.0 * 3.14159265358979 / 180.0;
+    CHECK_EQ(QuickBar::sectorAt(100 * std::sin(a) + 0.01, -100 * std::cos(a), 9, 50), 1);
 }
 
 // --- Editor dei comandi di gioco (pagina Star Citizen) ----------------------------------------------------
@@ -2332,18 +2377,21 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (mode == "--barra" && argc >= 3) {
-        // iris_tests --barra cartella : la barra rapida e i pannelli disegnati in PNG (stesso codice dello schermo).
+    if (mode == "--ruota" && argc >= 3) {
+        // iris_tests --ruota cartella : la ruota e i pannelli disegnati in PNG (stesso codice dello schermo).
         Ui::initialize();
         QuickBar::create(GetModuleHandleW(nullptr), {});
-        QuickBar::setButtons({ { "mining", L"MINING", L"Leggi adesso la signature dello scanner", false, true },
-                               { "chat", L"TRADUZIONE", L"Traduzione della chat accesa: clic per spegnerla", true, true },
-                               { "axis", L"ASSI", L"Apri l'overlay dell'Axis Visualizer", false, true },
-                               { "orb", L"SFERA", L"Nascondi la sfera di Iris", true, true },
-                               { "missions", L"MISSIONI", L"Contratti e obiettivi in corso", true, true },
-                               { "refinery", L"RAFFINERIA", L"Gli ordini della raffineria", true, true },
-                               { "log", L"DIARIO", L"Zona, salute e ultimi eventi", false, false } },
-                             L"NUM /  BARRA   \u00B7   NUM *  NASCONDI TUTTO", L"TI ASCOLTO", 1);
+        QuickBar::setButtons({ { "mining", L"MINING", L"Leggi adesso la signature dello scanner", false, true, L"LEGGI ORA", 6 },
+                               { "record", L"REGISTRO", L"Registro acceso (4 rilevamenti): clic per chiuderlo e salvarlo sul desktop", true, true,
+                                 L"IN CORSO \u00B7 4", 1 },
+                               { "refinery", L"RAFFINERIA", L"Gli ordini della raffineria con il conto alla rovescia", true, true, L"APERTO", 1 },
+                               { "missions", L"MISSIONI", L"Contratti e obiettivi in corso (dal Game.log)", false, true, L"CHIUSO", 4 },
+                               { "log", L"DIARIO", L"Attiva prima il diario di bordo nella finestra di Iris", false, false, L"DIARIO SPENTO", 2 },
+                               { "chat", L"TRADUZIONE", L"Traduzione della chat accesa: clic per spegnerla", true, true, L"ACCESA", 1 },
+                               { "axis", L"ASSI", L"Apri l'overlay dell'Axis Visualizer", false, true, L"CHIUSO", 4 },
+                               { "orb", L"SFERA", L"Nascondi la sfera di Iris", true, true, L"VISIBILE", 1 },
+                               { "iris", L"IRIS", L"Apri la finestra di Iris: impostazioni, mining, traduzione, diario", false, true, L"APRI", 6 } },
+                             L"SHIFT+TAB", L"TI ASCOLTO", 1);
         QuickBar::setPanel("missions", L"MISSIONI",
                            { { L"IN CORSO (2)", L"", 5 }, { L"Mese Scoperta RSI: Liv. Giallo - Supporta Nave", L"15:21", 0 },
                              { L"Mese Scoperta RSI: Importante Trasporto Forniture", L"15:51", 0 }, { L"OBIETTIVI", L"", 5 },
@@ -2356,10 +2404,10 @@ int main(int argc, char** argv) {
                              { L"Contratto completato: Mese Scoperta RSI: Ordine UCM (S)", L"16:20", 1 },
                              { L"Wingman_77 \u00E8 in quantum verso di te", L"16:18", 0 },
                              { L"Contratto fallito: Liv. Arancione - Difendi Nave", L"16:09", 3 } });
-        const bool ok = QuickBar::savePreview(TextUtils::utf8ToWide(argv[2]), 1);
+        const bool ok = QuickBar::savePreview(TextUtils::utf8ToWide(argv[2]), 5);
         QuickBar::destroy();
         Ui::shutdown();
-        std::printf("%s\n", ok ? "barra e pannelli salvati" : "salvataggio non riuscito");
+        std::printf("%s\n", ok ? "ruota e pannelli salvati" : "salvataggio non riuscito");
         return ok ? 0 : 1;
     }
     if (mode == "--sfera" && argc >= 3) {
@@ -2835,6 +2883,7 @@ int main(int argc, char** argv) {
     testAxis();
     testGameLog();
     testCommandEditor();
+    testWheel();
     testMiningLog();
     if (mode == "--completi") testFull();
 

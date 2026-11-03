@@ -5,7 +5,7 @@
 #include <vector>
 
 // Registro delle scansioni del mining: con l'opzione accesa ogni lettura dello
-// scanner (tasto, lettura continua, voce, tastierino, barra rapida) finisce in un
+// scanner (tasto, lettura continua, voce, tastierino, ruota) finisce in un
 // registro; alla chiusura Iris chiede il luogo e la qualità media dei materiali e
 // salva il file sul desktop: JSON (per il sito) e, se vuoi, CSV (per Excel).
 // La stessa roccia letta più volte di seguito conta una volta sola.

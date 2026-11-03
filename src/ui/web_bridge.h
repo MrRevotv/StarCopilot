@@ -49,7 +49,7 @@ public:
     void onTimer();                // circa 30 volte al secondo
     void onAppMessage(UINT msg, WPARAM wp, LPARAM lp);
     // Axis Visualizer: l'overlay è cambiato, o una sua finestra è stata spostata.
-    // Barra rapida: "chiudi il registro delle scansioni" -> la pagina Mining con la richiesta di luogo e qualità.
+    // Ruota: "chiudi il registro delle scansioni" -> la pagina Mining con la richiesta di luogo e qualità.
     void openMiningLogDialog();
     void onAxisChanged();
     void onAxisMoved(void* positions);
@@ -77,7 +77,7 @@ private:
     void handleMiningLog(const std::string& action, const void* message);
     void handleCommands(const std::string& action, const void* message); // editor dei comandi di gioco
     void captureGameKey();
-    void handleExtra(const std::string& action, const void* message); // diario, raffineria, avvio, barra rapida
+    void handleExtra(const std::string& action, const void* message); // diario, raffineria, avvio, ruota
     void toast(const std::string& text, bool ok = true);
 
     void handle(const std::string& action, const void* message);

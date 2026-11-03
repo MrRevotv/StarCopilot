@@ -120,7 +120,7 @@ namespace {
         return out;
     }
 
-    // I tasti a pressione singola: 0-3 il mining, 4 la barra rapida, 5 nascondi tutto.
+    // I tasti a pressione singola: 0-3 il mining, 4 la ruota, 5 nascondi tutto.
     std::vector<TalkTrigger>& miningKeys(AppSettings& s, int row) {
         switch (row) {
         case 0: return s.miningScanTriggers;
@@ -301,8 +301,9 @@ void WebBridge::sendSettings() {
     std::wstring autostartCommand;
     j["autostart"] = Autostart::enabled(&autostartCommand);
     j["autostartElsewhere"] = j["autostart"].get<bool>() && !Autostart::pointsHere();
-    // Barra rapida
+    // La ruota nel gioco
     j["quickBarEnabled"] = s.quickBarEnabled;
+    j["wheelGameOnly"] = s.wheelGameOnly;
     j["barKeys"] = json::array({ describeKeys(s.quickBarTriggers, nullptr), describeKeys(s.hideAllTriggers, nullptr) });
     // Diario di bordo e raffineria
     j["gameLogEnabled"] = s.gameLogEnabled;
@@ -595,6 +596,7 @@ void WebBridge::setSetting(const std::string& key, const void* valuePtr) {
                  { "greetOnStart", &AppSettings::greetOnStart },
                  { "closeToTray", &AppSettings::closeToTray },
                  { "quickBarEnabled", &AppSettings::quickBarEnabled },
+                 { "wheelGameOnly", &AppSettings::wheelGameOnly },
                  { "gameLogSpeakContracts", &AppSettings::gameLogSpeakContracts },
                  { "gameLogSpeakHealth", &AppSettings::gameLogSpeakHealth },
                  { "gameLogSpeakZones", &AppSettings::gameLogSpeakZones },
@@ -937,7 +939,7 @@ void WebBridge::startCapture(const std::string& target) {
     const bool allowJoystick = target != "chatOpen" && target != "chatSend";
     send("capture", dump({ { "target", target },
                            { "active", true },
-                           { "text", allowJoystick ? "Premi il tasto o il pulsante del joystick da usare (Esc annulla)..."
+                           { "text", allowJoystick ? "Premi il tasto, una combinazione (es. Shift+Tab) o il pulsante del joystick da usare (Esc annulla)..."
                                                    : "Premi il tasto da usare (Esc annulla)..." } }));
     HWND window = m_window;
     m_captureThread = std::thread([this, window, allowJoystick]() {
@@ -1534,7 +1536,7 @@ void WebBridge::handleAxis(const std::string& action, const void* messagePtr) {
     }
 }
 
-// --- Diario di bordo (Game.log), raffineria, avvio con Windows, barra rapida ------------------------
+// --- Diario di bordo (Game.log), raffineria, avvio con Windows, ruota --------------------------------
 
 namespace {
     const char* kindId(GameLog::Kind k) {
@@ -1621,7 +1623,7 @@ void WebBridge::handleExtra(const std::string& action, const void* messagePtr) {
         else toast("Avvio con Windows non cambiato: " + error, false);
         sendSettings();
     } else if (action == "quickBarShow") {
-        HudHost::toggleBar();
+        HudHost::toggleWheel(false);
     } else if (action == "gameLogEnable") {
         const bool on = m.value("on", false);
         // Si accende solo con l'avviso accettato nella pagina (ToS di Star Citizen, a tuo rischio).

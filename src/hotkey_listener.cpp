@@ -52,10 +52,26 @@ bool HotkeyListener::isAnyTalkTriggerDown() {
     return anyDown(getTalkTriggers());
 }
 
+namespace {
+    bool keyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+    // Shift/Ctrl/Alt tenuti giù adesso (destro o sinistro).
+    int heldMods() {
+        int m = 0;
+        if (keyDown(VK_SHIFT)) m |= TalkTrigger::Shift;
+        if (keyDown(VK_CONTROL)) m |= TalkTrigger::Ctrl;
+        if (keyDown(VK_MENU)) m |= TalkTrigger::Alt;
+        return m;
+    }
+
+    bool isModifier(int vk) { return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU); }
+}
+
 bool HotkeyListener::anyDown(const std::vector<TalkTrigger>& triggers) {
     for (const auto& t : triggers) {
         if (t.type == TalkTrigger::Type::Keyboard) {
-            if (GetAsyncKeyState(t.vk) & 0x8000) return true;
+            // I modificatori richiesti devono esserci (altri in più non danno fastidio).
+            if (keyDown(t.vk) && (heldMods() & t.mods) == t.mods) return true;
         } else if (JoystickInput::isButtonDown(t.joystickId, t.buttonIndex)) {
             return true;
         }
@@ -113,7 +129,13 @@ std::string HotkeyListener::keyName(int vk) {
 }
 
 std::string HotkeyListener::describeTrigger(const TalkTrigger& t) {
-    if (t.type == TalkTrigger::Type::Keyboard) return keyName(t.vk);
+    if (t.type == TalkTrigger::Type::Keyboard) {
+        std::string prefix;
+        if (t.mods & TalkTrigger::Ctrl) prefix += "Ctrl+";
+        if (t.mods & TalkTrigger::Alt) prefix += "Alt+";
+        if (t.mods & TalkTrigger::Shift) prefix += "Shift+";
+        return prefix + keyName(t.vk);
+    }
     std::string name = t.joystickName.empty() ? JoystickInput::nameOf(t.joystickId) : t.joystickName;
     if (name.empty()) name = "Joystick";
     return name + ": pulsante " + std::to_string(t.buttonIndex + 1);
@@ -146,6 +168,8 @@ bool HotkeyListener::captureNextInput(TalkTrigger& out, std::atomic<bool>& cance
     };
     if (allowJoystick) snapshot(true);
 
+    // Un modificatore premuto da solo (destro o sinistro): vale se lo rilasci senza premere altro.
+    int loneModifier = 0;
     auto start = std::chrono::steady_clock::now();
     while (!cancel.load()) {
         if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeoutMs)) return false;
@@ -153,19 +177,32 @@ bool HotkeyListener::captureNextInput(TalkTrigger& out, std::atomic<bool>& cance
             bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
             if (down && !keyWasDown[vk]) {
                 if (vk == VK_ESCAPE) return false;
-                // Shift/Ctrl/Alt generici: preferiamo la versione destra/sinistra
-                // (arriva nello stesso giro, con un codice più alto).
-                bool generic = vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU;
                 // Per i tasti della chat (allowJoystick=false) serve la tastiera, non il mouse.
                 bool mouse = vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
-                if (vk != VK_LBUTTON && !generic && (allowJoystick || !mouse)) {
+                if (isModifier(vk)) {
+                    // Shift/Ctrl/Alt generici: teniamo la versione destra/sinistra (stesso giro, codice più alto).
+                    // Alt Gr arriva come Ctrl sinistro + Alt destro: vince Alt destro.
+                    const bool generic = vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU;
+                    if (!generic && (!loneModifier || vk == VK_RMENU)) loneModifier = vk;
+                } else if (vk != VK_LBUTTON && (allowJoystick || !mouse)) {
                     out = TalkTrigger{};
                     out.type = TalkTrigger::Type::Keyboard;
                     out.vk = vk;
+                    out.mods = heldMods(); // Shift+Tab, Ctrl+F1...
+                    if (loneModifier == VK_RMENU && (out.mods & TalkTrigger::Ctrl) && !keyDown(VK_RCONTROL)) {
+                        // Alt Gr + tasto: il Ctrl finto di Windows non fa parte della combinazione.
+                        out.mods &= ~TalkTrigger::Ctrl;
+                    }
                     return true;
                 }
             }
             keyWasDown[vk] = down;
+        }
+        if (loneModifier && heldMods() == 0) {
+            out = TalkTrigger{};
+            out.type = TalkTrigger::Type::Keyboard;
+            out.vk = loneModifier;
+            return true;
         }
         if (allowJoystick && snapshot(false)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(15));

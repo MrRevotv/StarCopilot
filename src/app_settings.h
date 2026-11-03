@@ -51,11 +51,12 @@ struct AppSettings {
     bool greetOnStart = false;            // "Ciao, sono online e pronta" quando i modelli sono caricati
     bool closeToTray = true;              // la X nasconde la finestra nell'area di notifica (Esci dal menu dell'icona)
 
-    // --- Barra rapida nel gioco (come la barra di citizen-assistant) -----------------------
+    // --- La ruota nel gioco (i nomi "quickBar" vengono dalla barra rapida di prima) -------
     bool quickBarEnabled = true;
-    std::vector<TalkTrigger> quickBarTriggers; // mostra/nascondi la barra (predefinito: Num /)
+    std::vector<TalkTrigger> quickBarTriggers; // apri/chiudi la ruota, Iris in primo piano (predefinito: Shift+Tab)
+    bool wheelGameOnly = true;                 // il tasto apre la ruota solo con Star Citizen in primo piano
     std::vector<TalkTrigger> hideAllTriggers;  // nasconde tutto quello di Iris sullo schermo (predefinito: Num *)
-    // I pannelli sopra il gioco: aperti o no, e dove (-1 = sotto la barra).
+    // I pannelli sopra il gioco: aperti o no, e dove (-1 = in alto, in fila con gli altri).
     bool panelMissionsOpen = false, panelRefineryOpen = false, panelLogOpen = false;
     int panelMissionsX = -1, panelMissionsY = -1;
     int panelRefineryX = -1, panelRefineryY = -1;

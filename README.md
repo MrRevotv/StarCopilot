@@ -13,11 +13,15 @@ servita dall'exe stesso: niente file in più da distribuire. Barra laterale con 
 *Star Citizen*, *Mining*, *Axis Visualizer*, *Diario di bordo*, *Chat di gioco*, *Traduzione chat*,
 *Messaggi filtrati*, *Ascolto e voce*, *Impostazioni*; cursori, interruttori e la sfera animata che segue la voce.
 
-**Barra rapida nel gioco** (l'idea della barra di citizen-assistant): col suo tasto (Num / di base)
-scende dall'alto dello schermo, sopra il gioco, senza togliergli il fuoco: *Mining* (leggi adesso),
-*Traduzione* (accesa/spenta), *Assi* (overlay dell'Axis Visualizer), *Sfera*, e i pannelli *Missioni*,
-*Raffineria* e *Diario* (si trascinano dove vuoi e restano lì). *Nascondi tutto* (Num *) toglie dallo
-schermo barra, pannelli, sfera e overlay finché non lo ripremi. Esclusa dalle catture (OBS, OCR).
+**Ruota nel gioco**: col suo tasto (Shift+Tab di base) si apre al centro dello schermo e porta Iris
+davanti al gioco, così il cursore si libera da solo, senza Alt-Tab. Punta una voce col mouse e clicca:
+*Mining* (leggi adesso), *Registro*, *Raffineria*, *Missioni*, *Diario*, *Traduzione* (accesa/spenta),
+*Assi* (overlay dell'Axis Visualizer), *Sfera*, *Iris* (la finestra). Di nuovo il tasto, Esc, il tasto
+destro o un clic al centro ridanno il fuoco al gioco; di base il tasto vale solo con Star Citizen davanti
+(negli altri programmi Shift+Tab resta libero). I pannelli si mettono in alto uno accanto all'altro, o
+dove li hai trascinati l'ultima volta, e non tolgono il fuoco al gioco. Serve il gioco in finestra senza
+bordi. *Nascondi tutto* (Num *) toglie dallo schermo ruota, pannelli, sfera e overlay finché non lo
+ripremi. Esclusi dalle catture (OBS, OCR).
 
 **Avvio con Windows** (Impostazioni › Avvio): Iris parte nascosta nell'area di notifica (chiave Run
 dell'utente, niente permessi da amministratore). La X la nasconde lì (tasto destro sull'icona › Esci per
@@ -172,7 +176,7 @@ Ti dice **a schermo** che minerale o oggetto c'è nella signature dello scanner,
 - **Sconosciute**: le signature che non tornano finiscono in `%appdata%\Iris\mining_sconosciute.csv`
   (restano dopo il riavvio); scrivi materiale e quantità e Iris aggiunge la firma base alla tabella.
 - Immagini della lettura solo se le chiedi, e solo l'ultima (`%appdata%\Iris\debug\mining`).
-- **Registro delle scansioni** (pagina *Mining* o pulsante *REGISTRO* della barra rapida): acceso,
+- **Registro delle scansioni** (pagina *Mining* o voce *REGISTRO* della ruota): acceso,
   ogni roccia letta (tasto, lettura continua, voce, tastierino, barra) finisce nel registro, con
   esito (certo, probabile, ambiguo, sconosciuto), materiale, quantità, rarità; la stessa roccia
   riletta più volte di seguito conta una volta. Alla chiusura Iris chiede **in che luogo eri** e la
@@ -201,7 +205,7 @@ notifiche dell'HUD in italiano e in inglese (verificate su Game.log veri):
 - A voce: «Iris, che missioni ho?», «Iris, sono in zona di armistizio?» (strumento `game_status`).
 
 Le uccisioni e gli ordini della raffineria **non** sono più nel Game.log delle versioni attuali.
-La **raffineria** quindi va a timer (pagina *Mining*, barra rapida o a voce: «Iris, raffineria a
+La **raffineria** quindi va a timer (pagina *Mining*, ruota o a voce: «Iris, raffineria a
 Levski tra 3 ore e 20»): conto alla rovescia, avviso a voce quando l'ordine è pronto anche a
 finestra chiusa, ordini salvati in `raffineria.json`.
 
@@ -301,7 +305,7 @@ build\iris_tests.exe --voce "testo"          la voce di Windows
 build\iris_tests.exe --voce-neurale t.txt o.wav  la voce neurale, frase per frase, in un file
 build\iris_tests.exe --effetto robot in.wav out.wav  un effetto sulla voce (ia, androide, robot) su un WAV
 build\iris_tests.exe --sfera sfera.png         un fotogramma della sfera fluttuante, su scacchiera (trasparenza)
-build\iris_tests.exe --barra cartella          la barra rapida e i pannelli in PNG (le finestre vere sono escluse dalle catture)
+build\iris_tests.exe --ruota cartella          la ruota e i pannelli in PNG (le finestre vere sono escluse dalle catture)
 build\iris_tests.exe --microfono "nome" [s]  volume e probabilità di voce del microfono, secondo per secondo
 build\iris_tests.exe --trascrivi x.raw       cosa capisce whisper (audio float32 16 kHz)
 build\iris_tests.exe --mining "2 16,960"     cosa capisce la decodifica del mining da un testo dell'OCR
@@ -346,7 +350,7 @@ build\iris_tests.exe --ppocr                 PP-OCR contro l'OCR di Windows sui 
 | `axis_config.*` | Axis Visualizer: profili e moduli (JSON di Axis Visualizer), importazione, finestre per OBS |
 | `axis_input.*` | Axis Visualizer: periferiche (DirectInput, XInput, mouse, tastiera) e i loro valori |
 | `axis_server.*` | Axis Visualizer: server per OBS (HTTP + WebSocket, solo locale) |
-| `ui/quick_bar.*`, `ui/hud_host.*` | barra rapida e pannelli sopra il gioco (GDI+, non rubano il fuoco) e cosa fanno |
+| `ui/quick_bar.*`, `ui/hud_host.*` | ruota (prende il primo piano e lo ridà al gioco) e pannelli sopra il gioco (GDI+, non rubano il fuoco) e cosa fanno |
 | `ui/axis_panes.*`, `ui/axis_overlay.*` | Axis Visualizer: disegno dei moduli (GDI+) e finestre sopra il gioco, in un thread suo |
 | copiati da Voice to Chat | `chat_parser`, `gamer_slang`, `glossary`, `input_sender`, `language_guess`, `languages`, `ocr_engine`, `ocr_overlay`, `region_selector`, `sc_locations`, `screen_capture`, `screen_match`, `translation_prompt` (con le loro prove) |
 | `ui/main_window.*` | la finestra con WebView2: serve le pagine dall'exe, tiene aggiornati i riquadri sopra il gioco |

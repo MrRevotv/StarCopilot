@@ -1414,7 +1414,7 @@ void Assistant::applyMiningKeys(const AppSettings& s) {
                            });
                            m_tts.chime(on ? TtsEngine::Chime::Confirm : TtsEngine::Chime::Error);
                        } });
-    // La barra rapida: la mostra e la nasconde la finestra (thread dell'interfaccia).
+    // La ruota: la apre e la chiude la finestra (thread dell'interfaccia).
     if (s.quickBarEnabled) {
         actions.push_back({ s.quickBarTriggers, [this]() { notify(Event::QuickBar); } });
         actions.push_back({ s.hideAllTriggers, [this]() { notify(Event::HideAll); } });

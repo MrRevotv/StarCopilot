@@ -1,6 +1,6 @@
 ---
 name: ui-ux-design
-description: Regole di design per le interfacce di Iris (pagine WebView2 in src/ui/web e finestre GDI+ sopra il gioco). Usala ogni volta che crei o ritocchi una pagina, un pannello, la barra rapida o un overlay, e per fare un controllo completo dell'interfaccia (spaziature, tipografia, stati dei controlli).
+description: Regole di design per le interfacce di Iris (pagine WebView2 in src/ui/web e finestre GDI+ sopra il gioco). Usala ogni volta che crei o ritocchi una pagina, un pannello, la ruota o un overlay, e per fare un controllo completo dell'interfaccia (spaziature, tipografia, stati dei controlli).
 ---
 
 # Interfaccia visiva e UX di Iris
@@ -36,7 +36,8 @@ Transizioni **150–200 ms** (colore, bordo, ombra, opacità); niente animazioni
 - Azioni irreversibili (svuota, elimina, attiva funzioni a rischio): conferma con `ask()`, pulsante `danger`.
 - Esito delle azioni: `toast()` breve; errori persistenti in un `.callout.bad` nella pagina.
 - Mentre l'utente scrive in una casella non ridisegnare quella parte (perderebbe il fuoco).
-- Overlay sopra il gioco: non rubano mai il fuoco (WS_EX_NOACTIVATE), esclusi dalle catture quando
+- Overlay sopra il gioco: non rubano mai il fuoco (WS_EX_NOACTIVATE), tranne la ruota (Shift+Tab), che prende
+  il primo piano apposta per liberare il cursore e lo ridà al gioco quando si chiude; esclusi dalle catture quando
   coprono una zona letta dall'OCR, posizioni ricordate, DPI per monitor.
 
 ## Verifica

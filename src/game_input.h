@@ -47,8 +47,13 @@ namespace GameInput {
     // La finestra del gioco: per nome del processo ("StarCitizen" = StarCitizen.exe), se no per titolo.
     HWND findGameWindow(const std::string& processName, const std::string& windowTitle);
     bool isForeground(HWND window);
+    // Star Citizen (StarCitizen.exe, o la finestra "Star Citizen") è la finestra in primo piano?
+    bool starCitizenInForeground();
     // Porta il gioco in primo piano (anche quando Windows non vorrebbe).
     bool focus(HWND window);
+    // Porta in primo piano una finestra di Iris senza mandare tasti al gioco: si aggancia per un
+    // attimo all'input della finestra davanti (AttachThreadInput). true se ci è riuscita.
+    bool takeForeground(HWND own);
     // L'area interna della finestra, in coordinate schermo.
     bool clientRect(HWND window, RECT& out);
 

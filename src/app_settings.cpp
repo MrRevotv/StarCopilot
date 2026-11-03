@@ -64,11 +64,13 @@ AppSettings AppSettings::load() {
 }
 
 namespace {
-    // "keyboard,107" / "joystick2,<id>,<pulsante>,<nome>" -> tasto. false se non si capisce.
+    // "keyboard,107" / "keyboard,9,1" (Shift+Tab) / "joystick2,<id>,<pulsante>,<nome>" -> tasto. false se non si capisce.
     bool parseTrigger(const std::string& v, TalkTrigger& t) {
         if (TextUtils::startsWith(v, "keyboard,")) {
+            auto p = splitN(v.substr(9), 2);
             t.type = TalkTrigger::Type::Keyboard;
-            t.vk = toInt(v.substr(9), 0);
+            t.vk = toInt(p[0], 0);
+            t.mods = p.size() > 1 ? (toInt(p[1], 0) & (TalkTrigger::Shift | TalkTrigger::Ctrl | TalkTrigger::Alt)) : 0;
             return t.vk > 0 && t.vk <= 254;
         }
         if (TextUtils::startsWith(v, "joystick2,")) {
@@ -83,10 +85,11 @@ namespace {
         return false;
     }
 
-    TalkTrigger keyTrigger(int vk) {
+    TalkTrigger keyTrigger(int vk, int mods = 0) {
         TalkTrigger t;
         t.type = TalkTrigger::Type::Keyboard;
         t.vk = vk;
+        t.mods = mods;
         return t;
     }
 }
@@ -96,7 +99,8 @@ AppSettings AppSettings::parse(const std::string& content) {
     // Mining: tasti predefiniti come in Mining Signature Calculator (Num + legge, Num - a mano),
     // finché il file non dice altro (miningConfigured).
     bool miningConfigured = false;
-    bool quickBarConfigured = false; // tasti della barra rapida già scelti (anche vuoti)
+    bool quickBarConfigured = false; // tasto "nascondi tutto" già scelto (anche vuoto)
+    bool wheelConfigured = false;    // tasti della ruota già scelti; prima c'era la barra (Num /): si passa a Shift+Tab
     std::istringstream file(content);
     std::string line;
     while (std::getline(file, line)) {
@@ -181,11 +185,13 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "miningMaxQuantity") s.miningMaxQuantity = toInt(v, 40);
         else if (key == "miningSpeak") s.miningSpeak = toBool(v);
         else if (key == "miningLogCsv") s.miningLogCsv = toBool(v);
-        // Avvio, barra rapida, diario di bordo, raffineria
+        // Avvio, ruota, diario di bordo, raffineria
         else if (key == "greetOnStart") s.greetOnStart = toBool(v);
         else if (key == "closeToTray") s.closeToTray = toBool(v);
         else if (key == "quickBarConfigured") quickBarConfigured = toBool(v);
+        else if (key == "wheelConfigured") wheelConfigured = toBool(v);
         else if (key == "quickBarEnabled") s.quickBarEnabled = toBool(v);
+        else if (key == "wheelGameOnly") s.wheelGameOnly = toBool(v);
         else if (key == "panelMissionsOpen") s.panelMissionsOpen = toBool(v);
         else if (key == "panelRefineryOpen") s.panelRefineryOpen = toBool(v);
         else if (key == "panelLogOpen") s.panelLogOpen = toBool(v);
@@ -217,22 +223,9 @@ AppSettings AppSettings::parse(const std::string& content) {
             else s.miningToggleTriggers.push_back(t);
         }
         else if (key == "trigger" || key == "chatTrigger") {
+            // "joystick," della versione molto vecchia di Voice to Chat non si capisce: si rifà a mano.
             TalkTrigger t;
-            if (TextUtils::startsWith(v, "keyboard,")) {
-                t.type = TalkTrigger::Type::Keyboard;
-                t.vk = toInt(v.substr(9), 0);
-                if (t.vk <= 0 || t.vk > 254) continue;
-            } else if (TextUtils::startsWith(v, "joystick2,")) {
-                // joystick2,<id>,<pulsante>,<nome>
-                auto p = splitN(v.substr(10), 3);
-                if (p.size() < 2) continue;
-                t.type = TalkTrigger::Type::Joystick;
-                t.joystickId = p[0];
-                t.buttonIndex = toInt(p[1], 0);
-                if (p.size() > 2) t.joystickName = p[2];
-            } else {
-                continue; // "joystick," della versione molto vecchia di Voice to Chat: si rifà a mano
-            }
+            if (!parseTrigger(v, t)) continue;
             (key == "trigger" ? s.triggers : s.chatTriggers).push_back(t);
         }
     }
@@ -240,10 +233,9 @@ AppSettings AppSettings::parse(const std::string& content) {
         s.miningScanTriggers = { keyTrigger(VK_ADD) };
         s.miningManualTriggers = { keyTrigger(VK_SUBTRACT) };
     }
-    if (!quickBarConfigured) {
-        s.quickBarTriggers = { keyTrigger(VK_DIVIDE) };
-        s.hideAllTriggers = { keyTrigger(VK_MULTIPLY) };
-    }
+    if (!quickBarConfigured) s.hideAllTriggers = { keyTrigger(VK_MULTIPLY) };
+    // La ruota (al posto della barra di prima): Shift+Tab, anche per chi aveva il tasto della barra.
+    if (!wheelConfigured) s.quickBarTriggers = { keyTrigger(VK_TAB, TalkTrigger::Shift) };
     return s;
 }
 
@@ -309,7 +301,9 @@ std::string AppSettings::serialize() const {
     auto writeTriggers = [&](const char* key, const std::vector<TalkTrigger>& list) {
         for (const auto& t : list) {
             if (t.type == TalkTrigger::Type::Keyboard) {
-                o << key << "=keyboard," << t.vk << "\n";
+                o << key << "=keyboard," << t.vk;
+                if (t.mods) o << "," << t.mods;
+                o << "\n";
             } else if (!t.joystickId.empty()) {
                 o << key << "=joystick2," << t.joystickId << "," << t.buttonIndex << "," << oneLine(t.joystickName) << "\n";
             }
@@ -367,11 +361,13 @@ std::string AppSettings::serialize() const {
     o << "miningMaxQuantity=" << miningMaxQuantity << "\n";
     o << "miningSpeak=" << (miningSpeak ? 1 : 0) << "\n";
     o << "miningLogCsv=" << (miningLogCsv ? 1 : 0) << "\n";
-    // Avvio, barra rapida, diario di bordo, raffineria
+    // Avvio, ruota, diario di bordo, raffineria
     o << "greetOnStart=" << (greetOnStart ? 1 : 0) << "\n";
     o << "closeToTray=" << (closeToTray ? 1 : 0) << "\n";
     o << "quickBarConfigured=1\n";
+    o << "wheelConfigured=1\n";
     o << "quickBarEnabled=" << (quickBarEnabled ? 1 : 0) << "\n";
+    o << "wheelGameOnly=" << (wheelGameOnly ? 1 : 0) << "\n";
     writeTriggers("quickBarTrigger", quickBarTriggers);
     writeTriggers("hideAllTrigger", hideAllTriggers);
     o << "panelMissionsOpen=" << (panelMissionsOpen ? 1 : 0) << "\n";
