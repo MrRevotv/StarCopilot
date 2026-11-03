@@ -8,9 +8,9 @@
 
 struct AxisHost;
 
-// La barra rapida e i suoi pannelli collegati a Iris: cosa mostrano (stato,
-// mining, traduzione, assi, sfera, missioni dal diario di bordo, raffineria),
-// cosa fanno i pulsanti, il tasto "nascondi tutto". Thread della finestra.
+// La ruota e i suoi pannelli collegati a Iris: cosa mostrano (stato, mining,
+// traduzione, assi, sfera, missioni dal diario di bordo, raffineria), cosa fanno
+// le voci, il tasto "nascondi tutto". Thread della finestra.
 namespace HudHost {
 
     struct Context {
@@ -27,8 +27,10 @@ namespace HudHost {
 
     void onEngineEvent(Assistant::Event e);
     void onTimer();          // dal timer della finestra (~30 al secondo)
-    void refresh();          // ridisegna barra e pannelli (es. overlay degli assi aperto/chiuso)
-    void toggleBar();
+    void refresh();          // ridisegna ruota e pannelli (es. overlay degli assi aperto/chiuso)
+    // Apre o chiude la ruota. fromKey: dal suo tasto (vale solo con il gioco davanti, se scelto
+    // così; il mouse parte dal centro); se no dal menu dell'icona o dalla pagina.
+    void toggleWheel(bool fromKey);
     void toggleHideAll();
     bool hiddenAll();        // "nascondi tutto" attivo: niente sfera né riquadri finché non lo ripremi
 

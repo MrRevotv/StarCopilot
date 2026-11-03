@@ -2,8 +2,10 @@
 #include "axis_host.h"
 #include "axis_overlay.h"
 #include "quick_bar.h"
+#include "../game_input.h"
 #include "../game_log.h"
 #include "../hotkey_listener.h"
+#include "../joystick_input.h"
 #include "../mining_overlay.h"
 #include "../ocr_overlay.h"
 #include "../overlay.h"
@@ -19,6 +21,8 @@ namespace {
     bool g_hiddenAll = false;
     bool g_axisWasVisible = false;
     unsigned g_ticks = 0;
+    bool g_wheelPending = false;     // tasto della ruota premuto: si apre/chiude quando lo rilasci
+    ULONGLONG g_pendingSince = 0;
 
     std::wstring w(const std::string& s) { return TextUtils::utf8ToWide(s); }
 
@@ -49,6 +53,7 @@ namespace {
         return st.open && !st.obsOnly;
     }
 
+    // Le voci della ruota, in senso orario dall'alto: il mining, le informazioni di gioco, gli overlay, Iris.
     void updateBar() {
         const AppSettings s = g.engine->settings();
         const Assistant::Status st = g.engine->status();
@@ -66,29 +71,33 @@ namespace {
         const bool chatReady = s.ocrRegionW > 0 && s.ocrRegionH > 0;
         const bool log = s.gameLogEnabled;
         const bool recording = g.engine->miningLog().active();
+        const size_t found = recording ? g.engine->miningLog().entries().size() : 0;
+        auto panelState = [](const std::string& id) { return QuickBar::panelOpen(id) ? L"APERTO" : L"CHIUSO"; };
+        auto panelTone = [](const std::string& id) { return QuickBar::panelOpen(id) ? 1 : 4; };
         std::vector<QuickBar::Button> b = {
-            { "mining", L"MINING", miningReady ? L"Leggi adesso la signature dello scanner" : L"Mining: scegli prima la zona da leggere (pagina Mining)", false,
-              miningReady },
+            { "mining", L"MINING", miningReady ? L"Leggi adesso la signature dello scanner" : L"Scegli prima la zona da leggere nella pagina Mining di Iris", false,
+              miningReady, miningReady ? L"LEGGI ORA" : L"DA PREPARARE", miningReady ? 6 : 2 },
             { "record", L"REGISTRO",
-              recording ? L"Registro acceso (" + std::to_wstring(g.engine->miningLog().entries().size()) + L" rilevamenti): clic per chiuderlo e salvarlo sul desktop"
+              recording ? L"Registro acceso (" + std::to_wstring(found) + L" rilevamenti): clic per chiuderlo e salvarlo sul desktop"
                         : L"Registra le scansioni del mining: alla fine luogo, qualità e file sul desktop",
-              recording, true },
-            { "chat", L"TRADUZIONE", chatReady ? (s.ocrEnabled ? L"Traduzione della chat accesa: clic per spegnerla" : L"Accendi la traduzione della chat letta a schermo")
-                                               : L"Traduzione: scegli prima la zona della chat (pagina Traduzione chat)",
-              s.ocrEnabled, chatReady },
-            { "axis", L"ASSI", axisOpen() ? L"Chiudi l'overlay dell'Axis Visualizer" : L"Apri l'overlay dell'Axis Visualizer", axisOpen(), true },
-            { "orb", L"SFERA", s.overlayEnabled ? L"Nascondi la sfera di Iris" : L"Mostra la sfera di Iris", s.overlayEnabled, true },
-            { "missions", L"MISSIONI", log ? L"Contratti e obiettivi in corso (dal Game.log)" : L"Missioni: attiva prima il diario di bordo nella finestra di Iris",
-              QuickBar::panelOpen("missions"), log },
-            { "refinery", L"RAFFINERIA", L"Gli ordini della raffineria con il conto alla rovescia", QuickBar::panelOpen("refinery"), true },
-            { "log", L"DIARIO", log ? L"Zona, salute e ultimi eventi (dal Game.log)" : L"Diario: attiva prima il diario di bordo nella finestra di Iris",
-              QuickBar::panelOpen("log"), log },
+              recording, true, recording ? L"IN CORSO · " + std::to_wstring(found) : L"SPENTO", recording ? 1 : 4 },
+            { "refinery", L"RAFFINERIA", L"Gli ordini della raffineria con il conto alla rovescia", QuickBar::panelOpen("refinery"), true, panelState("refinery"),
+              panelTone("refinery") },
+            { "missions", L"MISSIONI", log ? L"Contratti e obiettivi in corso (dal Game.log)" : L"Attiva prima il diario di bordo nella finestra di Iris",
+              QuickBar::panelOpen("missions"), log, log ? panelState("missions") : L"DIARIO SPENTO", log ? panelTone("missions") : 2 },
+            { "log", L"DIARIO", log ? L"Zona, salute e ultimi eventi (dal Game.log)" : L"Attiva prima il diario di bordo nella finestra di Iris",
+              QuickBar::panelOpen("log"), log, log ? panelState("log") : L"DIARIO SPENTO", log ? panelTone("log") : 2 },
+            { "chat", L"TRADUZIONE",
+              chatReady ? (s.ocrEnabled ? L"Traduzione della chat accesa: clic per spegnerla" : L"Accendi la traduzione della chat letta a schermo")
+                        : L"Scegli prima la zona della chat nella pagina Traduzione chat di Iris",
+              s.ocrEnabled, chatReady, !chatReady ? L"DA PREPARARE" : s.ocrEnabled ? L"ACCESA" : L"SPENTA", !chatReady ? 2 : s.ocrEnabled ? 1 : 4 },
+            { "axis", L"ASSI", axisOpen() ? L"Chiudi l'overlay dell'Axis Visualizer" : L"Apri l'overlay dell'Axis Visualizer", axisOpen(), true,
+              axisOpen() ? L"APERTO" : L"CHIUSO", axisOpen() ? 1 : 4 },
+            { "orb", L"SFERA", s.overlayEnabled ? L"Nascondi la sfera di Iris" : L"Mostra la sfera di Iris", s.overlayEnabled, true,
+              s.overlayEnabled ? L"VISIBILE" : L"NASCOSTA", s.overlayEnabled ? 1 : 4 },
+            { "iris", L"IRIS", L"Apri la finestra di Iris: impostazioni, mining, traduzione, diario", false, true, L"APRI", 6 },
         };
-        std::wstring hint = keyText(s.quickBarTriggers);
-        if (!hint.empty()) hint += L"  BARRA";
-        const std::wstring all = keyText(s.hideAllTriggers);
-        if (!all.empty()) hint += (hint.empty() ? L"" : L"   ·   ") + all + L"  NASCONDI TUTTO";
-        QuickBar::setButtons(b, hint, status, tone);
+        QuickBar::setButtons(b, keyText(s.quickBarTriggers), status, tone);
     }
 
     void updateMissions() {
@@ -189,10 +198,38 @@ namespace {
         if (id == "log") QuickBar::openPanel(id, s.panelLogX, s.panelLogY);
     }
 
+    // Il tasto della ruota premuto adesso (anche solo uno dei suoi modificatori: Shift di Shift+Tab).
+    bool wheelKeyHeld() {
+        auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+        for (const auto& t : g.engine->settings().quickBarTriggers) {
+            if (t.type == TalkTrigger::Type::Joystick) {
+                if (JoystickInput::isButtonDown(t.joystickId, t.buttonIndex)) return true;
+                continue;
+            }
+            if (down(t.vk)) return true;
+            if ((t.mods & TalkTrigger::Shift) && down(VK_SHIFT)) return true;
+            if ((t.mods & TalkTrigger::Ctrl) && down(VK_CONTROL)) return true;
+            if ((t.mods & TalkTrigger::Alt) && down(VK_MENU)) return true;
+        }
+        return false;
+    }
+
+    void toggleWheelNow(bool fromKey) {
+        if (QuickBar::visible()) {
+            QuickBar::hide(true); // di nuovo il tasto: si torna al gioco
+            return;
+        }
+        // Shift+Tab serve anche negli altri programmi: di base il tasto vale solo con il gioco davanti.
+        if (fromKey && g.engine->settings().wheelGameOnly && !GameInput::starCitizenInForeground()) return;
+        if (g_hiddenAll) HudHost::toggleHideAll(); // "nascondi tutto" attivo: la ruota rimette tutto com'era
+        updateBar();
+        QuickBar::show(fromKey);
+    }
+
     void clicked(const std::string& id) {
         Assistant& e = *g.engine;
-        if (id == "settings") {
-            if (g.showMain) g.showMain();
+        if (id == "iris") {
+            if (g.showMain) g.showMain(); // la finestra di Iris davanti: la ruota si chiude da sola
         } else if (id == "record") {
             if (!e.miningLog().active()) {
                 e.miningLog().start((long long)time(nullptr));
@@ -202,7 +239,7 @@ namespace {
                 g.askLogClose();
             }
         } else if (id == "mining") {
-            e.mining().scan("barra");
+            e.mining().scan("ruota");
         } else if (id == "chat") {
             e.updateSettings([](AppSettings& s) { s.ocrEnabled = !s.ocrEnabled; });
             e.chime(e.settings().ocrEnabled);
@@ -266,7 +303,7 @@ void stop() {
 void onEngineEvent(Assistant::Event e) {
     if (!g_started) return;
     switch (e) {
-    case Assistant::Event::QuickBar: toggleBar(); break;
+    case Assistant::Event::QuickBar: toggleWheel(true); break;
     case Assistant::Event::HideAll: toggleHideAll(); break;
     case Assistant::Event::GameLog:
         updateMissions();
@@ -294,6 +331,11 @@ void onEngineEvent(Assistant::Event e) {
 
 void onTimer() {
     if (!g_started) return;
+    // Il tasto della ruota rilasciato (o tenuto troppo): adesso si apre o si chiude.
+    if (g_wheelPending && (!wheelKeyHeld() || GetTickCount64() - g_pendingSince > 1500)) {
+        g_wheelPending = false;
+        toggleWheelNow(true);
+    }
     if (++g_ticks % 30 == 0) { // ogni secondo: il conto alla rovescia
         g.engine->tickRefinery();
         if (QuickBar::panelOpen("refinery")) updateRefinery();
@@ -307,10 +349,16 @@ void refresh() {
     updatePanels();
 }
 
-void toggleBar() {
+void toggleWheel(bool fromKey) {
     if (!g_started) return;
-    updateBar();
-    QuickBar::toggle();
+    if (fromKey) {
+        // Dal tasto: si apre (o si chiude) quando lo rilasci. Così il rilascio di Shift e Tab arriva
+        // al gioco quando è ancora davanti, e il gioco non resta con Shift premuto (boost, corsa).
+        if (!g_wheelPending) g_pendingSince = GetTickCount64();
+        g_wheelPending = true;
+        return;
+    }
+    toggleWheelNow(false);
 }
 
 void toggleHideAll() {

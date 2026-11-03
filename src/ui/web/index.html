@@ -164,7 +164,7 @@
 
         <div class="panel span-2" id="mlog-panel">
           <div class="panel-title">Registro delle scansioni <span class="panel-meta">file JSON sul desktop, pronto per il sito</span></div>
-          <div class="row"><div class="row-text"><b>Registra le scansioni</b><small id="mlog-state">Ogni roccia letta (tasto, lettura continua, voce, tastierino, barra rapida) finisce nel registro. Alla fine ti chiedo il luogo e la qualità media e salvo il file sul desktop.</small></div><label class="switch"><input type="checkbox" id="mlog-switch"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Registra le scansioni</b><small id="mlog-state">Ogni roccia letta (tasto, lettura continua, voce, tastierino, ruota) finisce nel registro. Alla fine ti chiedo il luogo e la qualità media e salvo il file sul desktop.</small></div><label class="switch"><input type="checkbox" id="mlog-switch"><i></i></label></div>
           <div class="mlog-live hidden" id="mlog-live">
             <div class="mlog-stats" id="mlog-stats"></div>
             <div class="mlog-totals" id="mlog-totals"></div>
@@ -303,8 +303,8 @@
 
         <div class="panel log-body">
           <div class="panel-title">Sopra il gioco</div>
-          <p class="note first">Missioni e Diario stanno anche nella barra rapida: premi il suo tasto in gioco e apri i pannelli che ti servono. Restano dove li trascini.</p>
-          <div class="btn-row"><button class="btn log-bar-show">Mostra la barra rapida</button></div>
+          <p class="note first">Missioni e Diario stanno anche nella ruota: premi il suo tasto in gioco (Shift+Tab di base) e apri i pannelli che ti servono. Si mettono in alto uno accanto all'altro; se li trascini, la volta dopo tornano dove li hai lasciati.</p>
+          <div class="btn-row"><button class="btn log-bar-show">Mostra la ruota</button></div>
           <p class="note">A voce: «Iris, che missioni ho?», «Iris, sono in zona di armistizio?», «Iris, come sto?».</p>
         </div>
       </div>
@@ -538,7 +538,7 @@
     <!-- ------------------------------------------------------------- Impostazioni -->
     <section class="page" data-page="settings">
       <header class="page-head">
-        <div><h1>Impostazioni</h1><p>Tu, l'avvio, la barra rapida, il cervello di Iris, la sfera e gli aggiornamenti.</p></div>
+        <div><h1>Impostazioni</h1><p>Tu, l'avvio, la ruota, il cervello di Iris, la sfera e gli aggiornamenti.</p></div>
       </header>
       <div class="grid">
         <div class="panel">
@@ -562,16 +562,17 @@
         <div class="panel">
           <div class="panel-title">Avvio</div>
           <div class="row"><div class="row-text"><b>Avvia Iris con Windows</b><small id="autostart-note">Parte nascosta nell'area di notifica, pronta per quando giochi.</small></div><label class="switch"><input type="checkbox" id="autostart"><i></i></label></div>
-          <div class="row"><div class="row-text"><b>La X la nasconde nell'area di notifica</b><small>Iris resta attiva: tasti, barra rapida, avvisi. Per chiuderla: tasto destro sull'icona › Esci.</small></div><label class="switch"><input type="checkbox" data-set="closeToTray"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>La X la nasconde nell'area di notifica</b><small>Iris resta attiva: tasti, ruota, avvisi. Per chiuderla: tasto destro sull'icona › Esci.</small></div><label class="switch"><input type="checkbox" data-set="closeToTray"><i></i></label></div>
           <div class="row"><div class="row-text"><b>Saluto all'avvio</b><small>«Sistemi online, sono pronta» quando i modelli sono caricati.</small></div><label class="switch"><input type="checkbox" data-set="greetOnStart"><i></i></label></div>
         </div>
 
         <div class="panel">
-          <div class="panel-title">Barra rapida nel gioco</div>
-          <div class="row"><div class="row-text"><b>Barra rapida</b><small>Scende dall'alto col suo tasto: mining, traduzione, assi, sfera, missioni, raffineria, diario. Non toglie il fuoco al gioco.</small></div><label class="switch"><input type="checkbox" data-set="quickBarEnabled"><i></i></label></div>
+          <div class="panel-title">Ruota nel gioco</div>
+          <div class="row"><div class="row-text"><b>Ruota di Iris</b><small>Si apre al centro dello schermo col suo tasto e porta Iris davanti al gioco: il cursore si libera da solo. Punta una voce col mouse e clicca: mining, registro, raffineria, missioni, diario, traduzione, assi, sfera.</small></div><label class="switch"><input type="checkbox" data-set="quickBarEnabled"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Solo con Star Citizen davanti</b><small>Il tasto apre la ruota solo mentre giochi: negli altri programmi Shift+Tab resta libero.</small></div><label class="switch"><input type="checkbox" data-set="wheelGameOnly"><i></i></label></div>
           <div class="keys-table" id="bar-keys"></div>
-          <div class="btn-row"><button class="btn" id="bar-show">Mostra / nascondi la barra</button></div>
-          <p class="note">Per cliccare libera il cursore del gioco (mobiGlas o il tasto del cursore). «Nascondi tutto» toglie barra, pannelli, sfera e overlay finché non lo ripremi.</p>
+          <div class="btn-row"><button class="btn" id="bar-show">Mostra la ruota</button></div>
+          <p class="note">Per tornare al gioco: di nuovo il tasto, Esc, il tasto destro o un clic al centro della ruota. Serve il gioco in finestra senza bordi: a schermo intero potrebbe ridursi a icona quando Iris passa davanti. «Nascondi tutto» toglie ruota, pannelli, sfera e overlay finché non lo ripremi.</p>
         </div>
 
         <div class="panel">

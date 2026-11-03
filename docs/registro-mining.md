@@ -1,6 +1,6 @@
 # Registro delle scansioni del mining (file JSON di Iris)
 
-Con **Registra le scansioni** acceso (pagina *Mining* o pulsante **REGISTRO** della barra rapida)
+Con **Registra le scansioni** acceso (pagina *Mining* o voce **REGISTRO** della ruota)
 Iris annota ogni roccia letta dallo scanner. Alla chiusura chiede **luogo** e **qualità media** e
 salva sul desktop:
 
@@ -78,7 +78,7 @@ Ogni rilevamento:
 | `tipo` | `certo`, `probabile` | `minerale`, `salvage`, `roc` (depositi per ROC), `fps` (depositi a mano) |
 | `rarita` | se nota | `comune`, `non comune`, `raro`, `epico`, `leggendario` |
 | `alternative[]` | `ambiguo` | i materiali possibili, ognuno con `materiale`, `nome`, `quantita`, `tipo` |
-| `origine` | sempre | come è stata letta: `tasto`, `continua`, `voce`, `manuale` (tastierino), `barra` (barra rapida) |
+| `origine` | sempre | come è stata letta: `tasto`, `continua`, `voce`, `manuale` (tastierino), `ruota` (la ruota di Iris; `barra` nei registri delle versioni prima) |
 | `letture` | sempre | quante volte quella roccia è stata letta (rilette entro 45 secondi = stessa roccia) |
 
 ## Per il sito

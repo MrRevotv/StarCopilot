@@ -277,6 +277,58 @@ bool isForeground(HWND window) {
     return window && GetForegroundWindow() == window;
 }
 
+bool starCitizenInForeground() {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return false;
+    bool result = false;
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+            const wchar_t* file = wcsrchr(path, L'\\');
+            result = _wcsicmp(file ? file + 1 : path, L"StarCitizen.exe") == 0;
+        }
+        CloseHandle(process);
+    }
+    if (!result) {
+        wchar_t title[64] = {};
+        GetWindowTextW(fg, title, 64);
+        result = TextUtils::trim(TextUtils::wideToUtf8(title)) == "Star Citizen";
+    }
+    return result;
+}
+
+bool takeForeground(HWND own) {
+    if (!own) return false;
+    if (GetForegroundWindow() == own) return true;
+    // Per le prove: salta il tentativo diretto, come in gioco quando Windows non lo permette.
+    static const bool onlyAttach = GetEnvironmentVariableW(L"IRIS_PROVA_PRIMO_PIANO_AGGANCIO", nullptr, 0) > 0;
+    if (!onlyAttach) SetForegroundWindow(own);
+    if (GetForegroundWindow() == own) {
+        Log::info("Primo piano a Iris: diretto");
+        return true;
+    }
+    // Windows non dà il primo piano a chi non ha ricevuto l'ultimo input (il tasto l'ha letto
+    // il gioco): agganciati all'input della finestra davanti, il permesso c'è.
+    HWND fg = GetForegroundWindow();
+    const DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0, me = GetCurrentThreadId();
+    bool attached = false;
+    if (fgThread && fgThread != me && AttachThreadInput(me, fgThread, TRUE)) {
+        attached = true;
+        BringWindowToTop(own);
+        SetForegroundWindow(own);
+        SetActiveWindow(own);
+        SetFocus(own);
+        AttachThreadInput(me, fgThread, FALSE);
+    }
+    const bool ok = GetForegroundWindow() == own;
+    if (ok) Log::info("Primo piano a Iris: con l'aggancio all'input della finestra davanti");
+    else Log::warn(std::string("Primo piano a Iris non riuscito") + (attached ? "" : " (aggancio all'input rifiutato: il gioco è da amministratore?)"));
+    return ok;
+}
+
 bool focus(HWND window) {
     if (!window) return false;
     if (GetForegroundWindow() == window) return true;

@@ -330,7 +330,7 @@ namespace {
     void trayMenu() {
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, kTrayShow, L"Apri Iris");
-        AppendMenuW(menu, MF_STRING, kTrayBar, L"Barra rapida");
+        AppendMenuW(menu, MF_STRING, kTrayBar, L"Ruota di Iris");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kTrayQuit, L"Esci da Iris");
         SetMenuDefaultItem(menu, kTrayShow, FALSE);
@@ -340,7 +340,7 @@ namespace {
         const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, p.x, p.y, 0, g->hwnd, nullptr);
         DestroyMenu(menu);
         if (cmd == kTrayShow) showMain();
-        else if (cmd == kTrayBar) HudHost::toggleBar();
+        else if (cmd == kTrayBar) HudHost::toggleWheel(false);
         else if (cmd == kTrayQuit) PostMessageW(g->hwnd, WM_CLOSE, 0, 0);
     }
 
@@ -775,7 +775,7 @@ HWND create(HINSTANCE instance, Assistant& engine, UpdateManager& updates, int s
     applyOverlaySettings();
     startAxis(hwnd);
 
-    // Area di notifica, barra rapida sopra il gioco.
+    // Area di notifica, ruota e pannelli sopra il gioco.
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     g_msgShowMe = RegisterWindowMessageW(kShowMessage);
     ChangeWindowMessageFilterEx(hwnd, g_msgShowMe, MSGFLT_ALLOW, nullptr);

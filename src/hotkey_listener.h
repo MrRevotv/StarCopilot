@@ -8,17 +8,21 @@
 #include <vector>
 
 // Un tasto per parlare: un tasto di tastiera/mouse (codice virtuale di
-// Windows) o un pulsante di joystick (id stabile della periferica + numero).
+// Windows), anche con Shift/Ctrl/Alt (Shift+Tab), o un pulsante di joystick
+// (id stabile della periferica + numero).
 struct TalkTrigger {
     enum class Type { Keyboard, Joystick };
+    // Modificatori da tenere premuti insieme al tasto (0 = nessuno richiesto, come prima).
+    enum Mods { Shift = 1, Ctrl = 2, Alt = 4 };
     Type type = Type::Keyboard;
     int vk = 0;
+    int mods = 0;             // solo tastiera: somma di Mods
     std::string joystickId;   // GUID di istanza (vedi joystick_input.h)
     std::string joystickName; // per mostrarlo anche se è scollegato
     int buttonIndex = 0;      // 0-based
 
     bool operator==(const TalkTrigger& o) const {
-        return type == o.type && (type == Type::Keyboard ? vk == o.vk : joystickId == o.joystickId && buttonIndex == o.buttonIndex);
+        return type == o.type && (type == Type::Keyboard ? vk == o.vk && mods == o.mods : joystickId == o.joystickId && buttonIndex == o.buttonIndex);
     }
 };
 
@@ -59,6 +63,8 @@ public:
     static std::string keyName(int vk);
 
     // Aspetta il prossimo tasto/pulsante premuto (non uno già tenuto giù).
+    // Con Shift/Ctrl/Alt tenuti giù diventa una combinazione (Shift+Tab); un
+    // modificatore da solo vale quando lo rilasci senza aver premuto altro.
     // allowJoystick=false: solo tastiera (per i tasti della chat). Il tasto
     // sinistro del mouse non si accetta: lo si preme per usare la finestra, e
     // come push-to-talk registrerebbe a ogni clic. Esc annulla.

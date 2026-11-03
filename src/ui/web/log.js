@@ -1,4 +1,4 @@
-// Iris — Diario di bordo (Game.log), timer della raffineria, avvio con Windows e barra rapida.
+// Iris — Diario di bordo (Game.log), timer della raffineria, avvio con Windows e ruota.
 // Si carica prima di app.js e usa i suoi aiuti ($, h, post, toast, ask, setChip, keyChip, S) solo
 // dentro le funzioni.
 //   dal programma: {"t":"gameLog"}, {"t":"refinery"}
@@ -145,11 +145,11 @@ function drawRefinery() {
         h("div", { class: "ref-bar" }, h("i", { style: `width:${(pct * 100).toFixed(1)}%` })),
         h("small", { class: "ref-end" }, ready ? "pronto dalle " + clockOf(j.end) : "pronto alle " + clockOf(j.end)));
     })
-    : [h("div", { class: "empty" }, "Nessun ordine in lavorazione. Aggiungilo qui sotto, dalla barra rapida o a voce.")]));
+    : [h("div", { class: "empty" }, "Nessun ordine in lavorazione. Aggiungilo qui sotto o a voce.")]));
 }
 
-// --- Impostazioni: avvio con Windows, tasti della barra rapida ------------------------------------------
-const BAR_KEYS = ["Mostra / nascondi la barra", "Nascondi tutto (e rimetti)"];
+// --- Impostazioni: avvio con Windows, tasti della ruota -------------------------------------------------
+const BAR_KEYS = ["Apri / chiudi la ruota", "Nascondi tutto (e rimetti)"];
 
 function renderExtraSettings(s) {
   const auto = $("#autostart");

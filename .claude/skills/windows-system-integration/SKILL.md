@@ -14,7 +14,7 @@ description: Integrazione di Iris con Windows - avvio automatico (chiave Run), i
 - `--avvio-windows`: niente finestra, solo l'icona nell'area di notifica; i modelli si caricano in sottofondo.
 
 ## Area di notifica (tray)
-- Icona sempre presente: clic = mostra Iris, menu = Mostra Iris / Barra rapida / Esci.
+- Icona sempre presente: clic = mostra Iris, menu = Apri Iris / Ruota di Iris / Esci.
 - Chiudere la finestra (X, Alt+F4 = `SC_CLOSE`) la nasconde nell'area di notifica se l'opzione è attiva;
   `WM_CLOSE` mandato dal programma (aggiornamento, prove) chiude davvero.
 - Ricreare l'icona su `TaskbarCreated` (Explorer riavviato).
@@ -31,5 +31,9 @@ description: Integrazione di Iris con Windows - avvio automatico (chiave Run), i
 
 ## Tasti globali
 - `HotkeyListener` (thread suo, `GetAsyncKeyState` + joystick): funziona anche col gioco in primo piano
-  senza agganci di sistema. Tasti configurabili dalla pagina (tastiera o pulsanti del joystick).
+  senza agganci di sistema. Tasti configurabili dalla pagina (tastiera, anche con Shift/Ctrl/Alt come
+  Shift+Tab, o pulsanti del joystick). Il tasto non viene tolto agli altri programmi: per questo la ruota
+  di base risponde solo con Star Citizen in primo piano (`wheelGameOnly`).
+- Primo piano a una finestra di Iris dal tasto globale: `GameInput::takeForeground` (AttachThreadInput),
+  mai il trucco del tasto Alt finto (arriverebbe al gioco).
 - Mai mandare input al gioco senza che l'utente l'abbia chiesto.

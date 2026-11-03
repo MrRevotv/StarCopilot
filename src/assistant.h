@@ -62,7 +62,7 @@ public:
     // Mining: una lettura nuova o l'inserimento manuale (il riquadro a schermo);
     // MiningData: tabella dei materiali o sconosciute cambiate (la pagina Mining).
     // GameLog: il diario di bordo è cambiato. Refinery: i timer della raffineria. QuickBar / HideAll: i tasti
-    // della barra rapida (mostra/nascondi la barra, nascondi tutto quello di Iris sullo schermo).
+    // della ruota (apri/chiudi la ruota, nascondi tutto quello di Iris sullo schermo).
     // MiningLog: il registro delle scansioni del mining è cambiato.
     enum class Event { Status, Conversation, Settings, Heard, ChatHistory, Screen, Filtered, Mining, MiningData, GameLog, Refinery, QuickBar, HideAll, MiningLog };
     using Listener = std::function<void(Event)>;
@@ -181,7 +181,7 @@ private:
     void runGameCommand(const std::string& text, const Cmd::Match& match);
     // "Iris, che minerale è?" / "Iris, signature 16960": true se era un comando del mining.
     bool runMiningCommand(const AppSettings& s, const std::string& text);
-    // I tasti del mining (leggi, a mano, contorno, acceso/spento) e della barra rapida verso HotkeyListener.
+    // I tasti del mining (leggi, a mano, contorno, acceso/spento) e della ruota verso HotkeyListener.
     void applyMiningKeys(const AppSettings& s);
     // Il diario di bordo: acceso solo se l'utente l'ha attivato dopo l'avviso.
     void applyGameLog(const AppSettings& s);
