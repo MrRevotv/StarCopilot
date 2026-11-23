@@ -566,6 +566,35 @@ bool apply(State& s, const Event& e, size_t maxRecent) {
 
 // --- Dove sta il file ---------------------------------------------------------------------------
 
+namespace {
+    // Il Game.log più recente tra i rami (LIVE, PTU...) di queste cartelle di Star Citizen.
+    std::wstring newestIn(const std::vector<std::wstring>& roots) {
+        std::wstring best;
+        ULONGLONG bestTime = 0;
+        for (const auto& root : roots) {
+            for (const wchar_t* branch : { L"LIVE", L"PTU", L"EPTU", L"HOTFIX", L"TECH-PREVIEW" }) {
+                const std::wstring path = root + L"\\" + branch + L"\\Game.log";
+                WIN32_FILE_ATTRIBUTE_DATA a{};
+                if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a) || (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                const ULONGLONG t = ((ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+                if (t > bestTime) {
+                    bestTime = t;
+                    best = path;
+                }
+            }
+        }
+        return best;
+    }
+
+    // "...\StarCitizen\LIVE\Game.log" -> "...\StarCitizen" (la cartella dei rami).
+    std::wstring installRoot(const std::wstring& gameLog) {
+        const size_t file = gameLog.find_last_of(L"\\/");
+        if (file == std::wstring::npos || file == 0) return {};
+        const size_t branch = gameLog.find_last_of(L"\\/", file - 1);
+        return branch == std::wstring::npos ? std::wstring() : gameLog.substr(0, branch);
+    }
+}
+
 std::wstring discover() {
     std::vector<std::wstring> roots;
     wchar_t buf[MAX_PATH];
@@ -584,21 +613,7 @@ std::wstring discover() {
             roots.push_back(drive + sub);
         }
     }
-    std::wstring best;
-    ULONGLONG bestTime = 0;
-    for (const auto& root : roots) {
-        for (const wchar_t* branch : { L"LIVE", L"PTU", L"EPTU", L"HOTFIX", L"TECH-PREVIEW" }) {
-            const std::wstring path = root + L"\\" + branch + L"\\Game.log";
-            WIN32_FILE_ATTRIBUTE_DATA a{};
-            if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a) || (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            const ULONGLONG t = ((ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
-            if (t > bestTime) {
-                bestTime = t;
-                best = path;
-            }
-        }
-    }
-    return best;
+    return newestIn(roots);
 }
 
 // --- Lettura continua -----------------------------------------------------------------------------
@@ -672,9 +687,20 @@ void Watcher::loadContracts() {
     for (const auto& c : j) {
         if (!c.is_object()) continue;
         Contract x{ c.value("id", std::string()), c.value("name", std::string()), c.value("since", 0LL) };
-        if (x.name.empty() || (x.since > 0 && now - x.since > kContractMemorySeconds)) continue;
+        // Senza data (riga del Game.log senza ora): da adesso, così fra 3 giorni si dimentica anche lui.
+        if (x.since <= 0) x.since = now;
+        if (x.name.empty() || now - x.since > kContractMemorySeconds) continue;
         m_state.contracts.push_back(x);
     }
+}
+
+// I contratti più vecchi di 3 giorni si dimenticano anche con Iris sempre accesa (nell'area di notifica).
+static bool forgetOldContracts(State& state, long long now) {
+    const size_t before = state.contracts.size();
+    state.contracts.erase(std::remove_if(state.contracts.begin(), state.contracts.end(),
+                                         [&](const Contract& c) { return c.since > 0 && now - c.since > kContractMemorySeconds; }),
+                          state.contracts.end());
+    return state.contracts.size() != before;
 }
 
 void Watcher::saveContracts() {
@@ -687,7 +713,8 @@ void Watcher::saveContracts() {
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) return;
-        f << j.dump(1);
+        // Un nome con caratteri non UTF-8 (il Game.log non è garantito) non deve fermare il diario.
+        f << j.dump(1, ' ', false, json::error_handler_t::replace);
     }
     MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
@@ -723,6 +750,7 @@ bool Watcher::openFile(const std::wstring& path) {
         m_state.location.clear();
         m_state.health.clear();
         m_state.accepted = m_state.completed = m_state.failed = 0;
+        if (forgetOldContracts(m_state, (long long)std::time(nullptr))) m_contractsDirty = true;
         if (newSession) {
             Event e;
             e.kind = Kind::Other;
@@ -809,20 +837,28 @@ void Watcher::loop() {
     using Clock = std::chrono::steady_clock;
     auto lastLook = Clock::now() - std::chrono::hours(1);
     auto lastCheck = Clock::now();
+    auto lastExpiry = Clock::now();
+    int misses = 0; // ricerche andate a vuoto di fila
     std::wstring path;
     while (!m_stop) {
         const auto now = Clock::now();
         if (!m_file) {
-            if (now - lastLook >= std::chrono::seconds(8)) {
+            // Il file non c'è: si riprova ogni 8 secondi, dopo un minuto ogni 30 (la ricerca guarda tutti i dischi).
+            if (now - lastLook >= std::chrono::seconds(misses < 8 ? 8 : 30)) {
                 lastLook = now;
                 path = m_override.empty() ? discover() : m_override;
                 const bool opened = !path.empty() && openFile(path);
+                misses = opened ? 0 : misses + 1;
+                if (opened) readNew(); // la sessione già scritta subito, non al giro dopo
                 if (!opened) {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     m_status.found = false;
                     m_status.path = path;
                 }
-                if (m_onChanged) m_onChanged();
+                // Solo se cambia qualcosa: niente pagina ridisegnata ogni 8 secondi per niente.
+                if (opened || misses == 1) {
+                    if (m_onChanged) m_onChanged();
+                }
             }
         } else {
             readNew();
@@ -838,10 +874,12 @@ void Watcher::loop() {
                     if (GetFileInformationByHandle(probe, &info)) replaced = info.nFileIndexHigh != m_fileIndexHigh || info.nFileIndexLow != m_fileIndexLow;
                     CloseHandle(probe);
                 }
-                // Senza percorso scelto a mano: se un altro ramo (PTU...) è più recente, si passa a quello.
+                // Senza percorso scelto a mano: se un altro ramo (PTU...) della stessa installazione è più
+                // recente, si passa a quello. Solo lì: non si rileggono tutti i dischi ogni 30 secondi.
                 if (!replaced && m_override.empty() && now - lastLook >= std::chrono::seconds(30)) {
                     lastLook = now;
-                    const std::wstring newest = discover();
+                    const std::wstring root = installRoot(path);
+                    const std::wstring newest = root.empty() ? std::wstring() : newestIn({ root });
                     if (!newest.empty() && _wcsicmp(newest.c_str(), path.c_str()) != 0) {
                         path = newest;
                         replaced = true;
@@ -856,6 +894,18 @@ void Watcher::loop() {
                     }
                     if (m_onChanged) m_onChanged();
                 }
+            }
+        }
+        if (m_live && now - lastExpiry >= std::chrono::minutes(10)) {
+            lastExpiry = now;
+            bool forgot;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                forgot = forgetOldContracts(m_state, (long long)std::time(nullptr));
+            }
+            if (forgot) {
+                m_contractsDirty = true;
+                if (m_onChanged) m_onChanged();
             }
         }
         if (m_contractsDirty && m_live) {

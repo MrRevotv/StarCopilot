@@ -18,6 +18,7 @@ namespace Refinery {
         long long start = 0; // secondi UTC
         long long end = 0;
         bool announced = false;
+        bool beforeStart = false; // solo in takeFinished: finito mentre Iris era chiusa (non salvato)
         bool done(long long now) const { return now >= end; }
     };
 
@@ -42,6 +43,7 @@ namespace Refinery {
     private:
         mutable std::mutex m_mutex;
         std::vector<Job> m_jobs;
+        long long m_loadedAt = 0; // quando Iris li ha letti dal file (la sua partenza)
     };
 
 } // namespace Refinery

@@ -1,6 +1,7 @@
 #include "tts_engine.h"
 #include "log.h"
 #include "neural_voice.h"
+#include "speech_text.h"
 #include "text_utils.h"
 #include "voice_effect.h"
 
@@ -18,6 +19,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -100,6 +102,32 @@ namespace {
     void addSilence(std::vector<float>& out, double seconds) {
         out.resize(out.size() + (size_t)(seconds * TtsEngine::kSampleRate), 0.0f);
     }
+
+    // Ricampionamento lineare di un audio che arriva a pezzi: la posizione resta da un
+    // pezzo all'altro, così ai confini non ci sono salti (prima ogni pezzo ripartiva da zero).
+    struct StreamResampler {
+        double ratio = 1.0, pos = 0.0;
+        float last = 0.0f;
+        StreamResampler(int from, int to) : ratio(from > 0 && to > 0 ? (double)from / to : 1.0) {}
+        void run(const float* in, size_t n, std::vector<float>& out) {
+            out.clear();
+            if (n == 0) return;
+            if (ratio == 1.0) {
+                out.assign(in, in + n);
+                return;
+            }
+            for (;;) {
+                const double fl = std::floor(pos);
+                const long long i0 = (long long)fl;
+                if (i0 + 1 >= (long long)n) break;
+                const float a = i0 < 0 ? last : in[i0], b = in[i0 + 1];
+                out.push_back(a + (b - a) * (float)(pos - fl));
+                pos += ratio;
+            }
+            pos -= (double)n;
+            last = in[n - 1];
+        }
+    };
 }
 
 TtsEngine::~TtsEngine() {
@@ -314,7 +342,10 @@ void TtsEngine::stop() {
         m_texts.clear();
     }
     std::lock_guard<std::mutex> lock(m_audioMutex);
-    m_samples.clear();
+    // Zittita a metà di una parola: 8 ms che sfumano, non un taglio netto (clic).
+    const size_t fade = std::min<size_t>(m_samples.size(), kSampleRate / 125);
+    m_samples.resize(fade);
+    for (size_t i = 0; i < fade; ++i) m_samples[i] *= 1.0f - (float)(i + 1) / fade;
 }
 
 bool TtsEngine::isSpeaking() const {
@@ -328,9 +359,28 @@ bool TtsEngine::isSpeaking() const {
 }
 
 void TtsEngine::enqueueSamples(std::vector<float> samples, unsigned long long generation) {
-    if (samples.empty() || generation != m_generation.load()) return;
+    if (samples.empty()) return;
     std::lock_guard<std::mutex> lock(m_audioMutex);
+    // Il controllo col lucchetto preso: uno stop() arrivato nel frattempo butta via anche questi.
+    if (generation != m_generation.load()) return;
     m_samples.insert(m_samples.end(), samples.begin(), samples.end());
+}
+
+std::string TtsEngine::takeNext(std::deque<std::string>& texts) {
+    if (texts.empty()) return {};
+    constexpr size_t kShort = 30;  // sotto: un frammento ("Certo!", "Fatto.") che da solo spezza l'intonazione
+    constexpr size_t kMost = 220;  // sopra non si unisce più (la voce partirebbe dopo)
+    std::string text = TextUtils::trim(texts.front());
+    texts.pop_front();
+    while (!texts.empty() && text.size() < kShort) {
+        const std::string next = TextUtils::trim(texts.front());
+        if (text.size() + 1 + next.size() > kMost) break;
+        const char last = text.empty() ? '.' : text.back();
+        const bool closed = last == '.' || last == '!' || last == '?' || last == ':' || last == ';' || last == ',';
+        text += (text.empty() ? "" : closed ? " " : ". ") + next;
+        texts.pop_front();
+    }
+    return text;
 }
 
 void TtsEngine::onPlayback(float* out, unsigned int frames) {
@@ -351,6 +401,34 @@ void TtsEngine::onPlayback(float* out, unsigned int frames) {
     m_level.store(now > prev ? now : prev * 0.85f + now * 0.15f);
 }
 
+TtsEngine::NeuralResult TtsEngine::speakNeural(NeuralVoice* neural, const std::string& text, unsigned long long generation, VoiceEffect& effect) {
+    const int rate = neural->sampleRate();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!neural->isReady()) return NeuralResult::NotReady;
+        StreamResampler resampler(rate, kSampleRate);
+        bool sent = false;
+        const bool ok = neural->speak(text, [&](const float* pcm, size_t n) {
+            if (generation != m_generation.load()) return false; // zittita nel frattempo
+            std::vector<float> chunk;
+            resampler.run(pcm, n, chunk);
+            effect.process(chunk.data(), chunk.size());
+            enqueueSamples(std::move(chunk), generation);
+            sent = true;
+            return true;
+        }, [&]() { return generation != m_generation.load() || !m_running; }, attempt);
+        if (generation != m_generation.load() || !m_running) return NeuralResult::Done; // zittita: niente da dire
+        if (ok || sent) {
+            // Se si è rotta a metà la parte già detta resta: ripeterla da capo sarebbe peggio.
+            if (!ok) Log::warn("Voce neurale: frase interrotta a metà da un errore");
+            enqueueSamples(effect.tail(), generation);
+            return NeuralResult::Done;
+        }
+        if (!neural->isReady()) return NeuralResult::NotReady; // scaricata nel frattempo (si ricaricano i modelli)
+        Log::warn("Voce neurale: frase non riuscita, riprovo");
+    }
+    return NeuralResult::Failed;
+}
+
 void TtsEngine::synthLoop() {
     try {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -363,20 +441,22 @@ void TtsEngine::synthLoop() {
         Log::error("Voce: le voci di Windows non sono disponibili");
     }
     VoiceEffect effect(kSampleRate);
+    // Voce e velocità da dare alla voce di Windows: restano da fare finché non la si usa
+    // (prima si perdevano se nel frattempo parlava la voce neurale).
+    bool windowsVoicePending = true;
+    unsigned long long lastGeneration = m_generation.load();
 
     while (true) {
         std::string text;
         std::string voiceName;
         std::string effectId;
         double rate = 1.0;
-        bool voiceChanged = false;
         {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [&] { return !m_running || !m_texts.empty(); });
             if (!m_running) break;
-            text = m_texts.front();
-            m_texts.pop_front();
-            voiceChanged = m_voiceChanged;
+            text = takeNext(m_texts);
+            if (m_voiceChanged) windowsVoicePending = true;
             m_voiceChanged = false;
             voiceName = m_voice;
             rate = m_rate;
@@ -387,44 +467,47 @@ void TtsEngine::synthLoop() {
         if (effectId != effect.preset()) {
             effect.setPreset(effectId);
             Log::info("Effetto sulla voce: " + effect.preset());
+        } else if (generation != lastGeneration) {
+            effect.reset(); // zittita e poi di nuovo a parlare: niente eco della frase interrotta
         }
+        lastGeneration = generation;
+        text = SpeechText::forVoice(text);
 
-        // Prima la voce neurale, a pezzi man mano che si genera.
+        // La voce neurale, sempre lei: se si sta ancora caricando la si aspetta (un attimo
+        // di silenzio è meglio di un'altra voce); se una frase non le riesce si riprova.
         NeuralVoice* neural = m_neural.load();
-        if (m_useNeural && neural && neural->isReady()) {
-            const int rate = neural->sampleRate();
-            const bool ok = neural->speak(text, [&](const float* pcm, size_t n) {
-                if (generation != m_generation.load()) return false; // zittita nel frattempo
-                std::vector<float> chunk(pcm, pcm + n);
-                if (rate != kSampleRate && rate > 0) {
-                    const double ratio = (double)rate / kSampleRate;
-                    std::vector<float> res((size_t)(n / ratio));
-                    for (size_t i = 0; i < res.size(); ++i) {
-                        double src = i * ratio;
-                        size_t a = (size_t)src;
-                        float s0 = pcm[std::min(a, n - 1)], s1 = pcm[std::min(a + 1, n - 1)];
-                        res[i] = (float)(s0 + (s1 - s0) * (src - a));
-                    }
-                    chunk.swap(res);
+        bool done = false;
+        for (int round = 0; round < 2 && !done && m_useNeural && neural; ++round) {
+            {
+                const auto start = std::chrono::steady_clock::now();
+                std::unique_lock<std::mutex> lock(m_mutex);
+                while (m_running && m_useNeural && !neural->isReady() && generation == m_generation.load() &&
+                       std::chrono::steady_clock::now() - start < std::chrono::milliseconds(kNeuralWaitMs)) {
+                    m_cv.wait_for(lock, std::chrono::milliseconds(50));
                 }
-                effect.process(chunk.data(), chunk.size());
-                enqueueSamples(std::move(chunk), generation);
-                return true;
-            }, [&]() { return generation != m_generation.load() || !m_running; });
-            if (ok) {
-                enqueueSamples(effect.tail(), generation);
-                m_synthesizing = false;
-                continue;
             }
-            Log::warn("Voce neurale non riuscita: questa frase la dice la voce di Windows");
+            if (generation != m_generation.load() || !m_running) {
+                done = true;
+                break;
+            }
+            if (!m_useNeural || !neural->isReady()) {
+                if (m_useNeural) Log::warn("Voce neurale ancora non pronta: questa frase la dice la voce di Windows");
+                break;
+            }
+            const NeuralResult r = speakNeural(neural, text, generation, effect);
+            if (r == NeuralResult::Done) done = true;
+            if (r == NeuralResult::Failed) {
+                Log::warn("Voce neurale non riuscita due volte: questa frase la dice la voce di Windows");
+                break;
+            }
         }
-
-        if (!synth) {
+        if (done || !synth || generation != m_generation.load()) {
             m_synthesizing = false;
             continue;
         }
+
         try {
-            if (voiceChanged) {
+            if (windowsVoicePending) {
                 // La voce che contiene il nome scelto; se no una italiana; se no quella di Windows.
                 VoiceInformation chosen = nullptr, italian = nullptr;
                 const std::string wanted = TextUtils::toLower(voiceName);
@@ -443,6 +526,7 @@ void TtsEngine::synthLoop() {
                     synth.Options().AppendedSilence(SpeechAppendedSilence::Min); // meno pausa tra una frase e l'altra
                 } catch (...) {
                 }
+                windowsVoicePending = false;
             }
             SpeechSynthesisStream stream = synth.SynthesizeTextToStreamAsync(winrt::hstring(TextUtils::utf8ToWide(text))).get();
             const uint32_t size = (uint32_t)stream.Size();

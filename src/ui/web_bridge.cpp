@@ -19,6 +19,7 @@
 #include "../log.h"
 #include "../mining_decoder.h"
 #include "../mining_overlay.h"
+#include "../neural_voice.h"
 #include "../ocr_engine.h"
 #include "../ocr_overlay.h"
 #include "../overlay.h"
@@ -248,6 +249,8 @@ void WebBridge::sendSettings() {
     j["voiceEngine"] = s.voiceEngine;
     j["voiceName"] = s.voiceName;
     j["voiceEffect"] = s.voiceEffect;
+    j["neuralVoice"] = s.neuralVoice;
+    j["neuralVoiceFile"] = s.neuralVoiceFile;
     j["outputDeviceName"] = s.outputDeviceName;
     j["speechRate"] = s.speechRate;
     // Cervello, sfera, aggiornamenti
@@ -361,6 +364,9 @@ void WebBridge::sendLists() {
     json effects = json::array();
     for (const auto& e : VoiceEffect::presets()) effects.push_back({ { "id", e.id }, { "label", e.label } });
     j["effects"] = effects;
+    json neuralVoices = json::array();
+    for (const auto& p : NeuralVoice::presets()) neuralVoices.push_back({ { "id", p.id }, { "label", p.label } });
+    j["neuralVoices"] = neuralVoices;
     j["version"] = Updater::currentVersion();
     send("lists", dump(j));
 }
@@ -402,10 +408,12 @@ void WebBridge::sendMining() {
     if (PpOcr::ready()) {
         ocr = "Legge con PP-OCR (il riconoscitore di Citizen Assistant), l'OCR di Windows resta di riserva.";
         ocrKind = "ok";
+    } else if (!PpOcr::failure().empty()) {
+        ocr = "PP-OCR non si carica (" + PpOcr::failure() + "): legge con l'OCR di Windows.";
     } else if (PpOcr::filesPresent()) {
-        std::string error;
-        ocr = PpOcr::load(error) ? "Legge con PP-OCR (il riconoscitore di Citizen Assistant)." : "PP-OCR non si carica (" + error + "): legge con l'OCR di Windows.";
-        if (PpOcr::ready()) ocrKind = "ok";
+        // Si carica nel thread del mining (alla partenza o alla prima lettura), mai qui: la pagina non aspetta.
+        ocr = "Legge con PP-OCR (il riconoscitore di Citizen Assistant): si prepara alla prima lettura.";
+        ocrKind = "ok";
     } else {
         ocr = "Legge con l'OCR di Windows: PP-OCR (24 MB) si scarica da solo dopo l'avvio.";
     }
@@ -440,7 +448,8 @@ void WebBridge::sendGame() {
 void WebBridge::sendUpdate() {
     const UpdateManager::State u = m_updates.state();
     json j = { { "phase", updatePhase(u.phase) }, { "current", u.current },   { "latest", u.latest },       { "notes", u.notes },
-               { "pageUrl", u.pageUrl },          { "error", u.error },       { "checkedAt", u.checkedAt }, { "progress", u.progress } };
+               { "pageUrl", u.pageUrl },          { "error", u.error },       { "checkedAt", u.checkedAt }, { "progress", u.progress },
+               { "retryAt", u.retryAt } };
     send("update", dump(j));
 }
 
@@ -495,6 +504,14 @@ void WebBridge::onEngineEvent(int event) {
 }
 
 void WebBridge::onUpdateChanged() { sendUpdate(); }
+
+void WebBridge::pageGone() {
+    m_ready = false;
+    m_lastGame.clear();
+    m_lastNotice.clear();
+    m_lastCommands.clear();
+    m_axisPreviewsDirty = true;
+}
 
 void WebBridge::onTimer() {
     ++m_ticks;
@@ -719,6 +736,45 @@ void WebBridge::handle(const std::string& action, const void* messagePtr) {
         if (VoiceEffect::isValid(id)) {
             m_engine.updateSettings([&](AppSettings& s) { s.voiceEffect = id; });
             m_engine.testVoice();
+        }
+    } else if (action == "setNeuralVoice") {
+        // Una voce predefinita, il tuo file già scelto ("file") o un file nuovo ("pick").
+        const std::string id = str(m, "id");
+        if (NeuralVoice::isPreset(id) || (id == NeuralVoice::kFileVoice && !m_engine.settings().neuralVoiceFile.empty())) {
+            m_engine.updateSettings([&](AppSettings& s) { s.neuralVoice = id; });
+            m_engine.testVoice();
+        } else if (id == "pick") {
+            defer([this]() {
+                wchar_t file[MAX_PATH] = L"";
+                OPENFILENAMEW ofn{ sizeof(ofn) };
+                ofn.hwndOwner = m_window;
+                ofn.lpstrFilter = L"Voce (WAV)\0*.wav\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Un WAV con la voce da imitare (5-15 secondi, una persona sola, senza musica)";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+                if (!GetOpenFileNameW(&ofn)) {
+                    sendSettings(); // la tendina torna alla voce di prima
+                    return;
+                }
+                std::vector<float> pcm;
+                int rate = 0;
+                std::string error;
+                if (!NeuralVoice::readWav(file, pcm, rate, &error) || !NeuralVoice::cleanReference(pcm, rate, &error)) {
+                    toast("Questo WAV non va: " + error + ".", false);
+                    sendSettings();
+                    return;
+                }
+                const std::string path = TextUtils::wideToUtf8(file);
+                m_engine.updateSettings([&](AppSettings& s) {
+                    s.neuralVoice = NeuralVoice::kFileVoice;
+                    s.neuralVoiceFile = path;
+                });
+                char seconds[16];
+                std::snprintf(seconds, sizeof(seconds), "%.1f", pcm.size() / (double)rate);
+                toast(std::string("Iris imita la voce del tuo file (") + seconds + " s di parlato).");
+                m_engine.testVoice();
+            });
         }
     } else if (action == "testVoice") {
         m_engine.testVoice();

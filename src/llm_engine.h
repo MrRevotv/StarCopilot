@@ -30,6 +30,9 @@ public:
         int topK = 40;
         float repeatPenalty = 1.05f;
         int maxTokens = 700;
+        // La prima parola sempre la più probabile: è lì che il modello decide fra strumento e
+        // risposta (a volte, pescando a caso, al posto di "<tool_call>" usciva "ronics").
+        bool greedyFirstToken = true;
     };
 
     LlmEngine() = default;
@@ -58,6 +61,12 @@ public:
     Result generate(const std::string& prompt, const Sampling& sampling, const std::function<bool(const std::string&)>& onPiece,
                     std::string& out, const std::atomic<bool>* cancel = nullptr);
 
+    // Mette nella memoria del modello l'inizio di un prompt (istruzioni, strumenti,
+    // conversazione) senza rispondere: la domanda dopo riparte da lì e la risposta arriva
+    // prima. L'ultimo pezzo si rielabora sempre: così il modello torna davvero pronto
+    // sulla scheda video (mentre il gioco la usa, Windows può averlo spostato in memoria).
+    bool prefill(const std::string& promptPrefix, const std::atomic<bool>* cancel = nullptr);
+
     // Traduzione per la chat di gioco (come Voice to Chat): out riceve la
     // traduzione ripulita (vedi TranslationPrompt::cleanOutput).
     Result translate(const TranslationRequest& request, std::string& out, Channel channel = Channel::Voice,
@@ -71,6 +80,9 @@ private:
     };
 
     bool load(const std::string& modelPath, int threads, void* gpu, int gpuLayers);
+    // Porta la memoria del modello a "tokens" rielaborando solo quello che manca (almeno
+    // l'ultimo token). fresh: quanti ne ha elaborati. Con m_mutex già preso.
+    Result syncCache(const std::vector<int>& tokens, const std::atomic<bool>* cancel, size_t& fresh);
     bool evalTokens(const std::vector<int>& tokens, const std::atomic<bool>* cancel);
     bool evalTokensIn(void* ctx, const std::vector<int>& tokens, const std::atomic<bool>* cancel);
     void release();

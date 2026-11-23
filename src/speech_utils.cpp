@@ -100,6 +100,49 @@ bool isLikelyHallucination(const std::string& text) {
     return false;
 }
 
+namespace {
+    std::vector<std::string> splitWords(const std::string& s) {
+        std::vector<std::string> out;
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t sp = s.find(' ', pos);
+            if (sp == std::string::npos) sp = s.size();
+            if (sp > pos) out.push_back(s.substr(pos, sp - pos));
+            pos = sp + 1;
+        }
+        return out;
+    }
+
+    // Stessa parola, o quasi ("rebo"/"revo"): whisper sbaglia una lettera.
+    bool sameWord(const std::string& a, const std::string& b) {
+        return a == b || (a.size() >= 4 && b.size() >= 4 && TextUtils::similarity(a, b) >= 0.74);
+    }
+}
+
+bool soundsLikeEcho(const std::string& heard, const std::vector<std::string>& said, bool strict) {
+    if (heard.empty() || said.empty()) return false;
+    const std::vector<std::string> h = splitWords(heard);
+    // Dopo che ha finito, "sì" o "va bene" possono essere la tua risposta anche se lei li ha detti.
+    if (strict && h.size() < 3) return false;
+    std::string joined; // un pezzo sentito può stare a cavallo di due frasi
+    for (const auto& s : said) {
+        if (s.find(heard) != std::string::npos) return true;
+        if (TextUtils::similarity(heard, s) > (strict ? 0.85 : 0.6)) return true;
+        joined += (joined.empty() ? "" : " ") + s;
+    }
+    if (joined.find(heard) != std::string::npos) return true;
+    // Parola per parola, in fila come le ha dette lei: quante coincidono (anche quasi).
+    const std::vector<std::string> w = splitWords(joined);
+    if (h.size() < 2 || w.size() < h.size()) return false;
+    size_t best = 0;
+    for (size_t start = 0; start + h.size() <= w.size(); ++start) {
+        size_t same = 0;
+        for (size_t i = 0; i < h.size(); ++i) same += sameWord(h[i], w[start + i]) ? 1 : 0;
+        best = std::max(best, same);
+    }
+    return strict ? best == h.size() : best * 4 >= h.size() * 3;
+}
+
 std::string cleanTranscript(const std::string& text) {
     std::string out;
     int depthSquare = 0, depthRound = 0;

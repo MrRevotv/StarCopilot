@@ -114,6 +114,8 @@ public:
     GameChat& chat() { return m_chat; }
     // "scrivi in chat: ..." -> il testo da scrivere (vuoto se non è un comando di chat).
     static std::string chatCommandText(const std::string& command);
+    // "ricordati che il mio wingman si chiama Luca" -> "il mio wingman si chiama Luca" (vuoto se non lo è).
+    static std::string memoryCommandText(const std::string& command);
     // Il mining (Mining Signature Calculator dentro Iris): letture, tabella, sconosciute.
     MiningScanner& mining() { return m_mining; }
     // Il diario di bordo (Game.log, solo se l'utente l'ha attivato) e i timer della raffineria.
@@ -144,6 +146,7 @@ private:
         bool sharedKey = false;           // tasto in comune con la chat: con "Iris" è per lei, se no va in chat
         bool startedAwake = false;        // cominciata con la finestra di ascolto aperta
         bool startedWhileSpeaking = false; // cominciata mentre Iris parlava (forse è la sua voce)
+        bool startedAfterSpeaking = false; // cominciata appena dopo (l'eco può arrivare ancora, dalla stanza)
     };
 
     // Avvio e modelli
@@ -177,6 +180,14 @@ private:
     void dispatchCommand(const std::string& text);
     void workerLoop();
     void processCommand(const std::string& text);
+    // Il modello si prepara alla prossima domanda mentre parli (istruzioni e conversazione già
+    // elaborate, modello pronto sulla scheda video): la risposta parte prima. Solo se non c'è altro da fare.
+    void requestWarmUp();
+    void warmUp();
+    // Chi è l'utente, gioco aperto, risposte brevi: per il modello. Ritorna "brevi".
+    bool applyPersona();
+    // Dopo tanto silenzio la conversazione ricomincia da capo (le domande di prima non c'entrano più).
+    bool conversationExpired(const AppSettings& s) const;
     // Comando di gioco riconosciuto dal dizionario: tasti subito, senza modello.
     void runGameCommand(const std::string& text, const Cmd::Match& match);
     // "Iris, che minerale è?" / "Iris, signature 16960": true se era un comando del mining.
@@ -196,7 +207,8 @@ private:
 
     // Voce: tutto quello che Iris dice passa da qui (e si ricorda, per riconoscere la sua eco).
     void say(const std::string& text);
-    bool isOwnEcho(const std::string& heard);
+    // strict: sentita dopo che aveva finito di parlare (solo se è proprio uguale: potrebbe essere la tua risposta).
+    bool isOwnEcho(const std::string& heard, bool strict);
 
     // Stato e conversazione
     void refreshState();
@@ -217,7 +229,7 @@ private:
     std::vector<std::string> m_memory;
     std::string m_gpuSummary;
     std::string m_lastHeard;
-    std::string m_busyText;     // "Cerco su internet: ..."
+    std::string m_busyText;     // "Star Citizen: carrello"
     std::string m_speakingText; // l'ultima frase detta
     std::deque<std::pair<long long, std::string>> m_recentSpoken; // {quando, frase normalizzata}: per riconoscere l'eco
 
@@ -266,12 +278,16 @@ private:
     std::condition_variable m_speechCv;
     std::deque<Utterance> m_utterances;
     std::atomic<int> m_pendingForIris{ 0 };
+    // "Iris, imposta la rotta per..." e poi una pausa: il pezzo aspetta il resto della frase (solo il thread di trascrizione).
+    std::string m_pendingFragment;
+    long long m_pendingFragmentMs = 0;
 
     // Richieste
     std::thread m_worker;
     std::mutex m_jobMutex;
     std::condition_variable m_jobCv;
     std::deque<std::string> m_jobs;
+    std::atomic<bool> m_warmQueued{ false };
     std::atomic<bool> m_busy{ false };
     std::atomic<bool> m_cancel{ false };
     Clock::time_point m_lastInteraction = Clock::now();

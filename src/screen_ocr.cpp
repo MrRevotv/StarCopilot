@@ -26,10 +26,7 @@ using namespace winrt::Windows::Storage::Streams;
 namespace ScreenOcr {
 
 namespace {
-    struct Image {
-        std::vector<uint8_t> bgra;
-        int width = 0, height = 0;
-    };
+    using Image = ScreenCapture::Image;
 
     Image capture(const RECT& r) {
         Image img;
@@ -52,7 +49,7 @@ namespace {
             GdiFlush();
             img.width = w;
             img.height = h;
-            img.bgra.assign((uint8_t*)bits, (uint8_t*)bits + (size_t)w * h * 4);
+            img.pixels.assign((uint8_t*)bits, (uint8_t*)bits + (size_t)w * h * 4);
             SelectObject(mem, old);
         }
         if (dib) DeleteObject(dib);
@@ -61,15 +58,20 @@ namespace {
         return img;
     }
 
+    std::vector<uint8_t> luminance(const Image& src) {
+        std::vector<uint8_t> lum((size_t)src.width * src.height);
+        for (size_t p = 0; p < lum.size(); ++p) {
+            const uint8_t b = src.pixels[p * 4], g = src.pixels[p * 4 + 1], r = src.pixels[p * 4 + 2];
+            lum[p] = (uint8_t)((r * 299 + g * 587 + b * 114) / 1000);
+        }
+        return lum;
+    }
+
     // Grigi + contrasto stirato tra il 5% e il 95% dei pixel + inversione + ingrandimento.
     Image prepare(const Image& src, int scale, bool invert) {
-        std::vector<uint8_t> lum((size_t)src.width * src.height);
+        const std::vector<uint8_t> lum = luminance(src);
         int hist[256] = {};
-        for (size_t p = 0; p < lum.size(); ++p) {
-            const uint8_t b = src.bgra[p * 4], g = src.bgra[p * 4 + 1], r = src.bgra[p * 4 + 2];
-            lum[p] = (uint8_t)((r * 299 + g * 587 + b * 114) / 1000);
-            hist[lum[p]]++;
-        }
+        for (uint8_t v : lum) hist[v]++;
         const size_t total = lum.size();
         int lo = 0, hi = 255;
         size_t acc = 0;
@@ -81,7 +83,7 @@ namespace {
         Image out;
         out.width = src.width * scale;
         out.height = src.height * scale;
-        out.bgra.resize((size_t)out.width * out.height * 4);
+        out.pixels.resize((size_t)out.width * out.height * 4);
         for (int y = 0; y < out.height; ++y) {
             // Ingrandimento bilineare: il testo sottile del gioco resta leggibile.
             const double sy = std::max(0.0, (y + 0.5) / scale - 0.5);
@@ -96,12 +98,122 @@ namespace {
                 double n = std::clamp((v - lo) / (double)(hi - lo), 0.0, 1.0);
                 if (invert) n = 1.0 - n;
                 const uint8_t g = (uint8_t)(n * 255);
-                uint8_t* px = &out.bgra[((size_t)y * out.width + x) * 4];
+                uint8_t* px = &out.pixels[((size_t)y * out.width + x) * 4];
                 px[0] = px[1] = px[2] = g;
                 px[3] = 255;
             }
         }
         return out;
+    }
+
+    Image inverted(Image img) {
+        for (size_t i = 0; i < img.pixels.size(); i += 4) {
+            img.pixels[i] = (uint8_t)(255 - img.pixels[i]);
+            img.pixels[i + 1] = (uint8_t)(255 - img.pixels[i + 1]);
+            img.pixels[i + 2] = (uint8_t)(255 - img.pixels[i + 2]);
+        }
+        return img;
+    }
+
+    std::vector<uint8_t> windowFilter(const std::vector<uint8_t>& in, int w, int h, int k, bool takeMin);
+
+    // Le preparazioni, nell'ordine in cui si provano.
+    enum class Prep { Inverted, Plain, Cleaned, CleanedInverted, Strokes, StrokesBinary };
+
+    const char* prepName(Prep p) {
+        switch (p) {
+        case Prep::Inverted: return "invertita";
+        case Prep::Plain: return "normale";
+        case Prep::Cleaned: return "senza sfondo";
+        case Prep::CleanedInverted: return "senza sfondo, invertita";
+        case Prep::Strokes: return "solo i tratti chiari";
+        case Prep::StrokesBinary: return "solo i tratti, a soglia";
+        }
+        return "";
+    }
+
+    Image fromGray(const std::vector<uint8_t>& g, int w, int h) {
+        Image out;
+        out.width = w;
+        out.height = h;
+        out.pixels.resize((size_t)w * h * 4);
+        for (size_t i = 0; i < g.size(); ++i) {
+            uint8_t* px = &out.pixels[i * 4];
+            px[0] = px[1] = px[2] = g[i];
+            px[3] = 255;
+        }
+        return out;
+    }
+
+    // I tratti chiari e sottili, scuri su bianco: si ingrandisce, si stima lo sfondo dietro le
+    // lettere (apertura più larga dei tratti) e lo si toglie, poi il resto si stira fino al 99,5%
+    // (non fino al pixel più chiaro: il bordo lucido del vetro schiacciava le lettere). Per il
+    // testo bianco sul vetro chiaro della ricerca (240 su 210), che le altre preparazioni perdono.
+    Image strokes(const Image& src, int scale, bool binary) {
+        const std::vector<uint8_t> lum = luminance(src);
+        const int w = src.width * scale, h = src.height * scale;
+        std::vector<uint8_t> g((size_t)w * h);
+        for (int y = 0; y < h; ++y) {
+            const double sy = std::max(0.0, (y + 0.5) / scale - 0.5);
+            const int y0 = std::min((int)sy, src.height - 1), y1 = std::min(y0 + 1, src.height - 1);
+            const double fy = sy - y0;
+            for (int x = 0; x < w; ++x) {
+                const double sx = std::max(0.0, (x + 0.5) / scale - 0.5);
+                const int x0 = std::min((int)sx, src.width - 1), x1 = std::min(x0 + 1, src.width - 1);
+                const double fx = sx - x0;
+                g[(size_t)y * w + x] = (uint8_t)(lum[(size_t)y0 * src.width + x0] * (1 - fx) * (1 - fy) + lum[(size_t)y0 * src.width + x1] * fx * (1 - fy) +
+                                                 lum[(size_t)y1 * src.width + x0] * (1 - fx) * fy + lum[(size_t)y1 * src.width + x1] * fx * fy);
+            }
+        }
+        const int k = std::max(7, 4 * scale + 3);
+        const std::vector<uint8_t> background = windowFilter(windowFilter(g, w, h, k, true), w, h, k, false);
+        int hist[256] = {};
+        for (size_t i = 0; i < g.size(); ++i) {
+            g[i] = (uint8_t)(g[i] - background[i]);
+            hist[g[i]]++;
+        }
+        int top = 255;
+        for (size_t acc = 0; top > 1 && (acc += hist[top]) * 1000 < g.size() * 5; --top) {}
+        top = std::max(top, 12);
+        if (binary) {
+            // Otsu sui tratti (non sotto un terzo del chiaro: il rumore del vetro resta bianco).
+            long long sum = 0, count = (long long)g.size();
+            for (int t = 0; t < 256; ++t) sum += (long long)t * hist[t];
+            double sumB = 0, wB = 0, bestVar = -1;
+            int threshold = top / 2;
+            for (int t = 0; t < 256; ++t) {
+                wB += hist[t];
+                if (wB == 0) continue;
+                const double wF = count - wB;
+                if (wF == 0) break;
+                sumB += (double)t * hist[t];
+                const double mB = sumB / wB, mF = (sum - sumB) / wF;
+                const double between = wB * wF * (mB - mF) * (mB - mF);
+                if (between > bestVar) {
+                    bestVar = between;
+                    threshold = t;
+                }
+            }
+            threshold = std::max(threshold, top / 3);
+            for (auto& v : g) v = v > threshold ? 0 : 255;
+        } else {
+            for (auto& v : g) v = (uint8_t)(255 - std::min(255, v * 255 / top));
+        }
+        return fromGray(g, w, h);
+    }
+
+    Image prepareAs(const Image& shot, int scale, int maxDim, Prep mode) {
+        switch (mode) {
+        case Prep::Inverted: return prepare(shot, scale, true);
+        case Prep::Plain: return prepare(shot, scale, false);
+        // La pulizia della chat letta (ScreenCapture): toglie lo sfondo dietro le lettere, così il
+        // testo bianco sul vetro chiaro della ricerca resta l'unica cosa chiara.
+        case Prep::Cleaned: return ScreenCapture::prepareForOcr(shot, scale, maxDim);
+        case Prep::CleanedInverted: return inverted(ScreenCapture::prepareForOcr(shot, scale, maxDim));
+        case Prep::Strokes: return strokes(shot, scale, false);
+        case Prep::StrokesBinary: return strokes(shot, scale, true);
+        }
+        return {};
     }
 
     struct RawWord {
@@ -115,10 +227,12 @@ namespace {
 
     std::mutex g_engineMutex;
 
-    // L'OCR di Windows (C++/WinRT) in un thread suo, con il suo "apartment":
-    // chi lo chiama può essere un thread qualsiasi (anche quello dei comandi).
-    std::vector<RawLine> recognize(const Image& img, const std::string& language, std::string& error) {
-        std::vector<RawLine> lines;
+    using Reader = std::function<std::vector<RawLine>(const Image&)>;
+
+    // L'OCR di Windows (C++/WinRT) in un thread suo, con il suo "apartment": chi lo chiama
+    // può essere un thread qualsiasi (anche quello dei comandi). Un motore solo per tutte le
+    // immagini lette da work().
+    void withEngine(const std::string& language, std::string& error, const std::function<void(const Reader&)>& work) {
         std::thread([&]() {
             try {
                 winrt::init_apartment(winrt::apartment_type::multi_threaded);
@@ -136,26 +250,36 @@ namespace {
                     error = "nessuna lingua OCR installata in Windows";
                     return;
                 }
-                DataWriter writer;
-                writer.WriteBytes(winrt::array_view<const uint8_t>(img.bgra.data(), img.bgra.data() + img.bgra.size()));
-                SoftwareBitmap bitmap = SoftwareBitmap::CreateCopyFromBuffer(writer.DetachBuffer(), BitmapPixelFormat::Bgra8, img.width, img.height);
-                OcrResult result = engine.RecognizeAsync(bitmap).get();
-                for (const auto& line : result.Lines()) {
-                    RawLine l;
-                    l.text = TextUtils::wideToUtf8(std::wstring(line.Text()));
-                    for (const auto& word : line.Words()) {
-                        auto r = word.BoundingRect();
-                        l.words.push_back({ TextUtils::wideToUtf8(std::wstring(word.Text())), r.X, r.Y, r.Width, r.Height });
+                const Reader reader = [&](const Image& img) {
+                    std::vector<RawLine> lines;
+                    try {
+                        DataWriter writer;
+                        writer.WriteBytes(winrt::array_view<const uint8_t>(img.pixels.data(), img.pixels.data() + img.pixels.size()));
+                        SoftwareBitmap bitmap = SoftwareBitmap::CreateCopyFromBuffer(writer.DetachBuffer(), BitmapPixelFormat::Bgra8, img.width, img.height);
+                        OcrResult result = engine.RecognizeAsync(bitmap).get();
+                        for (const auto& line : result.Lines()) {
+                            RawLine l;
+                            l.text = TextUtils::wideToUtf8(std::wstring(line.Text()));
+                            for (const auto& word : line.Words()) {
+                                auto r = word.BoundingRect();
+                                l.words.push_back({ TextUtils::wideToUtf8(std::wstring(word.Text())), r.X, r.Y, r.Width, r.Height });
+                            }
+                            lines.push_back(l);
+                        }
+                    } catch (const winrt::hresult_error& e) {
+                        error = "OCR: " + TextUtils::wideToUtf8(std::wstring(e.message()));
+                    } catch (...) {
+                        error = "OCR non riuscito";
                     }
-                    lines.push_back(l);
-                }
+                    return lines;
+                };
+                work(reader);
             } catch (const winrt::hresult_error& e) {
                 error = "OCR: " + TextUtils::wideToUtf8(std::wstring(e.message()));
             } catch (...) {
                 error = "OCR non riuscito";
             }
         }).join();
-        return lines;
     }
 
     int letters(const std::vector<RawLine>& lines) {
@@ -184,7 +308,29 @@ namespace {
         return cached;
     }
 
+    // Le righe lette (in pixel dell'immagine ingrandita) in coordinate dello schermo.
+    Result toResult(const std::vector<RawLine>& lines, const RECT& region, int scale) {
+        Result res;
+        for (const auto& l : lines) {
+            double x1 = 1e9, y1 = 1e9, x2 = -1e9, y2 = -1e9;
+            for (const auto& w : l.words) {
+                x1 = std::min(x1, w.x);
+                y1 = std::min(y1, w.y);
+                x2 = std::max(x2, w.x + w.w);
+                y2 = std::max(y2, w.y + w.h);
+            }
+            auto toScreen = [&](double x, double y, double w, double h) {
+                return RECT{ region.left + (LONG)(x / scale), region.top + (LONG)(y / scale), region.left + (LONG)((x + w) / scale),
+                             region.top + (LONG)((y + h) / scale) };
+            };
+            if (!l.words.empty()) res.hits.push_back({ TextUtils::trim(l.text), toScreen(x1, y1, x2 - x1, y2 - y1), true });
+            for (const auto& w : l.words) res.hits.push_back({ TextUtils::trim(w.text), toScreen(w.x, w.y, w.w, w.h), false });
+        }
+        return res;
+    }
+
     // Immagine di controllo: quello che si è letto, con i riquadri verdi dell'OCR (BMP).
+    // Una per zona, sovrascritta: resta solo l'ultima lettura.
     std::string saveDebug(const Image& shot, const std::vector<Hit>& hits, const RECT& region, const std::string& tag) {
         const std::wstring dir = debugDir();
         CreateDirectoryW(dir.c_str(), nullptr);
@@ -194,17 +340,13 @@ namespace {
             const int l = h.rect.left - region.left, t = h.rect.top - region.top, r = h.rect.right - region.left, b = h.rect.bottom - region.top;
             auto put = [&](int x, int y) {
                 if (x < 0 || y < 0 || x >= img.width || y >= img.height) return;
-                uint8_t* p = &img.bgra[((size_t)y * img.width + x) * 4];
+                uint8_t* p = &img.pixels[((size_t)y * img.width + x) * 4];
                 p[0] = 0; p[1] = 255; p[2] = 0;
             };
             for (int x = l; x <= r; ++x) { put(x, t); put(x, b); }
             for (int y = t; y <= b; ++y) { put(l, y); put(r, y); }
         }
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        wchar_t name[64];
-        swprintf(name, 64, L"\\%02d%02d%02d-", st.wHour, st.wMinute, st.wSecond);
-        const std::wstring path = dir + name + TextUtils::utf8ToWide(tag) + L".bmp";
+        const std::wstring path = dir + L"\\" + TextUtils::utf8ToWide(tag) + L".bmp";
         FILE* f = nullptr;
         if (_wfopen_s(&f, path.c_str(), L"wb") != 0 || !f) return {};
         BITMAPFILEHEADER fh{};
@@ -217,12 +359,44 @@ namespace {
         ih.biCompression = BI_RGB;
         fh.bfType = 0x4D42;
         fh.bfOffBits = sizeof(fh) + sizeof(ih);
-        fh.bfSize = fh.bfOffBits + (DWORD)img.bgra.size();
+        fh.bfSize = fh.bfOffBits + (DWORD)img.pixels.size();
         fwrite(&fh, sizeof(fh), 1, f);
         fwrite(&ih, sizeof(ih), 1, f);
-        fwrite(img.bgra.data(), 1, img.bgra.size(), f);
+        fwrite(img.pixels.data(), 1, img.pixels.size(), f);
         fclose(f);
         return TextUtils::wideToUtf8(path);
+    }
+
+    // Minimo (o massimo) su una finestra k×k, prima le righe e poi le colonne.
+    std::vector<uint8_t> windowFilter(const std::vector<uint8_t>& in, int w, int h, int k, bool takeMin) {
+        const int r = k / 2;
+        std::vector<uint8_t> rows(in.size()), out(in.size());
+        auto pick = [takeMin](uint8_t a, uint8_t b) { return takeMin ? std::min(a, b) : std::max(a, b); };
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                uint8_t m = in[(size_t)y * w + x];
+                for (int d = std::max(0, x - r); d <= std::min(w - 1, x + r); ++d) m = pick(m, in[(size_t)y * w + d]);
+                rows[(size_t)y * w + x] = m;
+            }
+        }
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                uint8_t m = rows[(size_t)y * w + x];
+                for (int d = std::max(0, y - r); d <= std::min(h - 1, y + r); ++d) m = pick(m, rows[(size_t)d * w + x]);
+                out[(size_t)y * w + x] = m;
+            }
+        }
+        return out;
+    }
+
+    // I tratti chiari e sottili (le lettere) di una cattura: più chiari di almeno 14 livelli dello
+    // sfondo stimato lì intorno (apertura 7×7). Il vetro sfumato della ricerca e la mappa sfocata
+    // dietro restano fuori, sia sul vetro chiaro (testo 240 su 210) sia su quello scuro.
+    std::vector<bool> textMask(const Shot& s) {
+        const std::vector<uint8_t> background = windowFilter(windowFilter(s.gray, s.width, s.height, 7, true), s.width, s.height, 7, false);
+        std::vector<bool> mask(s.gray.size());
+        for (size_t i = 0; i < s.gray.size(); ++i) mask[i] = (int)s.gray[i] - (int)background[i] >= 14;
+        return mask;
     }
 }
 
@@ -230,40 +404,51 @@ std::wstring debugDir() {
     return AppPaths::getAppDataDir() + L"\\debug";
 }
 
-Result read(const RECT& region, const OcrSettings& settings, const std::string& debugTag) {
-    Result res;
-    const Image shot = capture(region);
+Result readImage(const Image& shot, const RECT& region, const OcrSettings& settings, const std::string& debugTag,
+                 const std::function<bool(const Result&)>& accept) {
+    Result best;
     if (shot.width < 8 || shot.height < 8) {
-        res.error = "zona troppo piccola o fuori dallo schermo";
-        return res;
+        best.error = "zona troppo piccola o fuori dallo schermo";
+        return best;
     }
     int scale = std::clamp(settings.upscale, 1, 4);
     const int maxDim = maxDimension();
     while (scale > 1 && (shot.width * scale > maxDim || shot.height * scale > maxDim)) scale--;
 
-    std::vector<RawLine> lines = recognize(prepare(shot, scale, true), settings.language, res.error);
-    if (letters(lines) < 3 && res.error.empty()) {
-        std::string err2;
-        std::vector<RawLine> plain = recognize(prepare(shot, scale, false), settings.language, err2);
-        if (letters(plain) > letters(lines)) lines = plain;
-    }
-    for (const auto& l : lines) {
-        double x1 = 1e9, y1 = 1e9, x2 = -1e9, y2 = -1e9;
-        for (const auto& w : l.words) {
-            x1 = std::min(x1, w.x);
-            y1 = std::min(y1, w.y);
-            x2 = std::max(x2, w.x + w.w);
-            y2 = std::max(y2, w.y + w.h);
+    // Senza accept: invertita, e normale solo se l'invertita legge poco (come sempre).
+    const std::vector<Prep> order = accept ? std::vector<Prep>{ Prep::Inverted, Prep::Cleaned, Prep::Strokes, Prep::StrokesBinary,
+                                                                Prep::CleanedInverted, Prep::Plain }
+                                           : std::vector<Prep>{ Prep::Inverted, Prep::Plain };
+    std::string error;
+    withEngine(settings.language, error, [&](const Reader& recognize) {
+        int bestLetters = -1;
+        for (const Prep mode : order) {
+            if (!accept && mode == Prep::Plain && (bestLetters >= 3 || !error.empty())) break;
+            const std::vector<RawLine> lines = recognize(prepareAs(shot, scale, maxDim, mode));
+            Result r = toResult(lines, region, scale);
+            r.variant = prepName(mode);
+            if (accept && accept(r)) {
+                best = std::move(r);
+                return;
+            }
+            const int n = letters(lines);
+            if (n > bestLetters) {
+                best = std::move(r);
+                bestLetters = n;
+            }
         }
-        auto toScreen = [&](double x, double y, double w, double h) {
-            return RECT{ region.left + (LONG)(x / scale), region.top + (LONG)(y / scale), region.left + (LONG)((x + w) / scale),
-                         region.top + (LONG)((y + h) / scale) };
-        };
-        if (!l.words.empty()) res.hits.push_back({ TextUtils::trim(l.text), toScreen(x1, y1, x2 - x1, y2 - y1), true });
-        for (const auto& w : l.words) res.hits.push_back({ TextUtils::trim(w.text), toScreen(w.x, w.y, w.w, w.h), false });
-    }
-    if (settings.saveDebugShots && !debugTag.empty()) res.savedImage = saveDebug(shot, res.hits, region, debugTag);
-    return res;
+    });
+    if (best.error.empty()) best.error = error;
+    if (settings.saveDebugShots && !debugTag.empty()) best.savedImage = saveDebug(shot, best.hits, region, debugTag);
+    return best;
+}
+
+Result read(const RECT& region, const OcrSettings& settings, const std::string& debugTag) {
+    return readImage(capture(region), region, settings, debugTag, nullptr);
+}
+
+Result readUntil(const RECT& region, const OcrSettings& settings, const std::string& debugTag, const std::function<bool(const Result&)>& accept) {
+    return readImage(capture(region), region, settings, debugTag, accept ? accept : [](const Result&) { return false; });
 }
 
 std::string linesText(const Result& result) {
@@ -274,6 +459,27 @@ std::string linesText(const Result& result) {
         out += h.text;
     }
     return out;
+}
+
+Shot grayOf(const Image& image) {
+    Shot s;
+    if (image.empty()) return s;
+    s.width = image.width;
+    s.height = image.height;
+    s.gray = luminance(image);
+    return s;
+}
+
+Shot grab(const RECT& region) {
+    return grayOf(capture(region));
+}
+
+double textChange(const Shot& before, const Shot& after) {
+    if (before.empty() || after.empty() || before.width != after.width || before.height != after.height) return 1.0;
+    const std::vector<bool> a = textMask(before), b = textMask(after);
+    size_t changed = 0;
+    for (size_t i = 0; i < a.size(); ++i) changed += a[i] != b[i] ? 1 : 0;
+    return (double)changed / (double)a.size();
 }
 
 } // namespace ScreenOcr

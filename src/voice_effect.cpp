@@ -329,6 +329,28 @@ struct VoiceEffect::Impl {
         }
     }
 
+    // Dopo la coda sfumata: eco, risonanze e filtri ripartono da zero, così la frase dopo
+    // comincia dal silenzio come la coda è finita (prima l'eco rimasta ripartiva di colpo: clic).
+    void clearLines() {
+        hp.clear();
+        presence.clear();
+        comb.line.clear();
+        chorus.line.clear();
+        for (auto& c : reverb.combs) {
+            c.line.clear();
+            c.filt = 0;
+        }
+        for (auto& a : reverb.allpasses) a.line.clear();
+        for (auto& b : vocoder.bands) {
+            b.m1.clear();
+            b.m2.clear();
+            b.c1.clear();
+            b.c2.clear();
+            b.env = 0;
+        }
+        vocoder.dryHp.clear();
+    }
+
     float runOne(float x) {
         float y = hp.run(x);
         if (useRing) y = ring.run(y);
@@ -392,6 +414,7 @@ std::vector<float> VoiceEffect::tail() {
     process(out.data(), out.size());
     // Sfuma in fondo: niente "clic" se poi non arriva altro.
     const size_t fade = out.size() / 3;
-    for (size_t i = 0; i < fade; ++i) out[out.size() - fade + i] *= 1.0f - (float)i / fade;
+    for (size_t i = 0; i < fade; ++i) out[out.size() - fade + i] *= 1.0f - (float)(i + 1) / fade;
+    m->clearLines();
     return out;
 }

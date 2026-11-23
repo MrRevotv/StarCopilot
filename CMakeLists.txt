@@ -82,7 +82,6 @@ add_library(iris_core STATIC
     src/glossary.cpp
     src/gpu.cpp
     src/hotkey_listener.cpp
-    src/html_utils.cpp
     src/http_client.cpp
     src/input_sender.cpp
     src/joystick_input.cpp
@@ -115,9 +114,9 @@ add_library(iris_core STATIC
     src/whisper_engine.cpp
 )
 # nlohmann/json: la copia che llama.cpp porta con sé (un solo header).
-# onnxruntime_c_api.h: solo l'header (MIT); la DLL si carica al volo (vedi ppocr.h). Lo scarica compila.bat.
+# onnxruntime_c_api.h: solo l'header (MIT, 1.20.1, nel repository); la DLL si carica al volo (vedi ppocr.h).
 if (NOT EXISTS "${CMAKE_SOURCE_DIR}/external/onnxruntime/include/onnxruntime_c_api.h")
-    message(FATAL_ERROR "Manca external/onnxruntime/include/onnxruntime_c_api.h: lancia compila.bat (lo scarica).")
+    message(FATAL_ERROR "Manca external/onnxruntime/include/onnxruntime_c_api.h (è nel repository).")
 endif()
 target_include_directories(iris_core PUBLIC src external/miniaudio external/llama.cpp/vendor "${CMAKE_BINARY_DIR}/generated" external/onnxruntime/include)
 target_link_libraries(iris_core PUBLIC

@@ -27,8 +27,9 @@ namespace MiningLog {
         std::string material, label, kind, rarity;
         int quantity = 0;
         std::vector<Alternative> alternatives; // solo se "ambiguo"
-        std::string source;        // "tasto", "continua", "voce", "manuale", "barra"
+        std::string source;        // "tasto", "continua", "voce", "manuale", "ruota" ("barra" nei registri di prima)
         int reads = 1;             // quante letture della stessa roccia
+        long long last = 0;        // secondi UTC dell'ultima lettura (solo nel registro in corso, non nel file)
     };
 
     struct MaterialTotal {
@@ -84,7 +85,6 @@ namespace MiningLog {
         mutable std::mutex m_mutex;
         bool m_active = false;
         long long m_start = 0;
-        long long m_lastSeen = 0; // ultima lettura dell'ultimo rilevamento
         std::vector<Entry> m_entries;
         std::vector<std::string> m_places;
         std::wstring m_lastFile;

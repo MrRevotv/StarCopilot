@@ -1,10 +1,12 @@
 #include "game_profile.h"
+#include "command_matcher.h"
 #include "game_input.h"
 #include "text_utils.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 
 namespace {
     using json = nlohmann::json;
@@ -104,45 +106,105 @@ std::string GameCommand::id() const {
     return intent;
 }
 
-std::string relaxedJson(const std::string& text) {
+std::string relaxedJson(const std::string& text, std::vector<size_t>* sourcePos) {
+    // Commenti e virgole in più diventano spazi (le posizioni restano quelle del file, per dire
+    // riga e colonna di un errore); una virgola dimenticata a fine riga si aggiunge.
     std::string out;
-    out.reserve(text.size());
-    bool inString = false, escape = false;
+    std::vector<size_t> pos;
+    out.reserve(text.size() + 16);
+    pos.reserve(text.size() + 16);
+    auto emit = [&](char c, size_t from) {
+        out += c;
+        pos.push_back(from);
+    };
+    static const char* kSmartOpen = "\xE2\x80\x9C";  // “
+    static const char* kSmartClose = "\xE2\x80\x9D"; // ”
+    auto smartQuoteAt = [&](size_t i) { return text.compare(i, 3, kSmartOpen) == 0 || text.compare(i, 3, kSmartClose) == 0; };
+    // Dove finisce un valore e ne comincia un altro: tra i due, su righe diverse, manca una virgola.
+    auto endsValue = [](char c) { return c == '"' || c == '}' || c == ']' || (c >= '0' && c <= '9') || c == 'e' || c == 'l'; };
+    auto startsValue = [](char c) { return c == '"' || c == '{' || c == '[' || (c >= '0' && c <= '9') || c == '-' || c == 't' || c == 'f' || c == 'n'; };
+
+    bool inString = false, escape = false, lineStart = true, newlineSince = false;
+    char lastSignificant = 0;
     for (size_t i = 0; i < text.size(); ++i) {
-        char c = text[i];
+        const char c = text[i];
+        const bool smart = smartQuoteAt(i);
         if (inString) {
-            out += c;
-            if (escape) escape = false;
-            else if (c == '\\') escape = true;
-            else if (c == '"') inString = false;
+            if (escape) {
+                escape = false;
+                emit(c, i);
+            } else if (c == '\\') {
+                escape = true;
+                emit(c, i);
+            } else if (c == '"' || smart) {
+                inString = false;
+                lastSignificant = '"';
+                newlineSince = false;
+                emit('"', i);
+                if (smart) {
+                    emit(' ', i + 1);
+                    emit(' ', i + 2);
+                    i += 2;
+                }
+            } else {
+                emit(c, i);
+            }
             continue;
         }
-        if (c == '"') {
-            inString = true;
-            out += c;
-            continue;
-        }
-        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/') {
-            while (i < text.size() && text[i] != '\n') ++i;
-            out += '\n';
+        const bool lineComment = (c == '/' && i + 1 < text.size() && text[i + 1] == '/') || (c == '#' && lineStart);
+        if (lineComment) {
+            while (i < text.size() && text[i] != '\n') {
+                emit(text[i] == '\r' ? '\r' : ' ', i);
+                ++i;
+            }
+            if (i < text.size()) emit('\n', i);
+            lineStart = newlineSince = true;
             continue;
         }
         if (c == '/' && i + 1 < text.size() && text[i + 1] == '*') {
-            size_t end = text.find("*/", i + 2);
-            i = end == std::string::npos ? text.size() : end + 1;
+            const size_t end = text.find("*/", i + 2);
+            const size_t stop = end == std::string::npos ? text.size() : end + 2;
+            for (; i < stop; ++i) {
+                if (text[i] == '\n') newlineSince = lineStart = true;
+                emit(text[i] == '\n' ? '\n' : ' ', i);
+            }
+            --i;
             continue;
         }
-        out += c;
+        if (c == '\n') {
+            lineStart = newlineSince = true;
+            emit(c, i);
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r') {
+            emit(c, i);
+            continue;
+        }
+        lineStart = false;
+        if ((startsValue(c) || smart) && newlineSince && endsValue(lastSignificant)) emit(',', i);
+        newlineSince = false;
+        if (c == '"' || smart) {
+            inString = true;
+            if (smart) {
+                emit(' ', i);
+                emit(' ', i + 1);
+                emit('"', i + 2);
+                i += 2;
+            } else {
+                emit('"', i);
+            }
+            continue;
+        }
+        lastSignificant = c;
+        emit(c, i);
     }
-    // Virgole prima di } o ]
-    std::string clean;
-    clean.reserve(out.size());
+
+    // Virgole prima di } o ]: diventano spazi.
     inString = false;
     escape = false;
     for (size_t i = 0; i < out.size(); ++i) {
-        char c = out[i];
+        const char c = out[i];
         if (inString) {
-            clean += c;
             if (escape) escape = false;
             else if (c == '\\') escape = true;
             else if (c == '"') inString = false;
@@ -152,51 +214,105 @@ std::string relaxedJson(const std::string& text) {
         if (c == ',') {
             size_t j = i + 1;
             while (j < out.size() && (out[j] == ' ' || out[j] == '\t' || out[j] == '\r' || out[j] == '\n')) ++j;
-            if (j < out.size() && (out[j] == '}' || out[j] == ']')) continue;
+            if (j < out.size() && (out[j] == '}' || out[j] == ']')) out[i] = ' ';
         }
-        clean += c;
     }
-    return clean;
+    if (sourcePos) *sourcePos = std::move(pos);
+    return out;
+}
+
+namespace {
+    // "riga 12, colonna 5" dell'errore, nel file com'è scritto, con la riga stessa.
+    std::string jsonErrorText(const std::string& original, const std::vector<size_t>& where, size_t relaxedSize, size_t byte) {
+        const size_t at = byte == 0 ? 0 : byte - 1; // nlohmann conta da 1
+        const bool atEnd = at >= relaxedSize;
+        size_t src = atEnd || where.empty() ? original.size() : where[std::min(at, where.size() - 1)];
+        src = std::min(src, original.size());
+        // Alla fine del file l'errore è dopo l'ultima cosa scritta: si indica quella.
+        if (atEnd) {
+            while (src > 0 && std::isspace((unsigned char)original[src - 1])) --src;
+        }
+        size_t line = 1, lineBegin = 0;
+        for (size_t i = 0; i < src; ++i) {
+            if (original[i] == '\n') {
+                line++;
+                lineBegin = i + 1;
+            }
+        }
+        size_t column = 1;
+        for (size_t i = lineBegin; i < src; ++i) {
+            if (((unsigned char)original[i] & 0xC0) != 0x80) column++; // caratteri, non byte
+        }
+        size_t lineEnd = original.find('\n', lineBegin);
+        if (lineEnd == std::string::npos) lineEnd = original.size();
+        std::string shown = TextUtils::trim(original.substr(lineBegin, lineEnd - lineBegin));
+        if (shown.size() > 70) shown = shown.substr(0, 67) + "...";
+        const std::string hint = atEnd ? "il file finisce prima del tempo: manca una } o una ] in fondo"
+                                       : "controlla virgole, due punti, virgolette e parentesi";
+        return "JSON non valido alla riga " + std::to_string(line) + ", colonna " + std::to_string(column) + " (" + hint + ")" +
+               (shown.empty() ? std::string() : ": «" + shown + "»");
+    }
 }
 
 GameProfile GameProfile::defaults() {
     GameProfile p;
-    // Tasti predefiniti di Star Citizen (controlla che siano i tuoi: Opzioni > Comandi).
+    p.defaultsVersion = kDefaultsVersion;
+    // Tasti predefiniti di Star Citizen 4.x (controlla che siano i tuoi: Opzioni > Comandi).
+    // Disaccoppiato è Alt sinistro + C, il cruise control è C.
     p.keys = {
         { "map", "F2" }, { "mobiglas", "F1" }, { "confirm", "Enter" }, { "cancel", "Escape" }, { "search_focus", "" },
         { "landing_gear", "N" }, { "lights", "L" }, { "vtol", "K" }, { "quantum_spool", "B" }, { "quantum_engage", "B" },
         { "scan_mode", "V" }, { "ping", "Tab" }, { "power", "U" }, { "engines", "I" }, { "shields", "O" }, { "weapons", "P" },
-        { "flight_ready", "R" }, { "request_landing", "LAlt+N" }, { "decoupled", "C" }, { "cruise", "LAlt+C" },
-        { "missiles", "G" }, { "decoy", "H" }, { "noise", "J" }, { "exit_seat", "Y" },
+        { "flight_ready", "R" }, { "request_landing", "LAlt+N" }, { "decoupled", "LAlt+C" }, { "cruise", "C" },
+        { "missiles", "G" }, { "decoy", "H" }, { "noise", "J" }, { "exit_seat", "Y" }, { "mining_mode", "M" },
     };
     p.commands = {
         cmd("set_route", { "imposta rotta per {destination}", "imposta la rotta per {destination}", "rotta per {destination}",
                            "rotta verso {destination}", "portami a {destination}", "andiamo a {destination}", "destinazione {destination}",
-                           "imposta destinazione {destination}", "traccia la rotta per {destination}", "set route to {destination}" },
+                           "imposta destinazione {destination}", "traccia la rotta per {destination}", "set route to {destination}",
+                           "imposta una rotta per {destination}", "calcola la rotta per {destination}", "imposta il percorso per {destination}",
+                           "percorso per {destination}" },
             {}, "Calcolo la rotta per {destination}."),
-        cmd("cancel_route", { "annulla rotta", "annulla la rotta", "cancella rotta", "cancella la rotta", "togli la rotta", "elimina la rotta" },
+        cmd("cancel_route", { "annulla rotta", "annulla la rotta", "cancella rotta", "cancella la rotta", "togli la rotta", "elimina la rotta",
+                              "annulla il percorso", "cancella il percorso" },
             {}, "Annullo la rotta."),
         cmd("open_map", { "apri la mappa", "apri mappa", "mappa stellare", "starmap" }),
         cmd("close_map", { "chiudi la mappa", "chiudi mappa", "togli la mappa" }),
         cmd("press", { "carrello", "carrello di atterraggio", "abbassa il carrello", "alza il carrello", "tira su il carrello", "gear" },
             { { "key", "landing_gear" } }, "Carrello."),
-        cmd("press", { "luci", "accendi le luci", "spegni le luci", "fari" }, { { "key", "lights" } }, "Luci."),
+        cmd("press", { "luci", "accendi le luci", "spegni le luci", "fari", "attiva le luci", "disattiva le luci" }, { { "key", "lights" } }, "Luci."),
         cmd("press", { "vtol", "modalita vtol", "vettoriale" }, { { "key", "vtol" } }, "VTOL."),
         cmd("press", { "modalita scansione", "scansione", "attiva lo scanner" }, { { "key", "scan_mode" } }),
         cmd("press", { "ping", "manda un ping", "pinga", "scansiona intorno" }, { { "key", "ping" } }),
         cmd("press", { "alimentazione", "accendi la nave", "spegni la nave" }, { { "key", "power" } }),
-        cmd("press", { "scudi", "alza gli scudi", "abbassa gli scudi" }, { { "key", "shields" } }, "Scudi."),
-        cmd("press", { "motori", "accendi i motori", "spegni i motori" }, { { "key", "engines" } }, "Motori."),
-        cmd("press", { "armi", "armi in linea", "arma i cannoni", "disarma" }, { { "key", "weapons" } }, "Armi."),
+        // Sono tasti "interruttore": alzare e abbassare premono lo stesso. I contrari restano separati
+        // nelle frasi (il riconoscimento non scambia mai "disattiva" con "alza").
+        cmd("press", { "scudi", "alza gli scudi", "abbassa gli scudi", "attiva gli scudi", "disattiva gli scudi", "accendi gli scudi",
+                       "spegni gli scudi" },
+            { { "key", "shields" } }, "Scudi."),
+        cmd("press", { "motori", "accendi i motori", "spegni i motori", "attiva i motori", "disattiva i motori" }, { { "key", "engines" } }, "Motori."),
+        cmd("press", { "armi", "armi in linea", "arma i cannoni", "disarma", "attiva le armi", "disattiva le armi", "accendi le armi",
+                       "spegni le armi" },
+            { { "key", "weapons" } }, "Armi."),
         cmd("press", { "pronti al volo", "avvia i sistemi", "prepara al volo", "flight ready" }, { { "key", "flight_ready" } }, "Sistemi pronti."),
-        cmd("press", { "richiedi atterraggio", "chiedi di atterrare", "permesso di atterraggio", "chiama la torre" },
-            { { "key", "request_landing" } }, "Richiedo l'atterraggio."),
-        cmd("press", { "modalita disaccoppiata", "disaccoppiato", "decoupled" }, { { "key", "decoupled" } }),
+        // Alt+N chiede alla torre (ATC) di atterrare o di partire: nell'hangar apre le porte.
+        cmd("press", { "richiedi atterraggio", "chiedi di atterrare", "permesso di atterraggio", "chiama la torre", "chiama l'atc", "chiama atc",
+                       "contatta la torre", "richiedi il decollo", "chiedi il decollo", "permesso di decollo", "apri l'hangar", "apri hangar",
+                       "apri le porte dell'hangar" },
+            { { "key", "request_landing" } }, "Chiamo la torre."),
+        cmd("press", { "modalita disaccoppiata", "disaccoppiato", "decoupled", "modalita coupled", "attiva la modalita coupled",
+                       "disattiva la modalita coupled", "modalita accoppiata", "accoppiato" },
+            { { "key", "decoupled" } }),
         cmd("press", { "cruise control", "velocita di crociera", "crociera" }, { { "key", "cruise" } }),
         cmd("press", { "missili", "arma i missili", "modalita missili" }, { { "key", "missiles" } }, "Missili."),
         cmd("press", { "flare", "lancia i flare", "contromisure", "decoy" }, { { "key", "decoy" } }),
         cmd("press", { "chaff", "disturbo", "lancia il disturbo" }, { { "key", "noise" } }),
-        cmd("hold", { "alzati", "esci dal sedile", "lascia il sedile" }, { { "key", "exit_seat" }, { "ms", "1200" } }),
+        cmd("press", { "mobiglas", "apri il mobiglas", "chiudi il mobiglas" }, { { "key", "mobiglas" } }),
+        cmd("press", { "modalita mining", "modalita estrazione", "modalita di estrazione", "laser minerario", "mining mode" },
+            { { "key", "mining_mode" } }, "Mining."),
+        cmd("hold", { "alzati", "esci dal sedile", "lascia il sedile", "alzati dal posto di guida", "alzati dal sedile", "esci dal posto di guida",
+                      "scendi dal sedile" },
+            { { "key", "exit_seat" }, { "ms", "1200" } }),
         cmd("sequence", { "prepara la nave", "accendi tutto", "check pre volo", "procedura di decollo" },
             { { "keys", "power,engines,shields,weapons" } }, "Accendo tutto."),
         cmd("quantum_travel", { "quantum", "salto quantico", "vai in quantum", "attiva il quantum", "avvia il salto" }, {}, "Salto quantico."),
@@ -242,22 +358,124 @@ GameProfile GameProfile::defaults() {
         { "Ruin Station", { "ruin" } },
         { "Checkmate Station", { "checkmate" } },
         { "Cru-L1", { "crul1", "cru l1", "cruelle 1", "crusader l1" } },
+        // Pyro
+        { "Pyro Gateway", { "gateway di pyro", "gateway pyro" } },
+        { "Stanton Gateway", { "gateway di stanton", "gateway stanton" } },
+        { "Monox", { "monox" } },
+        { "Bloom", { "blum" } },
+        { "Terminus", {} },
+        { "Orbituary", { "orbituari" } },
+        { "Starlight Service Station", { "starlight" } },
+        { "Patch City", { "patch city" } },
+        { "Endgame", { "end game" } },
+        { "Gaslight", { "gas light" } },
     };
+    // I punti di Lagrange (stazioni di rifornimento): "Cru-L4", detto "cru l4", "cru l quattro",
+    // "crusader l4". Le cifre contano: "cru l2" non diventa mai "Cru-L1".
+    {
+        struct Lagrange { const char* code; const char* planet; std::vector<int> points; };
+        static const char* kWords[] = { "", "uno", "due", "tre", "quattro", "cinque" };
+        const Lagrange list[] = { { "Arc", "arccorp", { 1, 2, 3, 4, 5 } }, { "Cru", "crusader", { 1, 4, 5 } },
+                                  { "Hur", "hurston", { 1, 2, 3, 4, 5 } }, { "Mic", "microtech", { 1, 2, 3, 4, 5 } } };
+        for (const auto& l : list) {
+            for (int n : l.points) {
+                const std::string code = l.code, lower = TextUtils::toLower(code), num = std::to_string(n);
+                auto& variants = p.aliases["destination"][code + "-L" + num];
+                for (const std::string& v : { lower + " l" + num, lower + " l " + kWords[n], lower + "l" + num, std::string(l.planet) + " l" + num }) {
+                    if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
+                }
+            }
+        }
+    }
     p.corrections = {
         { "a nulla", "annulla" }, { "cruzader", "crusader" }, { "crusade", "crusader" }, { "arcorp", "arccorp" },
         { "olisa", "olisar" }, { "quantico", "quantum" }, { "quantam", "quantum" }, { "pinaga", "pinga" },
         { "quantum and mode", "quantum" }, { "sera a film", "seraphim" }, { "serafin", "seraphim" },
+        // Come whisper ha sentito davvero alcuni comandi (frasi_non_capite.txt).
+        { "chiamala tc", "chiama l atc" }, { "chiama la tc", "chiama l atc" }, { "capoled", "coupled" }, { "capolet", "coupled" },
+        { "coppled", "coupled" }, { "imposto", "imposta" },
     };
     return p;
 }
 
+int GameProfile::addMissingDefaults() {
+    const GameProfile d = defaults();
+    int added = 0;
+    // Una frase nuova non deve rubarne una tua: né uguale, né quasi uguale (e dello stesso verso)
+    // in un altro comando ("apri hangar" accanto al tuo "apri l'hangar" lo batterebbe).
+    auto used = [&](const std::string& phrase, const GameCommand* owner) {
+        const std::string n = TextUtils::normalizeForMatch(phrase), cn = Cmd::normalize(phrase);
+        for (const auto& c : commands) {
+            for (const auto& ph : c.phrases) {
+                if (TextUtils::normalizeForMatch(ph) == n) return true;
+                if (&c != owner && Cmd::similarity(Cmd::normalize(ph), cn) >= 0.8 && Cmd::polarity(Cmd::normalize(ph)) == Cmd::polarity(cn)) return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& def : d.commands) {
+        auto it = std::find_if(commands.begin(), commands.end(), [&](const GameCommand& c) { return sameCommand(c, def); });
+        if (it == commands.end()) {
+            GameCommand c = def;
+            c.phrases.clear();
+            for (const auto& ph : def.phrases) {
+                if (!used(ph, nullptr)) c.phrases.push_back(ph);
+            }
+            if (c.phrases.empty()) continue;
+            commands.push_back(c);
+            added++;
+            continue;
+        }
+        for (const auto& ph : def.phrases) {
+            if (used(ph, &*it)) continue;
+            it->phrases.push_back(ph);
+            added++;
+        }
+    }
+    for (const auto& [k, v] : d.keys) {
+        if (keys.count(k)) continue;
+        keys[k] = v;
+        added++;
+    }
+    for (const auto& [slot, table] : d.aliases) {
+        for (const auto& [canonical, variants] : table) {
+            auto& dst = aliases[slot][canonical];
+            for (const auto& v : variants) {
+                if (std::find(dst.begin(), dst.end(), v) != dst.end()) continue;
+                dst.push_back(v);
+                added++;
+            }
+        }
+    }
+    for (const auto& [from, to] : d.corrections) {
+        if (corrections.count(from)) continue;
+        corrections[from] = to;
+        added++;
+    }
+    defaultsVersion = kDefaultsVersion;
+    return added;
+}
+
 bool GameProfile::parse(const std::string& text, GameProfile& out, std::string& error) {
-    json j = json::parse(relaxedJson(text), nullptr, false);
-    if (j.is_discarded() || !j.is_object()) {
+    std::vector<size_t> where;
+    const std::string relaxed = relaxedJson(text, &where);
+    json j;
+    try {
+        j = json::parse(relaxed);
+    } catch (const json::parse_error& e) {
+        error = jsonErrorText(text, where, relaxed.size(), e.byte);
+        return false;
+    } catch (...) {
         error = "JSON non valido (controlla virgole e parentesi)";
         return false;
     }
+    if (!j.is_object()) {
+        error = "il profilo deve essere un oggetto JSON: comincia con { e finisce con }";
+        return false;
+    }
     GameProfile p = defaults();
+    p.defaultsVersion = 0; // un file senza il numero è stato scritto prima dei predefiniti nuovi
+    read(j, "defaultsVersion", p.defaultsVersion);
     read(j, "name", p.name);
     read(j, "processName", p.processName);
     read(j, "windowTitle", p.windowTitle);
@@ -296,6 +514,7 @@ std::string GameProfile::toJson() const {
     j["keyGapMs"] = keyGapMs;
     j["stepDelayMs"] = stepDelayMs;
     j["matchThreshold"] = matchThreshold;
+    j["defaultsVersion"] = defaultsVersion;
     j["keys"] = keys;
     j["corrections"] = corrections;
     json cmds = json::array();

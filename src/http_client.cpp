@@ -1,5 +1,4 @@
 #include "http_client.h"
-#include "html_utils.h"
 #include "text_utils.h"
 
 #include <windows.h>
@@ -56,8 +55,8 @@ namespace {
         if (!h.session) { r.error = "rete non disponibile"; return r; }
         const int t = options.timeoutMs;
         WinHttpSetTimeouts(h.session, t, t, t, t);
-        // Pagine compresse: solo gzip. Alcuni server (Open-Meteo) mandano un
-        // "deflate" che Windows non riesce a leggere ("lettura interrotta").
+        // Risposte compresse: solo gzip. Alcuni server mandano un "deflate"
+        // che Windows non riesce a leggere ("lettura interrotta").
         DWORD decompress = WINHTTP_DECOMPRESSION_FLAG_GZIP;
         WinHttpSetOption(h.session, WINHTTP_OPTION_DECOMPRESSION, &decompress, sizeof(decompress));
         h.connect = WinHttpConnect(h.session, host, uc.nPort, 0);
@@ -116,23 +115,6 @@ namespace {
 
 Response get(const std::string& url, const Options& options) {
     return send(L"GET", url, {}, {}, options);
-}
-
-Response post(const std::string& url, const std::string& body, const std::string& contentType, const Options& options) {
-    return send(L"POST", url, body, contentType, options);
-}
-
-std::string bodyUtf8(const Response& response) {
-    const std::string cs = Html::charset(response.contentType, response.body);
-    if (cs == "iso-8859-1" || cs == "windows-1252" || cs == "latin1" || cs == "iso-8859-15" || cs == "cp1252") {
-        const std::string& b = response.body;
-        int n = MultiByteToWideChar(1252, 0, b.data(), (int)b.size(), nullptr, 0);
-        if (n <= 0) return b;
-        std::wstring w(n, L'\0');
-        MultiByteToWideChar(1252, 0, b.data(), (int)b.size(), w.data(), n);
-        return TextUtils::wideToUtf8(w);
-    }
-    return response.body;
 }
 
 } // namespace Http

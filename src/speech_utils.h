@@ -32,4 +32,12 @@ namespace SpeechUtils {
     // "(ride)"), simboli musicali. Ritorna stringa vuota se non resta nulla.
     std::string cleanTranscript(const std::string& text);
 
+    // La frase sentita è la voce di Iris tornata dalle casse al microfono? heard e said
+    // (le ultime frasi dette) già normalizzati: minuscolo, parole separate da uno spazio.
+    // Vale anche con qualche parola capita male ("ciao rebo sono iris" per "Ciao REVO, sono
+    // Iris"), purché le parole siano in fila come le ha dette lei. strict: sentita DOPO che
+    // aveva finito di parlare (potrebbe essere la tua risposta con le sue parole: "sì,
+    // imposta la rotta"), quindi solo se è proprio uguale.
+    bool soundsLikeEcho(const std::string& heard, const std::vector<std::string>& said, bool strict);
+
 } // namespace SpeechUtils

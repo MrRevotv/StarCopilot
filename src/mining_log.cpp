@@ -38,7 +38,7 @@ namespace {
         for (const auto& a : e.alternatives) alts.push_back({ { "material", a.material }, { "label", a.label }, { "kind", a.kind }, { "quantity", a.quantity } });
         return { { "epoch", e.epoch },   { "value", e.value }, { "outcome", e.outcome },   { "material", e.material }, { "label", e.label },
                  { "kind", e.kind },     { "rarity", e.rarity }, { "quantity", e.quantity }, { "alternatives", alts },
-                 { "source", e.source }, { "reads", e.reads } };
+                 { "source", e.source }, { "reads", e.reads }, { "last", e.last } };
     }
 
     Entry entryFrom(const json& j) {
@@ -53,6 +53,7 @@ namespace {
         e.quantity = j.value("quantity", 0);
         e.source = j.value("source", std::string());
         e.reads = std::max(1, j.value("reads", 1));
+        e.last = std::max(e.epoch, j.value("last", 0LL)); // i registri di prima non l'avevano
         if (j.contains("alternatives") && j["alternatives"].is_array()) {
             for (const auto& a : j["alternatives"]) {
                 if (a.is_object()) e.alternatives.push_back({ a.value("material", std::string()), a.value("label", std::string()), a.value("kind", std::string()), a.value("quantity", 0) });
@@ -63,11 +64,36 @@ namespace {
 
     int outcomeRank(const std::string& o) { return o == "certo" ? 3 : o == "probabile" ? 2 : o == "ambiguo" ? 1 : 0; }
 
+    // Quello che un rilevamento può essere ("Copper (Rame)|4"); vuoto = sconosciuto.
+    std::vector<std::string> options(const Entry& e) {
+        std::vector<std::string> out;
+        if (e.outcome == "certo" || e.outcome == "probabile") out.push_back(e.label + "|" + std::to_string(e.quantity));
+        for (const auto& a : e.alternatives) out.push_back(a.label + "|" + std::to_string(a.quantity));
+        return out;
+    }
+
+    // Due letture vicine possono essere la stessa roccia solo se hanno almeno una possibilità in
+    // comune (una sconosciuta va bene con tutto): Copper × 4 (16.960) e Iron × 4 (17.080) sono
+    // due rocce diverse anche se i numeri distano meno del 2%.
+    bool compatible(const Entry& a, const Entry& b) {
+        const auto x = options(a), y = options(b);
+        if (x.empty() || y.empty()) return true;
+        return std::any_of(x.begin(), x.end(), [&](const std::string& o) { return std::find(y.begin(), y.end(), o) != y.end(); });
+    }
+
     std::string csvField(std::string s) {
+        // Un testo che comincia con = + - @ Excel lo eseguirebbe come formula: si scrive come testo.
+        if (!s.empty() && (s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@')) s = "'" + s;
         if (s.find_first_of(";\"\r\n") == std::string::npos) return s;
         std::string out = "\"";
         for (char c : s) out += c == '"' ? "\"\"" : std::string(1, c);
         return out + "\"";
+    }
+
+    // "2026-11-01 21:40:17", ora locale: Excel (anche in italiano) la riconosce come data e ora.
+    std::string excelLocal(long long epoch) {
+        const std::string iso = isoLocal(epoch); // "2026-11-01T21:40:17+01:00"
+        return iso.substr(0, 10) + " " + iso.substr(11, 8);
     }
 
     bool writeAll(const std::wstring& path, const std::string& data) {
@@ -199,17 +225,17 @@ std::string toCsv(const std::vector<Entry>& entries, const Closing& c) {
     o << "Luogo;" << csvField(c.place) << "\r\n";
     o << "Qualità media;" << (c.quality >= 0 ? std::to_string(c.quality) : "") << "\r\n";
     o << "Operatore;" << csvField(c.operatorName) << "\r\n";
-    o << "Inizio;" << isoLocal(c.start) << "\r\n";
-    o << "Fine;" << isoLocal(c.end) << "\r\n";
+    o << "Inizio;" << excelLocal(c.start) << "\r\n";
+    o << "Fine;" << excelLocal(c.end) << "\r\n";
     o << "\r\n";
     o << "Ora;Segnale;Esito;Materiale;Nome;Quantità;Tipo;Rarità;Alternative;Origine;Letture\r\n";
     for (const auto& e : entries) {
         std::string alts;
         for (const auto& a : e.alternatives) alts += (alts.empty() ? "" : ", ") + a.label + " x" + std::to_string(a.quantity);
         const bool sure = e.outcome == "certo" || e.outcome == "probabile";
-        o << isoLocal(e.epoch).substr(11, 8) << ";" << e.value << ";" << e.outcome << ";" << csvField(sure ? e.material : "") << ";"
+        o << excelLocal(e.epoch) << ";" << e.value << ";" << e.outcome << ";" << csvField(sure ? e.material : "") << ";"
           << csvField(sure ? e.label : "") << ";" << (sure ? std::to_string(e.quantity) : "") << ";" << (sure ? e.kind : "") << ";"
-          << (sure ? e.rarity : "") << ";" << csvField(alts) << ";" << e.source << ";" << e.reads << "\r\n";
+          << (sure ? e.rarity : "") << ";" << csvField(alts) << ";" << csvField(e.source) << ";" << e.reads << "\r\n";
     }
     o << "\r\nMateriale;Nome;Tipo;Rocce;Quantità\r\n";
     for (const auto& m : summarize(entries).materials) {
@@ -253,7 +279,6 @@ void Recorder::load() {
             if (p.is_string()) m_places.push_back(p.get<std::string>());
         }
     }
-    m_lastSeen = m_entries.empty() ? 0 : m_entries.back().epoch;
     if (m_active) Log::info("Registro del mining: riprendo quello in corso (" + std::to_string(m_entries.size()) + " rilevamenti)");
 }
 
@@ -270,7 +295,8 @@ void Recorder::save() const {
         j["places"] = m_places;
     }
     const std::wstring path = statePath(), tmp = path + L".tmp";
-    if (writeAll(tmp, j.dump(1))) MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    // Un nome della tabella con caratteri non UTF-8 non deve far cadere Iris: si sostituiscono.
+    if (writeAll(tmp, j.dump(1, ' ', false, json::error_handler_t::replace))) MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 bool Recorder::active() const {
@@ -304,7 +330,6 @@ void Recorder::start(long long now) {
         if (m_active) return;
         m_active = true;
         m_start = now;
-        m_lastSeen = 0;
         m_entries.clear();
     }
     save();
@@ -325,26 +350,35 @@ bool Recorder::add(const Entry& e) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_active) return false;
-        bool merged = false;
-        if (!m_entries.empty()) {
-            Entry& last = m_entries.back();
-            const int tolerance = std::max(2, (int)std::lround(std::abs(last.value) * 0.02));
-            // La stessa roccia riletta (entro 45 s dall'ultima lettura, anche più volte di fila):
-            // una lettura in più; se adesso la lettura è più sicura, si tiene questa.
-            if (std::abs(e.value - last.value) <= tolerance && e.epoch >= m_lastSeen && e.epoch - m_lastSeen <= kSameRockSeconds) {
-                const int reads = last.reads + 1;
-                const long long first = last.epoch;
-                if (outcomeRank(e.outcome) > outcomeRank(last.outcome)) last = e;
-                last.reads = reads;
-                last.epoch = first;
-                merged = true;
+        // La stessa roccia riletta entro 45 s dalla sua ultima lettura (anche con un'altra roccia in
+        // mezzo: si passa dall'una all'altra) è una lettura in più, non un rilevamento nuovo. Stessa
+        // signature, o vicina (2%, una cifra letta male) ma con lo stesso materiale possibile.
+        // Se adesso la lettura è più sicura, si tiene questa.
+        // Tra le ultime, quella con la signature più vicina (a pari distanza, la più recente).
+        Entry* same = nullptr;
+        for (size_t back = 0; back < m_entries.size() && back < 8; ++back) {
+            Entry& x = m_entries[m_entries.size() - 1 - back];
+            const long long seen = std::max(x.epoch, x.last);
+            const int tolerance = std::max(2, (int)std::lround(std::abs(x.value) * 0.02));
+            const int diff = std::abs(e.value - x.value);
+            if (e.epoch < seen - 1 || e.epoch - seen > kSameRockSeconds || diff > tolerance || !compatible(e, x)) continue;
+            if (!same || diff < std::abs(e.value - same->value) ||
+                (diff == std::abs(e.value - same->value) && seen > std::max(same->epoch, same->last))) {
+                same = &x;
             }
         }
-        if (!merged) {
+        if (same) {
+            const int reads = same->reads + 1;
+            const long long first = same->epoch;
+            if (outcomeRank(e.outcome) > outcomeRank(same->outcome)) *same = e;
+            same->reads = reads;
+            same->epoch = first;
+            same->last = e.epoch;
+        } else {
             if (m_entries.size() >= kMaxEntries) return false;
             m_entries.push_back(e);
+            m_entries.back().last = e.epoch;
         }
-        m_lastSeen = e.epoch;
     }
     save();
     return true;

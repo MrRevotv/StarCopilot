@@ -27,7 +27,6 @@
 #include "gamer_slang.h"
 #include "glossary.h"
 #include "gpu.h"
-#include "html_utils.h"
 #include "http_client.h"
 #include "input_sender.h"
 #include "language_guess.h"
@@ -44,6 +43,7 @@
 #include "sc_locations.h"
 #include "screen_capture.h"
 #include "screen_match.h"
+#include "screen_ocr.h"
 #include "speech_utils.h"
 #include "translation_prompt.h"
 #include "speech_text.h"
@@ -64,13 +64,18 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <chrono>
+#include <ctime>
+#include <iomanip>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -126,6 +131,26 @@ namespace {
         void remember(const std::string& fact) override { std::printf("  [memoria: %s]\n", fact.c_str()); }
     };
 
+    // Come Iris col gioco aperto (--prova-domande): game_command con i comandi del profilo
+    // predefinito, ma senza premere niente (il risultato dice solo cosa avrebbe fatto).
+    class GameFakeHost : public FakeHost {
+    public:
+        explicit GameFakeHost(std::string definition) : m_definition(std::move(definition)) {}
+        std::vector<std::string> extraToolDefinitions() override { return { m_definition }; }
+        bool runExtraTool(const std::string& name, const std::string& argumentsJson, const std::atomic<bool>*, std::string& result) override {
+            if (name != "game_command") return false;
+            std::printf("  [game_command %s]\n", argumentsJson.c_str());
+            const nlohmann::json a = nlohmann::json::parse(argumentsJson, nullptr, false);
+            const std::string command = a.is_object() && a.contains("command") && a["command"].is_string() ? a["command"].get<std::string>() : "";
+            result = !command.empty() && m_definition.find("\"" + command + "\"") != std::string::npos ? "Fatto: " + command
+                                                                                                       : "Errore: comando sconosciuto.";
+            return true;
+        }
+
+    private:
+        std::string m_definition;
+    };
+
     // ------------------------------------------------------------------------------------
     void testWakeWord() {
         std::printf("Parola di attivazione\n");
@@ -156,12 +181,64 @@ namespace {
         CHECK(!WakeWord::detect("Crisi economica in vista").found);
         CHECK(!WakeWord::detect("Che ore sono?").found);
         CHECK(!WakeWord::detect("").found);
+        // Dal registro vero: il nome ripetuto ("Iris, Iris.") è solo una chiamata, non una domanda al modello.
+        m = WakeWord::detect("Iris, Iris.");
+        CHECK(m.found && m.command.empty());
+        m = WakeWord::detect("Iris, Iris, chiamala come vuoi.");
+        CHECK(m.found);
+        CHECK_STR(m.command, "chiamala come vuoi.");
+        m = WakeWord::detect("Rotta per Crusader, Iris, Iris.");
+        CHECK(m.found);
+        CHECK_STR(m.command, "Rotta per Crusader");
+        // Parlare DI lei con un amico, col nome in fondo, non la sveglia.
+        CHECK(!WakeWord::detect("Ho aggiornato Iris.").found);
+        CHECK(!WakeWord::detect("Ieri ho parlato con Iris.").found);
+        CHECK(!WakeWord::detect("Ti piace la mia Iris?").found);
+        CHECK(!WakeWord::detect("Ciao Rebo, sono Iris.").found);
+        CHECK(!WakeWord::detect("Hai visto dell'Iris?").found);
+        // Con la virgola, o dopo un comando, sì.
+        m = WakeWord::detect("Accendi i motori Iris");
+        CHECK(m.found);
+        CHECK_STR(m.command, "Accendi i motori");
+        m = WakeWord::detect("Hai finito, Iris?");
+        CHECK(m.found);
+        CHECK_STR(m.command, "Hai finito?");
         CHECK(WakeWord::isStopCommand("basta"));
         CHECK(WakeWord::isStopCommand("Stop!"));
         CHECK(WakeWord::isStopCommand("Zitta."));
         CHECK(WakeWord::isStopCommand("Basta così, grazie"));
         CHECK(!WakeWord::isStopCommand("basta con la pasta per stasera, cosa cucino?"));
         CHECK(!WakeWord::isStopCommand("che tempo fa"));
+        // Dal registro vero: andavano al modello invece di zittirla.
+        CHECK(WakeWord::isStopCommand("Zitta, sai zitta, basta, non mi interessa, zitta."));
+        CHECK(WakeWord::isStopCommand("Madonna, stai zitta!"));
+        CHECK(WakeWord::isStopCommand("No, stop."));
+        CHECK(WakeWord::isStopCommand("Eh, basta!"));
+        CHECK(!WakeWord::isStopCommand("annulla la rotta"));
+        CHECK(!WakeWord::isStopCommand("Squamno, guarda che basta un tuo cenno, scendo con un FS9 e lo trito."));
+        CHECK(WakeWord::isHesitation("Ehm."));
+        CHECK(WakeWord::isHesitation("Mmm, boh..."));
+        CHECK(!WakeWord::isHesitation("Sì."));
+        CHECK(!WakeWord::isHesitation("Ah, ok"));
+        CHECK(WakeWord::isUnfinished("Imposta la rotta per..."));
+        CHECK(WakeWord::isUnfinished("Integra\xE2\x80\xA6"));
+        CHECK(!WakeWord::isUnfinished("Rotta per Crusader."));
+        CHECK(WakeWord::wordCount("Ehi, Iris! Carrello.") == 3);
+
+        // L'eco della sua voce: dal registro vero, "Ciao Rebo, sono Iris" (detto da lei: "Ciao REVO, sono Iris...")
+        // era finito al modello come richiesta.
+        auto n = [](const char* s) { return WakeWord::normalize(s); };
+        const std::vector<std::string> said = { n("Ciao REVO, sono Iris. Questa è la mia voce.") };
+        CHECK(SpeechUtils::soundsLikeEcho(n("Ciao Rebo, sono Iris."), said, false));
+        CHECK(SpeechUtils::soundsLikeEcho(n("Questa è la mia voce."), said, false));
+        CHECK(!SpeechUtils::soundsLikeEcho(n("Iris, basta."), said, false));
+        const std::vector<std::string> said2 = { n("Ho cancellato il timer. Se ne avessi avuto più di uno, li avrei tutti annullati.") };
+        CHECK(SpeechUtils::soundsLikeEcho(n("Se ne avessi avuto più di uno, li avrei confiato."), said2, false));
+        // Dopo che ha finito di parlare: la tua risposta con le sue parole non è eco.
+        const std::vector<std::string> said3 = { n("Vuoi che imposti la rotta per Seraphim?") };
+        CHECK(!SpeechUtils::soundsLikeEcho(n("Sì, imposta la rotta."), said3, true));
+        CHECK(!SpeechUtils::soundsLikeEcho(n("Sì."), { n("Dimmi sì o no.") }, true));
+        CHECK(SpeechUtils::soundsLikeEcho(n("imposti la rotta per Seraphim"), said3, true));
         CHECK_STR(WakeWord::normalize("Ehi, Iris!"), "ehi iris");
         CHECK_STR(WakeWord::normalize("Perché  NO?"), "perché no");
     }
@@ -192,6 +269,52 @@ namespace {
         CHECK_STR(SpeechText::speakable("Ci sono 21\xC2\xB0" "C e vento a 10 km/h"), "Ci sono 21 gradi e vento a 10 chilometri orari");
         CHECK_STR(SpeechText::speakable("# Titolo\nTesto normale."), "Titolo. Testo normale.");
         CHECK_STR(SpeechText::speakable("Fatto \xE2\x9C\x85 subito \xF0\x9F\x98\x80"), "Fatto subito");
+
+        // Dopo il punto una minuscola non è una frase nuova ("Allora... vediamo").
+        s.reset();
+        out = s.push("Allora... vediamo la rotta. Fatto");
+        CHECK(out.size() == 1 && out[0] == "Allora... vediamo la rotta.");
+
+        // Numeri e sigle come li deve dire la voce.
+        CHECK_STR(SpeechText::numberToWords(0), "zero");
+        CHECK_STR(SpeechText::numberToWords(21), "ventuno");
+        CHECK_STR(SpeechText::numberToWords(23), "ventitré");
+        CHECK_STR(SpeechText::numberToWords(28), "ventotto");
+        CHECK_STR(SpeechText::numberToWords(103), "centotré");
+        CHECK_STR(SpeechText::numberToWords(108), "centotto");
+        CHECK_STR(SpeechText::numberToWords(180), "centottanta");
+        CHECK_STR(SpeechText::numberToWords(1000), "mille");
+        CHECK_STR(SpeechText::numberToWords(2023), "duemila ventitré");
+        CHECK_STR(SpeechText::numberToWords(23000), "ventitremila");
+        CHECK_STR(SpeechText::numberToWords(16960), "sedicimila novecentosessanta");
+        CHECK_STR(SpeechText::numberToWords(1000000), "un milione");
+        CHECK_STR(SpeechText::numberToWords(2500000), "due milioni cinquecentomila");
+        CHECK_STR(SpeechText::forVoice("Hai 16.960 UEC e 32 SCU di Laranite."), "Hai sedicimila novecentosessanta UEC e trentadue esse ci u di Laranite.");
+        CHECK_STR(SpeechText::forVoice("Il salto dura circa 2,5 minuti."), "Il salto dura circa due virgola cinque minuti.");
+        CHECK_STR(SpeechText::forVoice("Sono 3.5 gradi, poi 1,05."), "Sono tre virgola cinque gradi, poi uno virgola zero cinque.");
+        CHECK_STR(SpeechText::forVoice("Carburante al 15%"), "Carburante al quindici per cento");
+        CHECK_STR(SpeechText::forVoice("A 1.200.000 km da Hurston"), "A un milione duecentomila chilometri da Hurston");
+        CHECK_STR(SpeechText::forVoice("Signature 16,960: Borase x4"), "Signature sedicimila novecentosessanta: Borase per quattro");
+        CHECK_STR(SpeechText::forVoice("Vai a CRU-L1, poi Area18"), "Vai a CRU-L1, poi Area18");
+        CHECK_STR(SpeechText::forVoice("Alle 14:30 fa -5 gradi"), "Alle quattordici e trenta fa meno cinque gradi");
+        CHECK_STR(SpeechText::forVoice("Ciao, sono Iris. Tutto a posto?"), "Ciao, sono Iris. Tutto a posto?");
+        CHECK_STR(SpeechText::forVoice("QT pronto, contatta l'ATC: 1.250 m/s, 10km"), "quantum pronto, contatta l'a ti ci: mille duecentocinquanta metri al secondo, dieci chilometri");
+        CHECK_STR(SpeechText::forVoice("Scudi al 100% e 2 F7C pronti"), "Scudi al cento per cento e due F7C pronti");
+
+        // Coda della voce: un frammento corto si dice insieme alla frase dopo, se c'è già.
+        std::deque<std::string> q = { "Certo!", "Imposto la rotta per Hurston.", "Poi controllo il carburante." };
+        CHECK_STR(TtsEngine::takeNext(q), "Certo! Imposto la rotta per Hurston.");
+        CHECK(q.size() == 1);
+        q = { "Questa frase è lunga abbastanza per stare da sola.", "Ok." };
+        CHECK_STR(TtsEngine::takeNext(q), "Questa frase è lunga abbastanza per stare da sola.");
+        q = { "Ok", "Va bene." };
+        CHECK_STR(TtsEngine::takeNext(q), "Ok. Va bene.");
+        CHECK(q.empty());
+        q = { "Sì.", std::string(230, 'a') };
+        CHECK_STR(TtsEngine::takeNext(q), "Sì.");
+        CHECK(q.size() == 1);
+        q = { "Fatto." };
+        CHECK_STR(TtsEngine::takeNext(q), "Fatto.");
     }
 
     void testVad() {
@@ -253,93 +376,6 @@ namespace {
         CHECK(seg6.inSpeech());
     }
 
-    void testHtml() {
-        std::printf("Pagine web e ricerche\n");
-        CHECK_STR(Html::decodeEntities("perch&eacute; &amp; &#8217;ok&#x27; &lt;b&gt;"), "perch\xC3\xA9 & \xE2\x80\x99ok' <b>");
-        CHECK_STR(Html::stripTags("<b>Ciao</b>  <i>mondo</i> &amp; co"), "Ciao mondo & co");
-        CHECK_STR(Html::urlDecode("https%3A%2F%2Fwww.example.com%2Fa%3Fb%3D1"), "https://www.example.com/a?b=1");
-        CHECK_STR(Html::urlEncode("che tempo fa?"), "che+tempo+fa%3F");
-
-        const std::string ddg =
-            "<div class=\"result results_links results_links_deep result--ad \"><h2 class=\"result__title\">"
-            "<a rel=\"nofollow\" class=\"result__a\" href=\"https://duckduckgo.com/y.js?ad_domain=x.com&amp;ad_provider=b\">Pubblicita</a></h2>"
-            "<a class=\"result__snippet\" href=\"#\">Compra ora</a></div>"
-            "<div class=\"result results_links\"><h2 class=\"result__title\">"
-            "<a rel=\"nofollow\" class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fit.wikipedia.org%2Fwiki%2FRoma&amp;rut=abc\">Roma - <b>Wikipedia</b></a>"
-            "</h2><a class=\"result__snippet\" href=\"//duckduckgo.com/l/?uddg=x\">Roma &egrave; la <b>capitale</b> d'Italia.</a></div>"
-            "<div class=\"result\"><a rel=\"nofollow\" class=\"result__a\" href=\"https://www.comune.roma.it/\">Comune di Roma</a></div>";
-        auto r = Html::parseDuckDuckGo(ddg);
-        CHECK(r.size() == 2);
-        if (r.size() == 2) {
-            CHECK_STR(r[0].title, "Roma - Wikipedia");
-            CHECK_STR(r[0].url, "https://it.wikipedia.org/wiki/Roma");
-            CHECK_STR(r[0].snippet, "Roma \xC3\xA8 la capitale d'Italia.");
-            CHECK_STR(r[1].url, "https://www.comune.roma.it/");
-            CHECK_STR(r[1].snippet, "");
-        }
-
-        const std::string lite =
-            "<tr><td><a rel=\"nofollow\" href=\"https://www.ansa.it/notizia\" class='result-link'>Notizia ANSA</a></td></tr>"
-            "<tr><td class='result-snippet'>Il testo della <b>notizia</b>.</td></tr>"
-            "<tr><td><a rel=\"nofollow\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F\" class='result-link'>Esempio</a></td></tr>";
-        auto l = Html::parseDuckDuckGoLite(lite);
-        CHECK(l.size() == 2);
-        if (l.size() == 2) {
-            CHECK_STR(l[0].snippet, "Il testo della notizia.");
-            CHECK_STR(l[1].url, "https://example.org/");
-        }
-
-        const std::string bing =
-            "<ol id=\"b_results\"><li class=\"b_algo\" data-id iid=SERP.5355><div class=\"b_tpcn\"><a class=\"tilk\" href=\"https://www.bing.com/ck/a?!&amp;&amp;p=c8b0&amp;u=a1aHR0cHM6Ly93d3cuY2hpbWFnYXppbmUuaXQvbmV3cy8&amp;ntb=1\">"
-            "<cite>https://www.chimagazine.it</cite></a></div><h2><a target=\"_blank\" href=\"https://www.bing.com/ck/a?!&amp;&amp;p=c8b0&amp;"
-            "u=a1aHR0cHM6Ly93d3cuY2hpbWFnYXppbmUuaXQvbmV3cy8&amp;ntb=1\" h=\"ID=SERP,5145.2\">News - <strong>Chi</strong> Magazine</a></h2>"
-            "<div class=\"b_caption\"><p class=\"b_lineclamp2\"><span class=\"news_dt\">2 mar 2026</span>&nbsp;&#0183;&#32;Lui &#232; uno dei calciatori</p></div></li>"
-            "<li class=\"b_algo\"><h2><a href=\"https://example.com/diretto\">Diretto</a></h2></li></ol>";
-        auto b = Html::parseBing(bing);
-        CHECK(b.size() == 2);
-        if (b.size() == 2) {
-            CHECK_STR(b[0].url, "https://www.chimagazine.it/news/");
-            CHECK_STR(b[0].title, "News - Chi Magazine");
-            CHECK_STR(b[0].snippet, "2 mar 2026 \xC2\xB7 Lui \xC3\xA8 uno dei calciatori");
-            CHECK_STR(b[1].url, "https://example.com/diretto");
-        }
-
-        const std::string page =
-            "<html><head><title>Titolo &amp; pagina</title><style>.x{}</style></head><body>"
-            "<nav>Home Contatti Chi siamo Menu principale del sito</nav>"
-            "<script>var x = 'non leggere questo testo per niente';</script>"
-            "<article><h1>Il titolo dell'articolo è qui</h1><p>Questo è il primo paragrafo dell'articolo, abbastanza lungo da essere tenuto.</p>"
-            "<p>Questo è il secondo paragrafo, anche lui con parecchie parole dentro per sembrare vero.</p>"
-            "<p>" + std::string(400, 'a') + " fine.</p></article>"
-            "<footer>Copyright tutti i diritti riservati alla redazione</footer></body></html>";
-        CHECK_STR(Html::title(page), "Titolo & pagina");
-        std::string text = Html::toText(page, 3000);
-        CHECK(text.find("primo paragrafo") != std::string::npos);
-        CHECK(text.find("secondo paragrafo") != std::string::npos);
-        CHECK(text.find("non leggere") == std::string::npos);
-        CHECK(text.find("Copyright") == std::string::npos);
-        CHECK(text.find("Contatti") == std::string::npos);
-        CHECK(Html::toText(page, 60).size() < 80);
-
-        CHECK_STR(Html::charset("text/html; charset=ISO-8859-1", ""), "iso-8859-1");
-        CHECK_STR(Html::charset("text/html", "<meta charset=\"utf-8\">"), "utf-8");
-        CHECK_STR(Html::charset("", "<html>"), "");
-
-        const std::string rss =
-            "<rss><channel><title>Google News</title>"
-            "<item><title>Grande notizia di oggi - ANSA</title><link>https://news.google.com/a</link>"
-            "<pubDate>Fri, 31 Oct 2026 08:00:00 GMT</pubDate><source url=\"https://www.ansa.it\">ANSA</source></item>"
-            "<item><title><![CDATA[Altra notizia &amp; altro]]></title><pubDate>Fri, 31 Oct 2026 07:00:00 GMT</pubDate></item>"
-            "</channel></rss>";
-        auto items = Html::parseRss(rss);
-        CHECK(items.size() == 2);
-        if (items.size() == 2) {
-            CHECK_STR(items[0].title, "Grande notizia di oggi");
-            CHECK_STR(items[0].source, "ANSA");
-            CHECK_STR(items[1].title, "Altra notizia & altro");
-        }
-    }
-
     void testChatFormat() {
         std::printf("Formato della conversazione\n");
         using M = ChatFormat::Message;
@@ -373,6 +409,75 @@ namespace {
         CHECK(calls.size() == 1 && calls[0].argumentsJson.find("Steam") != std::string::npos);
         CHECK(ChatFormat::parseToolCalls("Ciao, come stai? Tutto bene.").empty());
         CHECK(ChatFormat::parseToolCalls("<tool_call>{rotto</tool_call>").empty());
+
+        // Dal registro vero: il 7B (soprattutto con le risposte brevi) scrive la richiesta come testo.
+        // Prima la voce la leggeva ("game_command graffa command...") e il comando non partiva.
+        const std::vector<std::string> names = { "remember", "game_command" };
+        calls = ChatFormat::parseToolCalls("game_command {\"command\": \"press:power\"} game_command {\"command\": \"press:engines\"} motori spenti",
+                                           &before, names);
+        CHECK(calls.size() == 2 && calls[0].name == "game_command" && calls[1].argumentsJson.find("press:engines") != std::string::npos);
+        CHECK_STR(before, "");
+        calls = ChatFormat::parseToolCalls("remember{\"fact\": \"il mio wingman si chiama Luca\"}", &before, names);
+        CHECK(calls.size() == 1 && calls[0].name == "remember" && calls[0].argumentsJson.find("Luca") != std::string::npos);
+        calls = ChatFormat::parseToolCalls("Ricevuto. game_command({'command': 'press:shields'})", &before, names);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("press:shields") != std::string::npos);
+        CHECK_STR(before, "Ricevuto. ");
+        calls = ChatFormat::parseToolCalls("open_website {\"url\": \"facebook.com\"}", &before, names); // strumento che non c'è: si riconosce lo stesso
+        CHECK(calls.size() == 1 && calls[0].name == "open_website");
+        calls = ChatFormat::parseToolCalls("{\"name\": \"game_command\", \"command\": \"press:vtol\"}", &before, names); // argomenti accanto al nome
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("press:vtol") != std::string::npos);
+        calls = ChatFormat::parseToolCalls("<tool_call>\n{\"name\": \"game_command\", \"arguments\": {\"command\": \"set_route\", \"destination\": \"Seraphim\"", &before, names);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("Seraphim") != std::string::npos); // troncata: si chiude
+        CHECK(ChatFormat::parseToolCalls("Ricorda di alzare gli scudi {prima} di partire.", &before, names).empty());
+        CHECK(ChatFormat::parseToolCalls("remember che domani si gioca.", &before, names).empty());
+        calls = ChatFormat::parseToolCalls("remember: fact=\"Il mio wingman si chiama Luca\"", &before, names); // altra forma vista nelle prove
+        CHECK(calls.size() == 1 && calls[0].name == "remember" && calls[0].argumentsJson.find("Luca") != std::string::npos);
+        calls = ChatFormat::parseToolCalls("game_command(command=\"press:shields\")", &before, names);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("press:shields") != std::string::npos);
+        CHECK(ChatFormat::toolCallStart("remember: fact=", names) == 0);
+        CHECK(ChatFormat::possibleToolCallTail("Ok. remember: fact", names) == 14);
+        CHECK(ChatFormat::plainToolCallComplete("game_command(command=\"press:shields\")", names));
+        // Con i nomi degli argomenti (toolSignature) anche gli argomenti in fila: game_command("set_route", "Crusader").
+        CHECK_STR(ChatFormat::toolSignature("{\"type\":\"function\",\"function\":{\"name\":\"game_command\",\"parameters\":{\"type\":\"object\","
+                                            "\"properties\":{\"command\":{},\"destination\":{}}}}}"),
+                  "game_command(command,destination)");
+        const std::vector<std::string> sigs = { "remember(fact)", "game_command(command,destination)" };
+        calls = ChatFormat::parseToolCalls("Ok, imposto. game_command(\"set_route\", \"Crusader\")", &before, sigs);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("\"destination\":\"Crusader\"") != std::string::npos &&
+              calls[0].argumentsJson.find("set_route") != std::string::npos);
+        calls = ChatFormat::parseToolCalls("game_command(\"press:shields\") game_command(\"press:engines\")", &before, sigs);
+        CHECK(calls.size() == 2);
+        CHECK(ChatFormat::parseToolCalls("game_command {\"command\": \"press:power\"}", &before, sigs).size() == 1);
+        CHECK(ChatFormat::mentionedTool("Ok, faccio. game_command[rotto", sigs) == 12);
+        // Solo gli argomenti ({"command": ...}) e una parola a caso prima ("ronics", visto davvero al posto di <tool_call>).
+        calls = ChatFormat::parseToolCalls("ronics\n{\"command\":\"press:shields\"} Scudi su.", &before, sigs);
+        CHECK(calls.size() == 1 && calls[0].name == "game_command");
+        calls = ChatFormat::parseToolCalls("ronics\n{\"name\": \"game_command\", \"arguments\": {\"command\": \"cancel_route\"}}", &before, sigs);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("cancel_route") != std::string::npos);
+        CHECK(ChatFormat::parseToolCalls("Il valore è {\"prezzo\": 3}", &before, sigs).empty());
+        // "Game_command: press:shields" (maiuscola in cima, valori nudi dopo i due punti), visto nelle prove.
+        calls = ChatFormat::parseToolCalls("Game_command: press:shields\ngame_command: set_route Port Tressler", &before, sigs);
+        CHECK(calls.size() == 2 && calls[0].name == "game_command" && calls[0].argumentsJson.find("press:shields") != std::string::npos &&
+              calls[1].argumentsJson.find("\"destination\":\"Port Tressler\"") != std::string::npos);
+        calls = ChatFormat::parseToolCalls("Remember: il mio wingman si chiama Luca", &before, sigs);
+        CHECK(calls.size() == 1 && calls[0].argumentsJson.find("il mio wingman si chiama Luca") != std::string::npos);
+        CHECK(ChatFormat::mentionedTool("Game_command press:shields press:engines", sigs) == 0);
+        CHECK(ChatFormat::parseToolCalls("Rotta: impostata per Crusader.", &before, sigs).empty());
+        CHECK(ChatFormat::mentionedTool("Rotta impostata.", sigs) == std::string::npos);
+        // Dove comincia, per non dirla a voce; e cosa tenere da parte mentre arriva a pezzi.
+        CHECK(ChatFormat::toolCallStart("Fatto. game_command {\"command\"", names) == 7);
+        CHECK(ChatFormat::toolCallStart("Scudi su.", names) == std::string::npos);
+        CHECK(ChatFormat::possibleToolCallTail("Ok. game_comm", names) == 9);
+        CHECK(ChatFormat::possibleToolCallTail("Ok. remember ", names) == 9);
+        CHECK(ChatFormat::possibleToolCallTail("Ok. <tool_c", names) == 7);
+        CHECK(ChatFormat::possibleToolCallTail("Scudi su.", names) == 0);
+        CHECK(ChatFormat::possibleToolCallTail("Motori ", names) == 0);
+        CHECK(ChatFormat::plainToolCallComplete("game_command {\"command\": \"press:power\"}", names));
+        CHECK(!ChatFormat::plainToolCallComplete("game_command {\"command\": \"press:po", names));
+        // Nella conversazione resta sempre la forma giusta.
+        CHECK_STR(ChatFormat::formatToolCall({ "game_command", "{\"command\":\"press:power\"}" }),
+                  "<tool_call>\n{\"name\": \"game_command\", \"arguments\": {\"command\":\"press:power\"}}\n</tool_call>");
+        CHECK_STR(ChatFormat::toolName("{\"type\":\"function\",\"function\":{\"name\":\"remember\"}}"), "remember");
         CHECK_STR(ChatFormat::cleanAnswer("Ciao!<|im_end|>"), "Ciao!");
         CHECK_STR(ChatFormat::cleanAnswer("<think>\nhmm\n</think>\n\nRisposta."), "Risposta.");
         CHECK_STR(ChatFormat::cleanAnswer("Ok. <tool_call>{\"name\""), "Ok.");
@@ -461,6 +566,290 @@ namespace {
             CHECK(r.ok && r.shown.find("(O)") != std::string::npos);
             CHECK(game.toolDefinition().find("press:landing_gear") != std::string::npos);
             CHECK(game.recentActions().size() >= 4);
+            r = game.execute(game.match("annulla la rotta"), sayFn, nullptr);
+            CHECK(r.ok);
+            CHECK_STR(r.brief, "Annullo di prova.");
+            CHECK(game.profile().defaultsVersion == GameProfile::kDefaultsVersion);
+        }
+    }
+
+    GameCommand testCommand(const std::string& intent, std::vector<std::string> phrases, const std::string& key) {
+        GameCommand c;
+        c.intent = intent;
+        c.phrases = std::move(phrases);
+        if (!key.empty()) c.args["key"] = key;
+        return c;
+    }
+
+    void testGameMatching() {
+        section("comandi: i contrari non si confondono");
+        const GameProfile p = GameProfile::defaults();
+        CHECK(Cmd::polarity("disattiva gli scudi") == -1 && Cmd::polarity("alza gli scudi") == 1 && Cmd::polarity("scudi") == 0);
+        auto m = Cmd::match(p, "Disattiva gli scudi.");
+        CHECK(m.found && m.command.id() == "press:shields" && m.phrase != "alza gli scudi");
+        // Un profilo di prima, senza le frasi nuove: "disattiva" trova "abbassa" (stesso verso), mai "alza".
+        GameProfile older = p;
+        for (auto& c : older.commands) {
+            if (c.id() == "press:shields") c.phrases = { "scudi", "alza gli scudi", "abbassa gli scudi" };
+        }
+        m = Cmd::match(older, "disattiva gli scudi");
+        CHECK(m.found && m.command.id() == "press:shields" && m.phrase != "alza gli scudi");
+        // Solo la frase contraria: niente comando (prima era "alza gli scudi" al 63%, a un passo dalla soglia).
+        GameProfile only;
+        only.keys = p.keys;
+        only.commands = { testCommand("press", { "alza gli scudi" }, "shields") };
+        CHECK(!Cmd::match(only, "disattiva gli scudi").found);
+        CHECK(!Cmd::match(only, "abbassa gli scudi").found);
+        // Comandi tuoi con tasti diversi per aprire e chiudere: mai uno al posto dell'altro.
+        GameProfile doors = p;
+        doors.keys["doors_open"] = "LAlt+O";
+        doors.keys["doors_close"] = "LAlt+P";
+        doors.commands.push_back(testCommand("press", { "apri le porte" }, "doors_open"));
+        doors.commands.push_back(testCommand("press", { "chiudi le porte" }, "doors_close"));
+        m = Cmd::match(doors, "chiudi le porte");
+        CHECK(m.found && m.command.id() == "press:doors_close");
+        m = Cmd::match(doors, "chiudi la porta");
+        CHECK(!(m.found && m.command.id() == "press:doors_open"));
+        m = Cmd::match(doors, "apri le porte");
+        CHECK(m.found && m.command.id() == "press:doors_open");
+        m = Cmd::match(p, "chiudi la mappa");
+        CHECK(m.found && m.command.intent == "close_map");
+        m = Cmd::match(p, "spegni la nave");
+        CHECK(m.found && m.phrase == "spegni la nave");
+        // Spegnere il quantum non è mai un salto quantico (non è un interruttore).
+        m = Cmd::match(p, "spegni il quantum");
+        CHECK(!(m.found && m.command.intent == "quantum_travel"));
+
+        section("comandi: come li storpia whisper");
+        for (const char* said : { "Mi posso una rotta per Seraphim?", "Un po' sono rotta per Seraphim.", "posta una rotta per Seraphim",
+                                  "Imposta una rotta per Seraphim." }) {
+            m = Cmd::match(p, said);
+            CHECK(m.found && m.command.intent == "set_route");
+            CHECK_STR(m.slots["destination"], "Stazione Orbitale Seraphim");
+        }
+        m = Cmd::match(p, "Imposto una rotta per Microtech.");
+        CHECK(m.found && m.slots["destination"] == "microTech");
+        // "annulla" prima di "rotta per": non è mai un'impostazione della rotta.
+        m = Cmd::match(p, "annulla la rotta per Crusader");
+        CHECK(!(m.found && m.command.intent == "set_route"));
+        m = Cmd::match(p, "Spegni le cose, come si chiamano? Spegni i motori.");
+        CHECK(m.found && m.command.id() == "press:engines");
+        m = Cmd::match(p, "Apri l'hangar.");
+        CHECK(m.found && m.command.id() == "press:request_landing");
+        m = Cmd::match(p, "Chiamala TC.");
+        CHECK(m.found && m.command.id() == "press:request_landing");
+        m = Cmd::match(p, "Alzati dal posto di guida.");
+        CHECK(m.found && m.command.id() == "hold:exit_seat");
+        m = Cmd::match(p, "Disattiva la modalità Capoled.");
+        CHECK(m.found && m.command.id() == "press:decoupled");
+        CHECK(!Cmd::match(p, "Qual è il tempo domani a Bagnarola?").found);
+        CHECK(!Cmd::match(p, "Nessuna.").found);
+
+        section("luoghi: i numeri contano");
+        m = Cmd::match(p, "Imposta la rotta per Cru L2.");
+        // Prima finiva su Cru-L1: rotta sbagliata. Né su Arc-L2 (nome corto, due lettere diverse).
+        CHECK(m.found && m.slots["destination"] != "Cru-L1" && m.slots["destination"] != "Arc-L2");
+        m = Cmd::match(p, "rotta per cru l4");
+        CHECK_STR(m.slots["destination"], "Cru-L4");
+        m = Cmd::match(p, "Imposta una rotta per Cruel 1.");
+        CHECK_STR(m.slots["destination"], "Cru-L1");
+        m = Cmd::match(p, "rotta per hurston l2");
+        CHECK_STR(m.slots["destination"], "Hur-L2");
+        m = Cmd::match(p, "rotta per arc l uno");
+        CHECK_STR(m.slots["destination"], "Arc-L1");
+        m = Cmd::match(p, "rotta per area diciotto");
+        CHECK_STR(m.slots["destination"], "Area18");
+
+        section("testo letto dall'OCR della mappa");
+        CHECK(Cmd::bestText({ "CRU-LI" }, "Cru-L1", 0.68) == 0);
+        CHECK(Cmd::bestText({ "ANNULIA" }, "ANNULLA", 0.75) == 0);
+        CHECK(Cmd::bestText({ "STAZONE ORBITALE SERAPHIM" }, "Stazione Orbitale Seraphim", 0.68) == 0);
+        CHECK(Cmd::ocrContains("ORISONORISON", "Orison") >= 0.99);
+        CHECK(Cmd::ocrContains("CRU-L1 STAZIONE AMBITIOUS", "Cru-L1") >= 0.7);
+        CHECK(Cmd::ocrContains("DNORISONI", "Orison") >= 0.7);
+        CHECK(Cmd::ocrContains("Li STAZIONE AMBITIOUS", "Cru-L1") < 0.7); // lì decide il campo cambiato, non l'OCR
+        CHECK(Cmd::ocrContains("q CERCA LOCALITÅ...", "CERCA LOCALITA") >= 0.75);
+        CHECK(Cmd::ocrContains("", "Orison") == 0.0);
+        CHECK_STR(Cmd::ocrFold("CRU-L1"), Cmd::ocrFold("cru li"));
+    }
+
+    void testProfileByHand() {
+        section("profilo scritto a mano");
+        std::string err;
+        GameProfile h;
+        // Commenti di tre tipi, virgole in più, una virgola dimenticata a fine riga, virgolette “tipografiche”.
+        const std::string hand =
+            "// il mio profilo\n{\n  \"name\": \"Star Citizen\"\n  # commento\n  \"dryRun\": true, /* prova */\n"
+            "  \"keys\": { \"landing_gear\": \xE2\x80\x9CLAlt+N\xE2\x80\x9D, },\n}\n";
+        CHECK(GameProfile::parse(hand, h, err));
+        CHECK(h.dryRun && h.keys["landing_gear"] == "LAlt+N" && h.name == "Star Citizen");
+        CHECK(h.defaultsVersion == 0); // scritto senza il numero: riceverà i predefiniti nuovi
+        // L'errore dice dove: riga e colonna del file com'è scritto (i commenti contano).
+        CHECK(!GameProfile::parse("// commento\n{\n  \"name\": \"x\",\n  \"dryRun\": tru\n}\n", h, err));
+        CHECK(err.find("riga 4") != std::string::npos);
+        std::printf("  errore: %s\n", err.c_str());
+        CHECK(!GameProfile::parse("{\n  \"name\" \"x\"\n}", h, err));
+        CHECK(err.find("riga 2") != std::string::npos);
+        CHECK(!GameProfile::parse("{\n  \"keys\": {\"map\": \"F2\"\n", h, err));
+        CHECK(err.find("finisce prima del tempo") != std::string::npos);
+        CHECK(!GameProfile::parse("{ rotto", h, err));
+        CHECK(err.find("riga 1") != std::string::npos);
+        // Le posizioni del testo ripulito restano quelle del file (per riga e colonna).
+        std::vector<size_t> where;
+        const std::string relaxed = relaxedJson("{ \"a\": 1, // x\n \"b\": [1,2,], }", &where);
+        CHECK(relaxed.size() == where.size());
+        CHECK(nlohmann::json::parse(relaxed, nullptr, false).is_object());
+
+        section("predefiniti nuovi nei profili di prima");
+        GameProfile old = GameProfile::defaults();
+        old.defaultsVersion = 0;
+        old.keys.erase("mining_mode");
+        old.keys["decoupled"] = "C"; // il tuo tasto resta il tuo
+        old.aliases["destination"].erase("Cru-L4");
+        old.commands.erase(std::remove_if(old.commands.begin(), old.commands.end(), [](const GameCommand& c) { return c.id() == "press:mobiglas"; }),
+                           old.commands.end());
+        for (auto& c : old.commands) {
+            if (c.id() == "press:request_landing") c.phrases = { "richiedi atterraggio", "chiama la torre" };
+        }
+        // Una frase nuova di Iris già usata da un tuo comando: resta tua.
+        old.keys["hangar_door"] = "LAlt+H";
+        old.commands.push_back(testCommand("press", { "apri l'hangar" }, "hangar_door"));
+        const int added = old.addMissingDefaults();
+        std::printf("  aggiunte %d cose al profilo di prima\n", added);
+        CHECK(added >= 5);
+        CHECK(old.defaultsVersion == GameProfile::kDefaultsVersion);
+        CHECK(old.keys["decoupled"] == "C" && old.keys["mining_mode"] == "M");
+        CHECK(old.aliases["destination"].count("Cru-L4") == 1);
+        auto m = Cmd::match(old, "apri il mobiglas");
+        CHECK(m.found && m.command.id() == "press:mobiglas");
+        m = Cmd::match(old, "chiedi il decollo");
+        CHECK(m.found && m.command.id() == "press:request_landing");
+        m = Cmd::match(old, "apri l'hangar");
+        CHECK(m.found && m.command.id() == "press:hangar_door");
+        CHECK(old.addMissingDefaults() == 0); // la seconda volta niente
+        GameProfile back;
+        CHECK(GameProfile::parse(GameProfile::defaults().toJson(), back, err) && back.defaultsVersion == GameProfile::kDefaultsVersion);
+        CHECK(GameProfile::parse("{}", back, err) && back.defaultsVersion == 0);
+
+        section("tasti finti e finestra del gioco");
+        Sleep(200);
+        CHECK(!GameInput::injectingInput());
+        {
+            GameInput::InjectionScope scope;
+            CHECK(GameInput::injectingInput());
+        }
+        CHECK(GameInput::injectingInput()); // ancora un attimo dopo: il thread dei tasti legge ogni 8 ms
+        Sleep(200);
+        CHECK(!GameInput::injectingInput());
+        // Esplora risorse ha finestre di servizio 0x0 prima di quelle vere: si prende la più grande.
+        if (HWND w = GameInput::findGameWindow("explorer", "")) {
+            RECT r{};
+            CHECK(GameInput::clientRect(w, r));
+        }
+    }
+
+    // La casella di ricerca della mappa stellare come nelle catture vere (551x51 su 3440x1440):
+    // bordi scuri, vetro sfumato (chiaro 185->215 o scuro), la lente e il testo bianco (240).
+    ScreenCapture::Image renderSearchBox(const wchar_t* text, bool brightGlass, bool caret) {
+        const int w = 551, h = 51;
+        HDC screen = GetDC(nullptr);
+        HDC dc = CreateCompatibleDC(screen);
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HGDIOBJ oldBmp = SelectObject(dc, bmp);
+        for (int x = 0; x < w; ++x) {
+            int lum = 22;
+            if (x >= 40 && x < 520) lum = brightGlass ? 185 + 30 * (x - 40) / 480 : 45 + 10 * (x - 40) / 480;
+            RECT col{ x, 0, x + 1, h };
+            HBRUSH b = CreateSolidBrush(RGB(std::max(0, lum - 8), lum, std::min(255, lum + 8)));
+            FillRect(dc, &col, b);
+            DeleteObject(b);
+        }
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(205, 210, 215));
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, 72, 12, 92, 32);
+        MoveToEx(dc, 90, 30, nullptr);
+        LineTo(dc, 97, 37);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
+        HFONT font = CreateFontW(-22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(238, 242, 248));
+        SIZE size{};
+        GetTextExtentPoint32W(dc, text, (int)wcslen(text), &size);
+        TextOutW(dc, 115, (h - size.cy) / 2, text, (int)wcslen(text));
+        if (caret) {
+            RECT c{ 115 + size.cx + 2, 12, 115 + size.cx + 4, 39 };
+            HBRUSH white = CreateSolidBrush(RGB(240, 244, 250));
+            FillRect(dc, &c, white);
+            DeleteObject(white);
+        }
+        GdiFlush();
+        ScreenCapture::Image img;
+        img.width = w;
+        img.height = h;
+        img.pixels.assign((uint8_t*)bits, (uint8_t*)bits + (size_t)w * h * 4);
+        for (size_t i = 3; i < img.pixels.size(); i += 4) img.pixels[i] = 255;
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        SelectObject(dc, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(nullptr, screen);
+        return img;
+    }
+
+    void testMapOcr() {
+        section("mappa stellare: il nome è entrato nel campo?");
+        for (bool bright : { true, false }) {
+            const ScreenOcr::Shot empty = ScreenOcr::grayOf(renderSearchBox(L"", bright, false));
+            const double name = ScreenOcr::textChange(empty, ScreenOcr::grayOf(renderSearchBox(L"ORISON", bright, false)));
+            const double two = ScreenOcr::textChange(empty, ScreenOcr::grayOf(renderSearchBox(L"U.A.", bright, false)));
+            const double caret = ScreenOcr::textChange(empty, ScreenOcr::grayOf(renderSearchBox(L"", bright, true)));
+            std::printf("  vetro %s: nome %.2f%%, due lettere %.2f%%, cursore %.2f%%\n", bright ? "chiaro" : "scuro", name * 100, two * 100, caret * 100);
+            CHECK(name >= 0.0025); // il nome scritto si vede anche se l'OCR non lo legge
+            CHECK(two >= 0.0025);  // anche "U.A." (l'OCR non lo legge mai)
+            CHECK(caret < 0.0025); // il cursore che lampeggia no
+            CHECK(ScreenOcr::textChange(empty, empty) == 0.0);
+            // Il vetro un po' più chiaro (la mappa che si muove dietro): non è testo.
+            ScreenCapture::Image shifted = renderSearchBox(L"", bright, false);
+            for (size_t i = 0; i < shifted.pixels.size(); ++i) {
+                if (i % 4 != 3) shifted.pixels[i] = (uint8_t)std::min(255, shifted.pixels[i] + 6);
+            }
+            CHECK(ScreenOcr::textChange(empty, ScreenOcr::grayOf(shifted)) < 0.0025);
+        }
+        CHECK(ScreenOcr::textChange(ScreenOcr::Shot{}, ScreenOcr::grayOf(renderSearchBox(L"", true, false))) == 1.0);
+
+        if (OcrEngineWrapper::installedLanguages().empty()) {
+            std::printf("  (OCR di Windows non installato: lettura saltata)\n");
+            return;
+        }
+        OcrSettings o;
+        o.language = "en";
+        o.upscale = 2;
+        o.saveDebugShots = false;
+        const RECT region{ 0, 0, 551, 51 };
+        for (bool bright : { true, false }) {
+            for (const wchar_t* text : { L"ORISON", L"CRU-L1", L"SERAPHIM", L"LORVILLE" }) {
+                const std::string want = TextUtils::wideToUtf8(text);
+                const ScreenOcr::Result res = ScreenOcr::readImage(renderSearchBox(text, bright, false), region, o, "", [&](const ScreenOcr::Result& x) {
+                    return Cmd::ocrContains(ScreenOcr::linesText(x), want) >= 0.7;
+                });
+                const std::string seen = TextUtils::collapseSpaces(ScreenOcr::linesText(res));
+                std::printf("  %s su vetro %s -> \"%s\" (%s)\n", want.c_str(), bright ? "chiaro" : "scuro", seen.c_str(), res.variant.c_str());
+                CHECK(Cmd::ocrContains(seen, want) >= 0.7);
+            }
         }
     }
 
@@ -691,6 +1080,41 @@ namespace {
         return out;
     }
 
+    void testChatChannels() {
+        section("chat letta: canali storpiati, righe fuse, messaggi corti");
+        // Letture vere del registro.
+        for (const char* tag : { "GLCBALE", "CLOBALE", "BALE", "'BALE", "BALE'", "tGLOBA", "CGI-OBALE", "tel-OBALEJ", "tGLCBALEJx", "GLOD3.LE",
+                                 "CLOCALE", "GLOBALE" }) {
+            CHECK_STR(ChatParser::canonicalChannel(tag), "GLOBALE");
+        }
+        CHECK_STR(ChatParser::canonicalChannel("LSE"), "LSE");
+        CHECK_STR(ChatParser::canonicalChannel("PARTY"), "PARTY");
+        for (const char* tag : { "GLOBEX", "SDR", "TEAM", "ANZ", "SQUADRA", "TUTTO" }) CHECK(ChatParser::canonicalChannel(tag).empty());
+
+        auto msgs = ChatParser::parse({ "[GLCBALE] Cybercomet: geme absolutely ready for IAE free fly event", "[BALE] BloodHeaven: Got nothing in",
+                                        "[tGLOBA][E] DarkstaR1st: MKS Connie is amazing" });
+        CHECK(msgs.size() == 3);
+        if (msgs.size() == 3) {
+            CHECK_STR(msgs[0].displayPrefix(), "[GLOBALE] Cybercomet: ");
+            CHECK_STR(msgs[1].displayPrefix(), "[GLOBALE] BloodHeaven: ");
+            CHECK_STR(msgs[2].displayPrefix(), "[GLOBALE] DarkstaR1st: ");
+        }
+        // Il filtro dell'utente su un'organizzazione resta com'era.
+        msgs = ChatParser::parse({ "[GLOBALE][LSE] Pilota: ci vediamo a Lorville" });
+        CHECK(msgs.size() == 1 && ChatParser::matchesFilter(msgs[0], "LSE"));
+        // Due righe fuse con il canale della seconda letto male in mezzo: il messaggio finisce lì.
+        msgs = ChatParser::parse({ "[BALE] xCJ-6x: rone in need of an extra seto ands? IBALEJ BloodHeavenCResend me te S y han" });
+        CHECK(msgs.size() == 1 && msgs[0].body == "rone in need of an extra seto ands?");
+        msgs = ChatParser::parse({ "[GLOBALE] Foo: is GLOBAL chat down for everyone?" });
+        CHECK(msgs.size() == 1 && msgs[0].body == "is GLOBAL chat down for everyone?");
+        CHECK(ChatParser::tooShortToTranslate("o7") && ChatParser::tooShortToTranslate("W") && ChatParser::tooShortToTranslate("?"));
+        CHECK(ChatParser::tooShortToTranslate("101") && !ChatParser::tooShortToTranslate("lol") && !ChatParser::tooShortToTranslate("thx m8"));
+        // La stessa riga riletta male mezzo minuto dopo somiglia abbastanza da non tradurla di nuovo.
+        const std::string good = TextUtils::normalizeForMatch("I was stuck in server error. could you give lead to bayhlen and have him invite?");
+        const std::string bad = TextUtils::normalizeForMatch("—-1 wasstuck In servererror:tould you give lead to ay en and have him invite?");
+        CHECK(ScreenMatch::likeness(good, bad) >= 0.75);
+    }
+
     void testScreenMatch() {
         section("stesso messaggio in due letture");
         auto key = [](const char* t) { return TextUtils::normalizeForMatch(t); };
@@ -899,6 +1323,12 @@ namespace {
         CHECK_STR(Assistant::chatCommandText("scrivi in chat: arrivo tra due minuti"), "arrivo tra due minuti");
         CHECK_STR(Assistant::chatCommandText("Scrivi in chat che sto arrivando"), "sto arrivando");
         CHECK_STR(Assistant::chatCommandText("manda in chat \"grazie a tutti\""), "grazie a tutti");
+        // "Ricordati che...": in memoria senza modello (il 7B a volte leggeva lo strumento a voce invece di usarlo).
+        CHECK_STR(Assistant::memoryCommandText("Ricordati che il mio wingman si chiama Luca."), "il mio wingman si chiama Luca");
+        CHECK_STR(Assistant::memoryCommandText("ricorda: la base è a Lorville"), "la base è a Lorville");
+        CHECK_STR(Assistant::memoryCommandText("Ricordati di alzare il carrello"), "");
+        CHECK_STR(Assistant::memoryCommandText("ricordati che"), "");
+        CHECK_STR(Assistant::memoryCommandText("ricordami la rotta"), "");
         CHECK_STR(Assistant::chatCommandText("di' in chat, ciao ragazzi"), "ciao ragazzi");
         CHECK_STR(Assistant::chatCommandText("che tempo fa a Roma?"), "");
         CHECK_STR(Assistant::chatCommandText("scrivi in chat"), "");
@@ -1183,6 +1613,36 @@ namespace {
         CHECK_STR(Mining::summary(Mining::decodeValue(8540, mats)), "8.540 = Iron (Ferro) × 2");
         CHECK_STR(Mining::summary(Mining::decodeValue(4240, mats)), "4.240 = Copper (Rame) × 1");
 
+        section("letture vere dell'HUD (dal log di Iris)");
+        // La distanza incollata dietro la signature, e "S" al posto del 6: si cambia solo dove c'era una lettera.
+        d = Mining::decodeText("SCONOSCII 0 11,5SS9.OkM", mats); // prima: "5.559: sconosciuta"
+        CHECK(d.value == 11565 && d.corrected && d.matches.size() == 1 && hasMatch(d, "Titanium", 3));
+        d = Mining::decodeText("11,5SS", mats); // con ogni cifra libera sarebbe anche Agricium × 3 (11.655)
+        CHECK(d.value == 11565 && d.corrected && d.matches.size() == 1);
+        // La distanza dell'HUD non è una signature (prima: "19.500 = Torite × 5 (probabile)").
+        CHECK(Mining::decodeText("SCONOSCIUTO 19.5kM", mats).matches.empty());
+        CHECK(Mining::decodeText("Q 17,200 scoNosc 30.4kP", mats).value == 17200);
+        // Numeri dell'HUD più piccoli di ogni firma base, e tacche unite: niente "340: sconosciuta".
+        for (const char* t : { "280 300 320 340 sot", "A.B. 100%", "L88Y", "240", "1622 5.0M IIS", "PRONTO 24\xC3\xB8 260 3\xC3\xB8\xC3\xB8 269" }) {
+            CHECK(!Mining::decodeText(t, mats).hasValue);
+        }
+        // Lo zero col taglio del carattere dell'HUD ("ø"): uno zero vero, la lettura è certa.
+        d = Mining::decodeText("16.96\xC3\xB8", mats);
+        CHECK(d.value == 16960 && !d.corrected && hasMatch(d, "Copper", 4));
+        // Una lettera che potrebbe essere due cifre in tabella: "1S,850" = Quantanium × 5 o Ouratite × 5 (16.850).
+        d = Mining::decodeText("1S,850", mats);
+        CHECK(d.value == 15850 && d.corrected && d.note.find("16.850") != std::string::npos);
+        // Solo un numero letto pulito, nella forma del badge, è una "sconosciuta" da annotare.
+        d = Mining::decodeText("32,300", mats);
+        CHECK(d.hasValue && d.matches.empty() && d.wellFormed);
+        CHECK(!Mining::decodeText("021565", mats).wellFormed);
+        CHECK(!Mining::decodeText("2 700", mats).wellFormed);
+        CHECK(Mining::decodeValue(32300, mats).wellFormed);
+        CHECK(Mining::decodeText("2 16,960", mats).wellFormed);
+        // Un nome con la virgola si salva e si rilegge uguale.
+        const auto commaTable = Mining::parseTable(Mining::formatTable({ { "Rame, puro", 4240, "minerale" } }));
+        CHECK(commaTable.size() == 1 && commaTable[0].name == "Rame, puro" && commaTable[0].base == 4240);
+
         section("numeri a voce e comandi");
         CHECK_EQ(Mining::parseItalianNumber("sedicimila novecentosessanta"), 16960LL);
         CHECK_EQ(Mining::parseItalianNumber("settemilaottanta"), 7080LL);
@@ -1452,8 +1912,48 @@ namespace {
             CHECK(out != voice);
             const std::vector<float> t = fx.tail();
             CHECK(!t.empty() && std::fabs(t.back()) < 1e-3f); // la coda sfuma
+            // Dopo la coda si riparte dal silenzio: niente eco rimasta che salta fuori (clic).
+            std::vector<float> after(400, 0.0f);
+            fx.process(after.data(), after.size());
+            float leftover = 0;
+            for (float x : after) leftover = std::max(leftover, std::fabs(x));
+            CHECK(leftover < 1e-6f);
             std::printf("  %-9s volume %.2f del originale, picco %.2f\n", id, wetRms / dryRms, peak);
         }
+
+        // Le misure della voce (per --voce-coerenza) e i file di riferimento della voce neurale.
+        std::vector<float> tone(sr * 6, 0.0f);
+        for (size_t i = sr; i < (size_t)sr * 5; ++i) {
+            const double t = (double)i / sr;
+            tone[i] = (float)(0.3 * std::sin(2 * 3.14159265 * 200 * t) + 0.1 * std::sin(2 * 3.14159265 * 400 * t));
+        }
+        const double f0 = VoiceMeasure::median(VoiceMeasure::pitch(tone.data(), tone.size(), sr));
+        CHECK(f0 > 197 && f0 < 203);
+        CHECK(std::fabs(VoiceMeasure::cosine({ 1, 2, 3 }, { 2, 4, 6 }) - 1.0) < 1e-9 && std::fabs(VoiceMeasure::cosine({ 1, 0 }, { 0, 1 })) < 1e-9);
+        CHECK(VoiceMeasure::resample(tone.data(), 24000, 24000, 16000).size() == 16000);
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        const std::wstring wav = std::wstring(tmp) + L"iris_voce_prova.wav";
+        CHECK(NeuralVoice::writeWav(wav, tone, sr));
+        std::vector<float> back;
+        int rate = 0;
+        std::string error;
+        CHECK(NeuralVoice::readWav(wav, back, rate, &error) && rate == sr && back.size() == tone.size());
+        CHECK(std::fabs(back[sr * 2] - tone[sr * 2]) < 1e-4f);
+        CHECK(NeuralVoice::cleanReference(back, rate, &error));
+        CHECK(back.size() > (size_t)sr * 4 && back.size() < (size_t)sr * 4.5); // via il silenzio ai lati
+        std::vector<float> shortOne(tone.begin() + sr, tone.begin() + sr * 2);
+        CHECK(!NeuralVoice::cleanReference(shortOne, sr, &error) && error.find("corto") != std::string::npos);
+        CHECK(!NeuralVoice::readWav(std::wstring(tmp) + L"non_esiste_proprio.wav", back, rate, &error));
+        DeleteFileW(wav.c_str());
+        CHECK(NeuralVoice::isPreset(NeuralVoice::presets().front().id) && !NeuralVoice::isPreset("boh"));
+        AppSettings vs = AppSettings::parse("neuralVoice=boh\n");
+        vs.sanitize();
+        CHECK(vs.neuralVoice == NeuralVoice::presets().front().id);
+        vs = AppSettings::parse("neuralVoice=file\nneuralVoiceFile=C:\\voce.wav\n");
+        vs.sanitize();
+        AppSettings vb = AppSettings::parse(vs.serialize());
+        CHECK(vb.neuralVoice == "file" && vb.neuralVoiceFile == "C:\\voce.wav");
     }
 
     void testUpdater() {
@@ -1890,6 +2390,53 @@ static void testGameLog() {
     CHECK_EQ(st.completed, 1);
     CHECK_EQ(st.accepted, 2);
 
+    // I contratti ricordati: quelli di più di 3 giorni si dimenticano, quelli senza data contano da adesso.
+    {
+        const std::wstring missions = AppPaths::getAppDataDir() + L"\\missioni.json";
+        const long long now = (long long)time(nullptr);
+        {
+            std::ofstream f(missions, std::ios::binary | std::ios::trunc);
+            f << "[{\"id\":\"a\",\"name\":\"Vecchio\",\"since\":" << (now - 4 * 86400) << "},{\"id\":\"b\",\"name\":\"Senza data\",\"since\":0}]";
+        }
+        GameLog::Watcher w;
+        w.start(L"C:\\nessuna-cartella-iris\\Game.log", nullptr, nullptr);
+        const GameLog::State remembered = w.state();
+        w.stop();
+        CHECK(remembered.contracts.size() == 1 && remembered.contracts[0].name == "Senza data" && remembered.contracts[0].since >= now);
+        DeleteFileW(missions.c_str());
+    }
+
+    // Un Game.log grande (una sessione lunga): la rilettura iniziale è veloce e non perde righe.
+    {
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        const std::wstring path = std::wstring(tmp) + L"IrisTests\\GameGrande.log";
+        const int kLines = 60000;
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f << login << "\r\n";
+            for (int n = 0; n < kLines; ++n) {
+                f << "<2026-11-01T09:" << std::setw(2) << std::setfill('0') << (n / 1000) % 60 << ":00.000Z> [Notice] <CEntityComponentPhysics> "
+                  << "qualcosa di lungo che il gioco scrive di continuo, riga " << n << " [Team_Physics][Entity]\r\n";
+                if (n % 10000 == 0) f << jurisdiction << "\r\n";
+            }
+            f << accepted << "\r\n";
+        }
+        GameLog::Watcher w;
+        std::atomic<int> events{ 0 };
+        const auto t0 = std::chrono::steady_clock::now();
+        w.start(path, [&](const GameLog::Event&, bool) { events++; }, nullptr);
+        for (int t = 0; t < 400 && (w.status().catchingUp || !w.status().found); ++t) Sleep(25);
+        const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  Game.log di %d righe riletto in %lld ms\n", w.status().lines, ms);
+        CHECK(!w.status().catchingUp && w.status().lines >= kLines);
+        CHECK_EQ(events.load(), 2 + kLines / 10000); // login, contratto, giurisdizioni
+        CHECK(ms < 8000);
+        w.stop();
+        DeleteFileW(path.c_str());
+        DeleteFileW((AppPaths::getAppDataDir() + L"\\missioni.json").c_str());
+    }
+
     // Il file vero: un Game.log finto, letto dal thread come farebbe con quello del gioco.
     {
         wchar_t tmp[MAX_PATH];
@@ -1938,6 +2485,34 @@ static void testGameLog() {
     CHECK_STR(Refinery::formatRemaining(0), "pronto");
     CHECK_STR(Refinery::spokenDuration(12000), "3 ore e 20 minuti");
     CHECK_STR(Refinery::spokenDuration(3600), "un'ora");
+    // Detti e scritti come vengono: apostrofo tipografico, quarti, numeri composti, unità intere.
+    CHECK_EQ(dur("mezz\xE2\x80\x99ora"), 1800LL);      // prima valeva un'ora
+    CHECK_EQ(dur("un\xE2\x80\x99ora e mezza"), 5400LL);
+    CHECK_EQ(dur("un'ora e un quarto"), 4500LL);
+    CHECK_EQ(dur("tre quarti d'ora"), 2700LL);
+    CHECK_EQ(dur("un'ora e ventidue"), 4920LL);
+    CHECK_EQ(dur("45 minuti"), 2700LL);
+    CHECK_EQ(dur("1 ora e 20 di raffinazione"), 4800LL); // "di" non sono giorni
+    CHECK_EQ(dur("sette ore"), 25200LL);
+    // Niente eccezioni né numeri assurdi (prima "3: " e "99999999999999999999" facevano cadere Iris).
+    CHECK_EQ(dur("3: "), 10800LL);
+    CHECK_EQ(dur("99999999999999999999"), -1LL);
+    CHECK_EQ(dur("99999999999999999999 ore"), -1LL);
+    CHECK_EQ(dur("0"), -1LL);
+    CHECK_EQ(dur("::"), -1LL);
+    CHECK_STR(Refinery::spokenDuration(3585), "un'ora"); // prima: "meno di un minuto"
+    CHECK_STR(Refinery::spokenDuration(14390), "4 ore"); // prima: "3 ore"
+    CHECK_STR(Refinery::spokenDuration(20), "meno di un minuto");
+    {
+        // Finito con il PC sospeso (Iris già partita): si annuncia a voce al risveglio, non è "di prima dell'avvio".
+        Refinery::Timers awake;
+        awake.load();
+        const long long realNow = (long long)time(nullptr);
+        const std::string id = awake.add("Sospeso", "", 60, realNow);
+        const auto finished = awake.takeFinished(realNow + 3 * 3600);
+        CHECK(finished.size() == 1 && !finished[0].beforeStart);
+        awake.remove(id);
+    }
     {
         Refinery::Timers timers;
         timers.load();
@@ -2257,6 +2832,17 @@ static void testMiningLog() {
     const std::string csv = MiningLog::toCsv(list, c);
     CHECK(TextUtils::startsWith(csv, "\xEF\xBB\xBF" "Luogo;Aaron Halo"));
     CHECK(csv.find("Savrilium x5, Scrap x8") != std::string::npos);
+    // Per Excel in italiano: data e ora che riconosce ("2025-11-01 10:40:00"), niente formule dai nomi.
+    CHECK(csv.find("Inizio;" + MiningLog::isoLocal(t0).substr(0, 10) + " " + MiningLog::isoLocal(t0).substr(11, 8) + "\r\n") != std::string::npos);
+    CHECK(csv.find("\r\n" + MiningLog::isoLocal(t0 + 5).substr(0, 10) + " ") != std::string::npos);
+    {
+        MiningLog::Closing evil = c;
+        evil.place = "=HYPERLINK(\"x\");Halo";
+        const std::string e2 = MiningLog::toCsv(list, evil);
+        CHECK(e2.find("Luogo;\"'=HYPERLINK(\"\"x\"\");Halo\"") != std::string::npos);
+        const nlohmann::json j2 = nlohmann::json::parse(MiningLog::toJson(list, evil), nullptr, false);
+        CHECK(j2.is_object() && j2.value("luogo", std::string()) == evil.place);
+    }
 
     // Chiusura: i file in una cartella di prova (non sul desktop vero), il registro si spegne, il luogo si ricorda.
     wchar_t tmp[MAX_PATH];
@@ -2275,7 +2861,524 @@ static void testMiningLog() {
     CHECK(!again.finish(c, folder, false, path, error)); // già chiuso
     DeleteFileW(path.c_str());
     DeleteFileW(csvPath.c_str());
+
+    // Rocce vicine: Copper × 4 (16.960) e Iron × 4 (17.080) distano meno del 2% ma sono due rocce;
+    // tornare sul rame dopo il ferro è la stessa roccia di prima; una cifra letta male va con la più vicina.
+    {
+        MiningLog::Recorder r2;
+        r2.load();
+        if (r2.active()) r2.cancel();
+        r2.start(t0);
+        CHECK(r2.add(entry(t0, 16960, "certo", "Copper (Rame)", 4, "continua")));
+        CHECK(r2.add(entry(t0 + 5, 17080, "certo", "Iron (Ferro)", 4, "continua")));
+        CHECK(r2.add(entry(t0 + 10, 16960, "certo", "Copper (Rame)", 4, "continua")));
+        CHECK(r2.add(entry(t0 + 12, 16968, "sconosciuto", "", 0, "continua")));
+        const auto l2 = r2.entries();
+        CHECK_EQ((int)l2.size(), 2);
+        if (l2.size() == 2) {
+            CHECK_EQ(l2[0].reads, 3);
+            CHECK_STR(l2[0].outcome, "certo");
+            CHECK_STR(l2[1].label, "Iron (Ferro)");
+            CHECK_EQ(l2[1].reads, 1);
+        }
+        r2.cancel();
+    }
 }
+
+// --- Interfaccia e Windows: aggiornamento, file salvati, server per OBS, finestra -----------------------------
+static void testInterfaceAndWindows() {
+    std::printf("\n[interfaccia e windows]\n");
+    // Aggiornamento: GitHub che limita i controlli (403/429) si lascia in pace un'ora, un suo errore o la
+    // rete che manca mezz'ora, poi sempre più piano (al massimo 4 ore). Testo in italiano, non "ha risposto 503".
+    Updater::Failure f = Updater::describeFailure(403, "");
+    CHECK(f.retryMinutes == 60 && f.text.find("limitato") != std::string::npos);
+    CHECK_EQ(Updater::describeFailure(429, "").retryMinutes, 60);
+    f = Updater::describeFailure(503, "");
+    CHECK(f.retryMinutes == 30 && f.text.find("non risponde") != std::string::npos && f.text.find("503") != std::string::npos);
+    f = Updater::describeFailure(0, "tempo scaduto");
+    CHECK(f.retryMinutes == 30 && f.text.find("connessione") != std::string::npos);
+    CHECK_EQ(Updater::describeFailure(404, "").retryMinutes, 240);
+    CHECK_EQ(Updater::retryDelayMinutes(30, 1), 30);
+    CHECK_EQ(Updater::retryDelayMinutes(30, 2), 60);
+    CHECK_EQ(Updater::retryDelayMinutes(30, 3), 120);
+    CHECK_EQ(Updater::retryDelayMinutes(30, 12), 240);
+    CHECK_EQ(Updater::retryDelayMinutes(60, 0), 60);
+
+    // Una versione scaricata che, installata, non parte come quella versione: si scarta e non si
+    // reinstalla a ogni avvio (niente aggiornamenti in cerchio).
+    {
+        CreateDirectoryW(AppPaths::getAppDataDir().c_str(), nullptr);
+        CreateDirectoryW(Updater::updatesDir().c_str(), nullptr);
+        DeleteFileW((Updater::updatesDir() + L"\\scartate.txt").c_str());
+        const std::wstring exe = Updater::downloadedPath("99.0.0");
+        std::ofstream(exe, std::ios::binary | std::ios::trunc) << "MZ finto exe di prova";
+        std::string hash;
+        CHECK(Updater::sha256File(exe, hash));
+        std::ofstream(exe + L".ok", std::ios::binary | std::ios::trunc) << hash;
+        std::string version;
+        CHECK(Updater::pendingUpdate(&version) == exe);
+        CHECK_STR(version, "99.0.0");
+        CHECK(!Updater::isBroken("99.0.0"));
+        Updater::confirmInstalled(); // c'è ancora uno scaricato più nuovo: l'installato non era quello
+        CHECK(Updater::isBroken("99.0.0") && Updater::isBroken("V99.0") && !Updater::isBroken("99.0.1"));
+        CHECK(GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES);
+        CHECK(Updater::pendingUpdate().empty());
+        DeleteFileW((Updater::updatesDir() + L"\\scartate.txt").c_str());
+    }
+
+    // File salvati "tutto o niente": il vecchio resta come .bak, e un file vuoto (PC spento mentre si
+    // salvava) lascia il posto alla copia di sicurezza.
+    {
+        const std::wstring file = AppPaths::getAppDataDir() + L"\\prova_salvataggio.cfg";
+        for (const wchar_t* ext : { L"", L".bak", L".tmp" }) DeleteFileW((file + ext).c_str());
+        CHECK(AppPaths::writeFileSafely(file, "uno"));
+        CHECK(AppPaths::writeFileSafely(file, "due"));
+        std::string text;
+        bool fromBackup = true;
+        CHECK(AppPaths::readFileOrBackup(file, text, &fromBackup) && text == "due" && !fromBackup);
+        HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CloseHandle(h); // rovinato: vuoto
+        CHECK(AppPaths::readFileOrBackup(file, text, &fromBackup) && text == "uno" && fromBackup);
+        CHECK(AppPaths::writeFileSafely(file, "tre")); // sopra quello vuoto: la copia buona resta
+        CHECK(AppPaths::readFileOrBackup(file, text, &fromBackup) && text == "tre" && !fromBackup);
+        CHECK(AppPaths::readFileOrBackup(file + L".bak", text) && text == "uno");
+        CHECK(GetFileAttributesW((file + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+        CHECK(!AppPaths::readFileOrBackup(file + L".non-esiste", text));
+        for (const wchar_t* ext : { L"", L".bak", L".tmp" }) DeleteFileW((file + ext).c_str());
+    }
+
+    // Impostazioni scritte a mano con numeri impossibili; la finestra ingrandita si ricorda.
+    AppSettings odd = AppSettings::parse("micGain=nan\nspeechRate=inf\nvadThreshold=-nan\nsilenceThreshold=nan\n");
+    odd.sanitize();
+    CHECK(odd.micGain == 1.0f && odd.speechRate == 1.1 && odd.vadThreshold == 0.5 && odd.silenceThreshold == 0.01);
+    AppSettings big;
+    CHECK(!big.windowMaximized && !AppSettings::parse("").windowMaximized);
+    big.windowMaximized = true;
+    CHECK(AppSettings::parse(big.serialize()).windowMaximized);
+
+    // Server per OBS: solo questo computer e le sue pagine. Un sito aperto nel browser (Origin suo) o che
+    // si fa passare per localhost (Host suo: "DNS rebinding") non legge assi e tasti dal WebSocket.
+    CHECK(AxisServer::allowedRequest("localhost:8787", "", 8787));
+    CHECK(AxisServer::allowedRequest("127.0.0.1:8787", "http://127.0.0.1:8787", 8787));
+    CHECK(AxisServer::allowedRequest("[::1]:8787", "http://localhost:8787", 8787));
+    CHECK(AxisServer::allowedRequest("LOCALHOST", "", 8787));
+    CHECK(AxisServer::allowedRequest("", "", 8787));
+    CHECK(!AxisServer::allowedRequest("localhost:8787", "https://sito-qualsiasi.example", 8787));
+    CHECK(!AxisServer::allowedRequest("localhost:8787", "null", 8787));
+    CHECK(!AxisServer::allowedRequest("localhost:8787", "http://localhost:8788", 8787));
+    CHECK(!AxisServer::allowedRequest("sito.example:8787", "", 8787));
+    CHECK(!AxisServer::allowedRequest("localhost.sito.example:8787", "", 8787));
+    CHECK(!AxisServer::allowedRequest("localhost:9999", "", 8787));
+    {
+        AxisServer server;
+        server.setPages("<html>KEY=__KEY__</html>", "<html>__ROWS__</html>");
+        std::string error;
+        int port = 0;
+        for (int p = 18800; p < 18820 && !port; ++p) {
+            if (server.start(p, error)) port = p;
+        }
+        CHECK(port != 0);
+        if (port) {
+            const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/g1";
+            CHECK_EQ(Http::get(url).status, 200);
+            Http::Options foreign;
+            foreign.headers = { L"Origin: https://sito-qualsiasi.example" };
+            CHECK_EQ(Http::get(url, foreign).status, 403);
+            server.stop();
+        }
+    }
+}
+
+// --- Coerenza della voce neurale (iris_tests --voce-coerenza) -----------------------------
+// Non possiamo ascoltare: si misura. Per ogni frase F0 mediana, quanto la F0 si sposta
+// dentro la frase (finestre da 0,5 s), centroide spettrale e il "timbro" (x-vector del
+// codificatore di parlante del mmproj): stessa voce = timbri molto simili.
+namespace voice_coherence {
+    struct Row {
+        std::string text;
+        std::vector<float> pcm; // 24 kHz
+        long long ms = 0, firstMs = -1;
+        double seconds = 0, f0 = 0, f0Spread = 0, f0Jump = 0, centroid = 0, halves = -1, toMean = 0;
+        std::vector<float> xvec;
+        std::string heard;
+    };
+
+    double semitones(double f, double ref) { return f > 0 && ref > 0 ? 12.0 * std::log2(f / ref) : 0.0; }
+
+    void writeWav(const std::wstring& path, const std::vector<float>& pcm, int rate) {
+        FILE* out = nullptr;
+        if (_wfopen_s(&out, path.c_str(), L"wb") != 0 || !out) return;
+        const uint32_t r = (uint32_t)rate, dataBytes = (uint32_t)pcm.size() * 2, riff = 36 + dataBytes, fmtSize = 16, byteRate = r * 2;
+        const uint16_t fmtPcm = 1, channels = 1, align = 2, bits = 16;
+        fwrite("RIFF", 1, 4, out); fwrite(&riff, 4, 1, out); fwrite("WAVEfmt ", 1, 8, out); fwrite(&fmtSize, 4, 1, out);
+        fwrite(&fmtPcm, 2, 1, out); fwrite(&channels, 2, 1, out); fwrite(&r, 4, 1, out); fwrite(&byteRate, 4, 1, out);
+        fwrite(&align, 2, 1, out); fwrite(&bits, 2, 1, out); fwrite("data", 1, 4, out); fwrite(&dataBytes, 4, 1, out);
+        for (float x : pcm) {
+            const int16_t v = (int16_t)std::clamp(x * 32767.0f, -32768.0f, 32767.0f);
+            fwrite(&v, 2, 1, out);
+        }
+        fclose(out);
+    }
+
+    // Le misure di una frase (il timbro a parte: serve la voce neurale caricata).
+    void analyze(Row& r, int rate) {
+        r.seconds = r.pcm.size() / (double)rate;
+        const std::vector<float> f0 = VoiceMeasure::pitch(r.pcm.data(), r.pcm.size(), rate);
+        r.f0 = VoiceMeasure::median(f0);
+        r.centroid = VoiceMeasure::centroid(r.pcm.data(), r.pcm.size(), rate);
+        // Finestre da 0,5 s (50 valori da 10 ms): mediana di ognuna, poi quanto si spostano.
+        std::vector<double> windows;
+        for (size_t at = 0; at + 25 <= f0.size(); at += 50) {
+            std::vector<float> w(f0.begin() + at, f0.begin() + std::min(f0.size(), at + 50));
+            const size_t voiced = (size_t)std::count_if(w.begin(), w.end(), [](float v) { return v > 0; });
+            if (voiced >= 12) windows.push_back(semitones(VoiceMeasure::median(w), r.f0));
+        }
+        double mean = 0, var = 0, jump = 0;
+        for (double v : windows) mean += v;
+        if (!windows.empty()) mean /= windows.size();
+        for (size_t i = 0; i < windows.size(); ++i) {
+            var += (windows[i] - mean) * (windows[i] - mean);
+            if (i > 0) jump = std::max(jump, std::fabs(windows[i] - windows[i - 1]));
+        }
+        r.f0Spread = windows.size() > 1 ? std::sqrt(var / windows.size()) : 0.0;
+        r.f0Jump = jump;
+    }
+
+    // Timbro della frase intera e delle due metà (solo frasi da 3 s in su).
+    void timbre(Row& r, NeuralVoice& voice, int rate) {
+        voice.speakerEmbedding(r.pcm.data(), r.pcm.size(), rate, r.xvec);
+        if (r.seconds >= 3.0) {
+            std::vector<float> a, b;
+            const size_t half = r.pcm.size() / 2;
+            voice.speakerEmbedding(r.pcm.data(), half, rate, a);
+            voice.speakerEmbedding(r.pcm.data() + half, r.pcm.size() - half, rate, b);
+            r.halves = VoiceMeasure::cosine(a, b);
+        }
+    }
+
+    struct Summary {
+        double f0 = 0, f0Dev = 0, centroid = 0, centroidDev = 0, toMean = 0, minPair = 1, spread = 0, jump = 0, halves = 0;
+    };
+
+    Summary summarize(std::vector<Row>& rows) {
+        Summary s;
+        std::vector<float> f0s;
+        for (const auto& r : rows) f0s.push_back((float)r.f0);
+        const double ref = VoiceMeasure::median(f0s);
+        s.f0 = ref;
+        double m = 0, c = 0;
+        for (const auto& r : rows) {
+            m += semitones(r.f0, ref);
+            c += r.centroid;
+        }
+        m /= rows.size();
+        c /= rows.size();
+        double v = 0, cv = 0;
+        for (const auto& r : rows) {
+            v += (semitones(r.f0, ref) - m) * (semitones(r.f0, ref) - m);
+            cv += (r.centroid - c) * (r.centroid - c);
+        }
+        s.f0Dev = std::sqrt(v / rows.size());
+        s.centroid = c;
+        s.centroidDev = c > 0 ? 100.0 * std::sqrt(cv / rows.size()) / c : 0.0;
+        // Timbro: il "centro" di tutte le frasi, poi quanto ognuna gli somiglia.
+        std::vector<float> centre;
+        for (const auto& r : rows) {
+            if (r.xvec.empty()) continue;
+            if (centre.empty()) centre.assign(r.xvec.size(), 0.0f);
+            for (size_t i = 0; i < centre.size() && i < r.xvec.size(); ++i) centre[i] += r.xvec[i];
+        }
+        int n = 0, nh = 0;
+        for (auto& r : rows) {
+            if (r.xvec.empty()) continue;
+            r.toMean = VoiceMeasure::cosine(r.xvec, centre);
+            s.toMean += r.toMean;
+            n++;
+            for (const auto& o : rows) {
+                if (&o != &r && !o.xvec.empty()) s.minPair = std::min(s.minPair, VoiceMeasure::cosine(r.xvec, o.xvec));
+            }
+            if (r.halves >= 0) {
+                s.halves += r.halves;
+                nh++;
+            }
+            s.spread += r.f0Spread;
+            s.jump += r.f0Jump;
+        }
+        if (n > 0) {
+            s.toMean /= n;
+            s.spread /= n;
+            s.jump /= n;
+        }
+        if (nh > 0) s.halves /= nh;
+        return s;
+    }
+
+    void print(const char* title, std::vector<Row>& rows) {
+        const Summary s = summarize(rows);
+        std::printf("\n%s\n", title);
+        std::printf("  #  durata  tempo   1o audio   F0    var.F0  salto  centroide  timbro  metà\n");
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const Row& r = rows[i];
+            std::printf(" %2zu  %5.1fs %6lldms %6lldms %5.0fHz %5.2fst %5.2fst %7.0fHz  %.3f  %s\n", i + 1, r.seconds, r.ms, r.firstMs, r.f0, r.f0Spread,
+                        r.f0Jump, r.centroid, r.toMean, r.halves >= 0 ? (std::to_string(r.halves).substr(0, 5)).c_str() : "  -  ");
+        }
+        std::printf("  TRA LE FRASI:    F0 %.0f Hz, dev. std %.2f semitoni; centroide %.0f Hz, dev. std %.1f%%; timbro: somiglianza al centro %.3f, coppia peggiore %.3f\n",
+                    s.f0, s.f0Dev, s.centroid, s.centroidDev, s.toMean, s.minPair);
+        std::printf("  DENTRO LE FRASI: variazione F0 %.2f semitoni, salto massimo medio %.2f semitoni; timbro prima metà / seconda metà %.3f\n", s.spread,
+                    s.jump, s.halves);
+    }
+
+    const char* const kSentences[] = {
+        "Fatto.",
+        "Carrello abbassato.",
+        "Rotta impostata per Seraphim Station, in orbita attorno a Crusader.",
+        "Scudi al massimo e motori accesi, pronta al decollo.",
+        "Sul conto hai 16.960 UEC e nella stiva ci sono 32 SCU di Laranite.",
+        "Il salto quantico verso Hurston dura circa 2,5 minuti.",
+        "Domani a Roma il cielo sarà coperto al mattino, con qualche schiarita nel pomeriggio e una minima di 6 gradi, quindi ti conviene portare una giacca se esci presto.",
+        "Ciao Rebo, sono online e pronta.",
+        "Attenzione: carburante quantico al 15%, ti consiglio di fare rifornimento a Port Tressler prima di ripartire.",
+        "L'ordine della raffineria di ArcCorp è pronto: ritiralo quando vuoi.",
+    };
+
+    bool g_forVoice = true;
+
+    // "t=0.8 k=40 p=0.95 m=0.05 r=1.05 s=123 c=12 f=0": campionamento diverso da quello di Iris.
+    NeuralVoice::Sampling parseSampling(int argc, char** argv, int from) {
+        NeuralVoice::Sampling s;
+        for (int i = from; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a.size() < 3 || a[1] != '=') continue;
+            const double v = std::atof(a.c_str() + 2);
+            switch (a[0]) {
+            case 't': s.temperature = (float)v; break;
+            case 'k': s.topK = (int)v; break;
+            case 'p': s.topP = (float)v; break;
+            case 'm': s.minP = (float)v; break;
+            case 'r': s.repeatPenalty = (float)v; break;
+            case 's': s.seed = (uint32_t)std::strtoul(a.c_str() + 2, nullptr, 10); break;
+            case 'c': s.firstChunk = (int)v; break;
+            case 'f': g_forVoice = v != 0; break; // f=0: senza numeri in lettere (come la Iris di prima)
+            }
+        }
+        return s;
+    }
+
+    // La voce: "" = quella predefinita di Iris, un id ("aurora"), "nessuna" (la voce a caso di
+    // prima) o un file WAV di riferimento.
+    bool chooseVoice(NeuralVoice& voice, const std::string& choice) {
+        if (choice.empty() || NeuralVoice::isPreset(choice)) {
+            voice.setVoice(choice.empty() ? NeuralVoice::presets().front().id : choice);
+            return voice.prepare();
+        }
+        if (choice == "nessuna") return voice.setReferenceAudio({}, 0);
+        std::vector<float> pcm;
+        int rate = 0;
+        std::string error;
+        if (!NeuralVoice::readWav(TextUtils::utf8ToWide(choice), pcm, rate, &error) || !NeuralVoice::cleanReference(pcm, rate, &error)) {
+            std::printf("Riferimento non usabile: %s\n", error.c_str());
+            return false;
+        }
+        return voice.setReferenceAudio(pcm, rate);
+    }
+
+    int run(const std::wstring& folder, const std::string& voiceChoice, const NeuralVoice::Sampling& sampling) {
+        std::error_code dirError;
+        std::filesystem::create_directories(folder, dirError);
+        NeuralVoice voice;
+        if (!voice.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()), 8)) {
+            std::printf("Voce neurale non caricata\n");
+            return 1;
+        }
+        voice.setSampling(sampling);
+        const int rate = voice.sampleRate();
+        auto t0 = std::chrono::steady_clock::now();
+        if (!chooseVoice(voice, voiceChoice)) std::printf("ATTENZIONE: voce \"%s\" non preparata\n", voiceChoice.c_str());
+        voice.speak("Pronta.", [](const float*, size_t) { return true; }); // riscaldamento, come in Iris
+        std::printf("Voce: %s. Campionamento: temperatura %.2f, top-k %d, top-p %.2f, min-p %.2f, ripetizione %.2f, seme %u. Preparazione: %lld ms\n",
+                    voice.voiceName().c_str(), sampling.temperature, sampling.topK, sampling.topP, sampling.minP, sampling.repeatPenalty, sampling.seed,
+                    (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+
+        std::vector<Row> rows;
+        std::vector<float> all;
+        for (const char* sentence : kSentences) {
+            Row r;
+            r.text = g_forVoice ? SpeechText::forVoice(SpeechText::speakable(sentence)) : SpeechText::speakable(sentence); // come in Iris
+            const auto start = std::chrono::steady_clock::now();
+            voice.speak(r.text, [&](const float* p, size_t n) {
+                if (r.firstMs < 0) r.firstMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+                r.pcm.insert(r.pcm.end(), p, p + n);
+                return true;
+            });
+            r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+            analyze(r, rate);
+            timbre(r, voice, rate);
+            wchar_t name[32];
+            swprintf_s(name, L"\\frase-%02zu.wav", rows.size() + 1);
+            writeWav(folder + name, r.pcm, rate);
+            all.insert(all.end(), r.pcm.begin(), r.pcm.end());
+            all.resize(all.size() + rate * 4 / 10, 0.0f);
+            rows.push_back(std::move(r));
+        }
+        writeWav(folder + L"\\tutte.wav", all, rate);
+
+        // Per confronto: la voce di Windows (Elsa), che è sempre la stessa per costruzione.
+        std::vector<Row> elsa;
+        for (const char* sentence : kSentences) {
+            Row r;
+            r.text = SpeechText::speakable(sentence);
+            std::thread([&]() { r.pcm = TtsEngine::synthesize(r.text, "Elsa"); }).join();
+            if (r.pcm.empty()) break;
+            analyze(r, TtsEngine::kSampleRate);
+            timbre(r, voice, TtsEngine::kSampleRate);
+            elsa.push_back(std::move(r));
+        }
+        voice.unload();
+
+        // Whisper: cosa si capisce (nomi, numeri).
+        WhisperEngine whisper;
+        if (whisper.init(AppPaths::toLibraryPath(AppPaths::whisperModelPath()), AppPaths::toLibraryPath(AppPaths::vadModelPath()), 8, true)) {
+            for (auto& r : rows) r.heard = whisper.transcribe(VoiceMeasure::resample(r.pcm.data(), r.pcm.size(), rate, 16000), "it", "");
+        }
+
+        print("VOCE NEURALE", rows);
+        if (!elsa.empty()) print("VOCE DI WINDOWS (Elsa), per confronto: una voce sempre uguale", elsa);
+        std::printf("\nCosa si capisce (whisper):\n");
+        for (size_t i = 0; i < rows.size(); ++i) {
+            std::printf(" %2zu  detto:   %s\n     capito:  %s\n", i + 1, rows[i].text.c_str(), rows[i].heard.c_str());
+        }
+        std::printf("\nFile in %s\n", TextUtils::wideToUtf8(folder).c_str());
+        return 0;
+    }
+
+    // Le voci che il modello si inventa, seme per seme: la voce di riferimento (senza
+    // riferimento) e tre frasi dette imitandola. Per scegliere le voci predefinite.
+    int seeds(uint32_t first, uint32_t last, const std::wstring& folder) {
+        std::error_code dirError;
+        std::filesystem::create_directories(folder, dirError);
+        NeuralVoice voice;
+        if (!voice.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()), 8)) return 1;
+        const int rate = voice.sampleRate();
+        voice.setReferenceAudio({}, 0);
+        voice.speak("Pronta.", [](const float*, size_t) { return true; });
+        const char* const probe[] = { "Rotta impostata per Hurston.", "Scudi al massimo e motori accesi, pronta al decollo.",
+                                      "Domani a Roma il cielo sarà coperto, con una minima di 6 gradi." };
+        struct Seed {
+            uint32_t seed;
+            Row ref;
+            std::vector<Row> said;
+        };
+        std::vector<Seed> list;
+        for (uint32_t seed = first; seed <= last; ++seed) {
+            Seed s{ seed };
+            const NeuralVoice::Preset p{ "prova", "prova", seed };
+            if (!voice.makePresetReference(p, s.ref.pcm) || !NeuralVoice::cleanReference(s.ref.pcm, rate)) {
+                std::printf("seme %u: niente voce\n", seed);
+                continue;
+            }
+            analyze(s.ref, rate);
+            timbre(s.ref, voice, rate);
+            voice.setReferenceAudio(s.ref.pcm, rate);
+            std::vector<float> all;
+            for (const char* t : probe) {
+                Row r;
+                r.text = t;
+                voice.speak(t, [&](const float* x, size_t n) {
+                    r.pcm.insert(r.pcm.end(), x, x + n);
+                    return true;
+                });
+                analyze(r, rate);
+                timbre(r, voice, rate);
+                r.toMean = VoiceMeasure::cosine(r.xvec, s.ref.xvec);
+                all.insert(all.end(), r.pcm.begin(), r.pcm.end());
+                all.resize(all.size() + rate * 4 / 10, 0.0f);
+                s.said.push_back(std::move(r));
+            }
+            voice.setReferenceAudio({}, 0);
+            wchar_t name[64];
+            swprintf_s(name, L"\\seme-%u.wav", seed);
+            writeWav(folder + name, s.ref.pcm, rate);
+            swprintf_s(name, L"\\seme-%u-frasi.wav", seed);
+            writeWav(folder + name, all, rate);
+            std::printf("seme %u fatto\n", seed);
+            list.push_back(std::move(s));
+        }
+        voice.unload();
+        WhisperEngine whisper;
+        const bool hear = whisper.init(AppPaths::toLibraryPath(AppPaths::whisperModelPath()), AppPaths::toLibraryPath(AppPaths::vadModelPath()), 8, true);
+        std::printf("\n seme   durata  F0rif  var.F0  metà   | F0 frasi (st dal rif.)    timbro come il rif.  | whisper\n");
+        for (auto& s : list) {
+            if (hear) s.ref.heard = whisper.transcribe(VoiceMeasure::resample(s.ref.pcm.data(), s.ref.pcm.size(), rate, 16000), "it", "");
+            double minSim = 1;
+            std::string f0s;
+            for (const auto& r : s.said) {
+                minSim = std::min(minSim, r.toMean);
+                char b[24];
+                std::snprintf(b, sizeof(b), "%+5.1f ", semitones(r.f0, s.ref.f0));
+                f0s += b;
+            }
+            std::printf(" %5u  %5.1fs %5.0fHz %5.2fst  %.3f | %s       min %.3f          | %s\n", s.seed, s.ref.seconds, s.ref.f0, s.ref.f0Spread,
+                        s.ref.halves, f0s.c_str(), minSim, s.ref.heard.c_str());
+        }
+        return 0;
+    }
+
+    // Il primo pezzo chiesto prima (dopo 12 fotogrammi invece che 72) cambia l'audio? E dove
+    // un pezzo finisce e l'altro comincia, il segnale salta (clic)?
+    int seams() {
+        NeuralVoice voice;
+        if (!voice.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()), 8)) return 1;
+        voice.setVoice(NeuralVoice::presets().front().id);
+        voice.prepare();
+        const std::string text = SpeechText::speakable(kSentences[6]);
+        auto once = [&](int firstChunk, std::vector<size_t>& cuts, long long& firstMs) {
+            NeuralVoice::Sampling s;
+            s.firstChunk = firstChunk;
+            voice.setSampling(s);
+            std::vector<float> pcm;
+            const auto t0 = std::chrono::steady_clock::now();
+            firstMs = -1;
+            voice.speak(text, [&](const float* x, size_t n) {
+                if (firstMs < 0) firstMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                pcm.insert(pcm.end(), x, x + n);
+                cuts.push_back(pcm.size());
+                return true;
+            });
+            return pcm;
+        };
+        std::vector<size_t> cutsA, cutsB;
+        long long msA = 0, msB = 0;
+        const std::vector<float> a = once(12, cutsA, msA), b = once(0, cutsB, msB);
+        double diff = 0, energy = 0, maxDiff = 0;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+            diff += (double)(a[i] - b[i]) * (a[i] - b[i]);
+            energy += (double)b[i] * b[i];
+            maxDiff = std::max(maxDiff, (double)std::fabs(a[i] - b[i]));
+        }
+        std::printf("Primo pezzo dopo 12 fotogrammi: %zu campioni, primo audio %lld ms, pezzi a", a.size(), msA);
+        for (size_t c : cutsA) std::printf(" %.2fs", c / (double)voice.sampleRate());
+        std::printf("\nBlocchi da 72 (libreria):       %zu campioni, primo audio %lld ms, pezzi a", b.size(), msB);
+        for (size_t c : cutsB) std::printf(" %.2fs", c / (double)voice.sampleRate());
+        std::printf("\nDifferenza: massima %.5f, rapporto segnale/differenza %.1f dB\n", maxDiff, diff > 0 ? 10 * std::log10(energy / diff) : 999.0);
+        // Salti ai confini: |x[i]-x[i-1]| al confine rispetto al 99,9° percentile di tutto l'audio.
+        for (const auto* pair : { &a, &b }) {
+            const std::vector<float>& x = *pair;
+            const std::vector<size_t>& cuts = pair == &a ? cutsA : cutsB;
+            std::vector<float> steps;
+            for (size_t i = 1; i < x.size(); ++i) steps.push_back(std::fabs(x[i] - x[i - 1]));
+            std::vector<float> sorted = steps;
+            std::sort(sorted.begin(), sorted.end());
+            const float p999 = sorted.empty() ? 0 : sorted[sorted.size() * 999 / 1000];
+            for (size_t c : cuts) {
+                if (c > 0 && c < x.size()) std::printf("  %s: confine a %.2fs, salto %.4f (99,9%% dei salti sotto %.4f)\n", pair == &a ? "prima" : "72   ",
+                                                       c / (double)voice.sampleRate(), steps[c - 1], p999);
+            }
+        }
+        // Inizio e fine della frase: da quanto vicino a zero partono/arrivano.
+        if (!a.empty()) std::printf("  primo campione %.4f, ultimo %.4f\n", a.front(), a.back());
+        return 0;
+    }
+} // namespace voice_coherence
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
@@ -2297,6 +3400,54 @@ int main(int argc, char** argv) {
         const auto d = Mining::decodeText(arg, Mining::defaultMaterials());
         std::printf("%s\n", Mining::summary(d).c_str());
         if (!d.note.empty()) std::printf("  nota: %s\n", d.note.c_str());
+        return 0;
+    }
+
+    if (mode == "--comando" && !arg.empty()) {
+        // iris_tests --comando "frase" [star_citizen.json] : che comando di gioco capisce Iris (senza
+        // premere niente). Con un profilo: quello, con i predefiniti nuovi aggiunti in memoria (il
+        // file non si tocca).
+        GameProfile p = GameProfile::defaults();
+        if (argc > 3) {
+            std::ifstream f(TextUtils::utf8ToWide(argv[3]), std::ios::binary);
+            std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            if (TextUtils::startsWith(text, "\xEF\xBB\xBF")) text.erase(0, 3);
+            std::string error;
+            if (!GameProfile::parse(text, p, error)) {
+                std::printf("Profilo non valido: %s\n", error.c_str());
+                return 1;
+            }
+            if (p.defaultsVersion < GameProfile::kDefaultsVersion) std::printf("(predefiniti nuovi aggiunti in memoria: %d)\n", p.addMissingDefaults());
+        }
+        const Cmd::Match m = Cmd::match(p, arg);
+        std::printf("%s  \"%s\" -> %s, frase \"%s\", %.0f%%", m.found ? "CAPITO" : "non capito", arg.c_str(),
+                    m.command.intent.empty() ? "-" : m.command.id().c_str(), m.phrase.c_str(), m.score * 100);
+        for (const auto& [k, v] : m.slots) std::printf(", %s = \"%s\"", k.c_str(), v.c_str());
+        std::printf("\n");
+        return 0;
+    }
+
+    if (mode == "--ocr-mappa" && !arg.empty()) {
+        // iris_tests --ocr-mappa immagine.png ["testo atteso"] [lingua] : cosa legge l'OCR della mappa
+        // stellare con ogni preparazione dell'immagine (le catture di %appdata%\Iris\debug, in PNG).
+        const ScreenCapture::Image img = MiningImage::loadPng(TextUtils::utf8ToWide(arg));
+        if (img.empty()) {
+            std::printf("Non leggo l'immagine (serve un PNG).\n");
+            return 1;
+        }
+        const std::string wanted = argc > 3 ? argv[3] : "";
+        OcrSettings o;
+        o.language = argc > 4 ? argv[4] : "en";
+        if (argc > 5) o.upscale = std::atoi(argv[5]);
+        o.saveDebugShots = false;
+        const RECT r{ 0, 0, img.width, img.height };
+        ScreenOcr::readImage(img, r, o, "", [&](const ScreenOcr::Result& x) {
+            const std::string t = TextUtils::collapseSpaces(ScreenOcr::linesText(x));
+            std::printf("  %-26s \"%s\"", x.variant.c_str(), t.c_str());
+            if (!wanted.empty()) std::printf("   somiglianza %.2f", Cmd::ocrContains(t, wanted));
+            std::printf("\n");
+            return false;
+        });
         return 0;
     }
 
@@ -2553,6 +3704,117 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (mode == "--prova-domande") {
+        // iris_tests --prova-domande [breve] : un giro di frasi vere (dal registro di chi gioca), col gioco
+        // "aperto" (profilo predefinito, niente tasti premuti): prima il dizionario dei comandi, se no il
+        // modello. Per ognuna: tempo alla prima frase (o al primo strumento), strumenti, risposta.
+        // Come in Iris: il modello si prepara all'avvio e mentre parli (tempo a parte, non si aspetta),
+        // e i comandi istantanei entrano nella conversazione. "senza-preparazione" (terzo argomento): come prima.
+        const bool brief = arg == "breve";
+        const bool prepare = !(argc > 3 && std::string(argv[3]) == "senza-preparazione");
+        GameController game;
+        game.load(); // cartella delle prove: profilo predefinito
+        const GameProfile profile = game.profile();
+        GameFakeHost gameHost(game.toolDefinition());
+        Tools gameTools(gameHost);
+        LlmEngine llm;
+        if (!loadLlm(llm)) return 1;
+        Agent agent(llm, gameTools);
+        Agent::Persona persona;
+        persona.userName = "REVO";
+        persona.game = profile.name;
+        persona.brief = brief;
+        agent.setPersona(persona);
+        auto elapsed = [](std::chrono::steady_clock::time_point t) {
+            return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+        };
+        if (prepare) {
+            const auto tw = std::chrono::steady_clock::now();
+            agent.warmUp(nullptr);
+            std::printf("  Preparazione all'avvio (istruzioni e strumenti): %lld ms\n", elapsed(tw));
+        }
+        const char* const script[] = {
+            "prepara la nave",
+            "rotta per Crusader",
+            "È attiva.",
+            "alza gli scudi e accendi i motori",
+            "Spegni le cose, come si chiamano? Spegni i motori.",
+            "Apri l'hangar.",
+            "Mi posso una rotta per Seraphim?",
+            "Riprova!",
+            "Alzati dal posto di guida.",
+            "Disattiva la modalità Capoled.",
+            "Chiamala TC.",
+            "Ricordati che il mio wingman si chiama Luca",
+            "Come si chiama il mio wingman?",
+            "Che cos'è il quantanium?",
+            "Qual è il tempo domani a Bagnarola?",
+            "Apri Facebook",
+            "Metti un timer di 5 minuti",
+            "Ehm.",
+            "Poche volte.",
+            "Quanto fa 12 per 7?",
+            "Come si atterra in una stazione?",
+            "Grazie",
+        };
+        long long totalFirst = 0;
+        int counted = 0;
+        for (const char* q : script) {
+            std::printf("\n> %s\n", q);
+            const std::string fact = prepare ? Assistant::memoryCommandText(q) : std::string();
+            if (!fact.empty()) {
+                std::printf("  ISTANTANEO: memoria \"%s\"\n", fact.c_str());
+                agent.noteAction(q, "salvato in memoria");
+                continue;
+            }
+            const Cmd::Match m = Cmd::match(profile, q);
+            if (m.found) {
+                std::printf("  ISTANTANEO: %s (\"%s\", %d%%)\n", m.command.id().c_str(), m.phrase.c_str(), (int)(m.score * 100 + 0.5));
+                if (prepare) {
+                    // Come in Iris: per la rotta il gioco qui dice di controllare (il caso del registro vero).
+                    const bool route = m.command.intent == "set_route";
+                    agent.noteAction(q, route ? "non riuscito (Ho premuto Imposta rotta ma non vedo comparire Annulla: controlla in gioco che la "
+                                                "rotta sia attiva.)"
+                                              : "eseguito");
+                }
+                continue;
+            }
+            if (prepare) {
+                const auto tw = std::chrono::steady_clock::now();
+                agent.warmUp(nullptr);
+                std::printf("  (preparazione mentre parli: %lld ms)\n", elapsed(tw));
+            }
+            Agent::Callbacks cb;
+            const auto t0 = std::chrono::steady_clock::now();
+            long long first = -1;
+            std::vector<std::string> spoken;
+            auto mark = [&]() {
+                if (first < 0) first = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            };
+            cb.onSentence = [&](const std::string& s) {
+                mark();
+                spoken.push_back(SpeechText::speakable(s));
+            };
+            cb.onTool = [&](const std::string& what) {
+                mark();
+                std::printf("  STRUMENTO: %s\n", what.c_str());
+            };
+            std::string answer;
+            std::atomic<bool> cancel{ false };
+            const Agent::Result r = agent.ask(q, cb, &cancel, answer);
+            const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            for (const auto& s : spoken) std::printf("  VOCE: %s\n", s.c_str());
+            std::printf("  RISPOSTA (%s, primo segno %lld ms, tutto %lld ms): %s\n", r == Agent::Result::Ok ? "ok" : "ERRORE", first, ms,
+                        answer.c_str());
+            if (first >= 0) {
+                totalFirst += first;
+                counted++;
+            }
+        }
+        std::printf("\nTempo medio al primo segno (voce o strumento): %lld ms su %d risposte del modello\n", counted ? totalFirst / counted : 0LL,
+                    counted);
+        return 0;
+    }
     if (mode == "--voce-file" && argc >= 5) {
         // iris_tests --voce-file "Cosimo" testo.txt uscita.wav : la voce di Windows (come in Iris) in un file.
         FILE* in = nullptr;
@@ -2674,7 +3936,7 @@ int main(int argc, char** argv) {
         std::string rest = splitter.flush();
         if (!rest.empty()) sentences.push_back(rest);
         for (const auto& s : sentences) {
-            voice.speak(SpeechText::speakable(s), [&](const float* p, size_t n) {
+            voice.speak(SpeechText::forVoice(SpeechText::speakable(s)), [&](const float* p, size_t n) { // come in Iris
                 if (firstMs < 0) firstMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t2).count();
                 pcm.insert(pcm.end(), p, p + n);
                 chunks++;
@@ -2698,6 +3960,80 @@ int main(int argc, char** argv) {
         }
         fclose(out);
         return 0;
+    }
+    if (mode == "--voce-coerenza") {
+        // iris_tests --voce-coerenza [cartella] [voce] : la voce neurale resta la stessa? 10 frasi, misure e WAV.
+        return voice_coherence::run(arg.empty() ? std::wstring(L"campioni-voce\\coerenza") : TextUtils::utf8ToWide(arg), argc > 3 ? argv[3] : "",
+                                    voice_coherence::parseSampling(argc, argv, 4));
+    }
+    if (mode == "--voce-semi" && argc >= 4) {
+        // iris_tests --voce-semi primo ultimo [cartella] : le voci che il modello si inventa con ogni seme
+        // (per scegliere le voci predefinite): F0, timbro stabile, cosa capisce whisper.
+        return voice_coherence::seeds((uint32_t)std::strtoul(argv[2], nullptr, 10), (uint32_t)std::strtoul(argv[3], nullptr, 10),
+                                      argc > 4 ? TextUtils::utf8ToWide(argv[4]) : std::wstring(L"campioni-voce\\semi"));
+    }
+    if (mode == "--voce-leggi") {
+        // iris_tests --voce-leggi ["frase" ...] : cosa capisce whisper dalla voce neurale, col testo così com'è
+        // e dopo SpeechText::forVoice (numeri e sigle in parole). Per trovare cosa la voce legge male.
+        std::vector<std::string> phrases;
+        for (int i = 2; i < argc; ++i) phrases.push_back(argv[i]);
+        if (phrases.empty()) {
+            phrases = { "Hai 16.960 UEC.", "Nella stiva ci sono 32 SCU di Quantanium.", "Il salto dura 2,5 minuti.", "Carburante al 15%.",
+                        "Sei a 1.200 km da Lorville.", "Borase x4 e Agricium x2.", "Vai al punto CRU-L1.", "Atterra ad Area18.",
+                        "Velocità 1.250 m/s.", "Domani alle 14:30.", "Temperatura -12 gradi.", "Hai un F7C e un 300i.",
+                        "Signature 16,960: Borase.", "Ordine numero 3 su 7.", "Prezzo 1,05 UEC per unità." };
+        }
+        NeuralVoice voice;
+        if (!voice.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()), 8)) return 1;
+        voice.setVoice(NeuralVoice::presets().front().id);
+        voice.prepare();
+        std::vector<std::vector<float>> raw, fixed;
+        for (const auto& p : phrases) {
+            for (auto* list : { &raw, &fixed }) {
+                std::vector<float> pcm;
+                voice.speak(list == &raw ? p : SpeechText::forVoice(p), [&](const float* x, size_t n) {
+                    pcm.insert(pcm.end(), x, x + n);
+                    return true;
+                });
+                list->push_back(VoiceMeasure::resample(pcm.data(), pcm.size(), voice.sampleRate(), 16000));
+            }
+        }
+        voice.unload();
+        WhisperEngine whisper;
+        if (!whisper.init(AppPaths::toLibraryPath(AppPaths::whisperModelPath()), AppPaths::toLibraryPath(AppPaths::vadModelPath()), 8, true)) return 1;
+        for (size_t i = 0; i < phrases.size(); ++i) {
+            std::printf("\n%s\n  per la voce:     %s\n  capito (prima):  %s\n  capito (dopo):   %s\n", phrases[i].c_str(), SpeechText::forVoice(phrases[i]).c_str(),
+                        whisper.transcribe(raw[i], "it", "").c_str(), whisper.transcribe(fixed[i], "it", "").c_str());
+        }
+        return 0;
+    }
+    if (mode == "--voce-confronta" && argc >= 4) {
+        // iris_tests --voce-confronta a.wav b.wav ... : quanto si somigliano i timbri (x-vector), e F0 mediana.
+        NeuralVoice voice;
+        if (!voice.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()), 8)) return 1;
+        std::vector<std::vector<float>> xs;
+        for (int i = 2; i < argc; ++i) {
+            std::vector<float> pcm, x;
+            int rate = 0;
+            NeuralVoice::readWav(TextUtils::utf8ToWide(argv[i]), pcm, rate);
+            voice.speakerEmbedding(pcm.data(), pcm.size(), rate, x);
+            const std::vector<float> f0 = VoiceMeasure::pitch(pcm.data(), pcm.size(), rate);
+            std::printf("%2d  F0 %5.0f Hz  %5.1f s  %s\n", i - 1, VoiceMeasure::median(f0), pcm.size() / (double)std::max(1, rate), argv[i]);
+            xs.push_back(x);
+        }
+        std::printf("    ");
+        for (size_t j = 0; j < xs.size(); ++j) std::printf("  %5zu", j + 1);
+        std::printf("\n");
+        for (size_t i = 0; i < xs.size(); ++i) {
+            std::printf("%2zu  ", i + 1);
+            for (size_t j = 0; j < xs.size(); ++j) std::printf("  %.3f", VoiceMeasure::cosine(xs[i], xs[j]));
+            std::printf("\n");
+        }
+        return 0;
+    }
+    if (mode == "--voce-cuciture") {
+        // iris_tests --voce-cuciture : il primo pezzo chiesto prima (12 fotogrammi) cambia l'audio? Salti tra i pezzi?
+        return voice_coherence::seams();
     }
     if (mode == "--trascrivi" && !arg.empty()) {
         // Audio grezzo float32 mono 16 kHz (ffmpeg -i x.wav -ar 16000 -ac 1 -f f32le x.raw): cosa capisce whisper.
@@ -2864,10 +4200,13 @@ int main(int argc, char** argv) {
     testWakeWord();
     testSpeechText();
     testVad();
-    testHtml();
     testChatFormat();
     testGame();
+    testGameMatching();
+    testProfileByHand();
+    testMapOcr();
     testChatParser();
+    testChatChannels();
     testScreenMatch();
     testTranslationPrompt();
     testInputPlan();
@@ -2885,6 +4224,7 @@ int main(int argc, char** argv) {
     testCommandEditor();
     testWheel();
     testMiningLog();
+    testInterfaceAndWindows();
     if (mode == "--completi") testFull();
 
     std::printf("\n%d controlli, %d falliti\n", g_checks, g_failures);

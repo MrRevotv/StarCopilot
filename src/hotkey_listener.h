@@ -91,7 +91,9 @@ private:
         std::function<void()> callback;
     };
 
-    static bool anyDown(const std::vector<TalkTrigger>& triggers);
+    // keyboard = false: solo i pulsanti del joystick (mentre Iris manda tasti finti, quelli di
+    // tastiera che si abbassano non sono tuoi).
+    static bool anyDown(const std::vector<TalkTrigger>& triggers, bool keyboard = true);
 
     std::mutex m_mutex;
     std::vector<TalkTrigger> m_triggers;

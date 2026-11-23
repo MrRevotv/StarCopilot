@@ -125,6 +125,19 @@ namespace {
             error = "OCR del mining non ancora scaricato";
             return false;
         }
+        // Una DLL caricata da una cartella dell'utente: prima di farla girare si ricontrolla che sia
+        // proprio quella scaricata (stessa impronta). Se non lo è (rovinata o cambiata) si toglie,
+        // e al prossimo avvio Iris la riscarica.
+        if (!hashIs(dll, kRuntimeDllSha256)) {
+            DeleteFileW(dll.c_str());
+            error = "onnxruntime.dll non è quella attesa (impronta diversa): si riscarica al prossimo avvio";
+            return false;
+        }
+        if (!hashIs(model, kModelSha256)) {
+            DeleteFileW(model.c_str());
+            error = "il modello PP-OCR è rovinato (impronta diversa): si riscarica al prossimo avvio";
+            return false;
+        }
         // Dal percorso completo: Windows ha una sua onnxruntime.dll (vecchia) in System32.
         g.dll = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!g.dll) {
@@ -232,6 +245,10 @@ namespace {
 
 namespace {
     std::atomic<bool> g_enabled{ true };
+    // Lo stato per chi non deve aspettare il caricamento (la pagina Mining): niente g.mutex.
+    std::atomic<bool> g_ready{ false };
+    std::mutex g_failureMutex;
+    std::string g_lastFailure;
 }
 
 void setEnabled(bool on) { g_enabled = on; }
@@ -253,8 +270,17 @@ bool load(std::string& error) {
     }
     g_stamp = stamp;
     g.tried = true;
-    if (loadLocked(error)) return true;
+    if (loadLocked(error)) {
+        g_ready = true;
+        std::lock_guard<std::mutex> failureLock(g_failureMutex);
+        g_lastFailure.clear();
+        return true;
+    }
     g.failure = error;
+    {
+        std::lock_guard<std::mutex> failureLock(g_failureMutex);
+        g_lastFailure = error;
+    }
     Log::warn("OCR del mining: PP-OCR non disponibile (" + error + "), uso l'OCR di Windows");
     // Quello che si è aperto a metà si chiude: al prossimo tentativo si riparte da zero.
     if (g.api) {
@@ -272,8 +298,12 @@ bool load(std::string& error) {
 }
 
 bool ready() {
-    std::lock_guard<std::mutex> lock(g.mutex);
-    return g.session != nullptr;
+    return g_ready.load();
+}
+
+std::string failure() {
+    std::lock_guard<std::mutex> lock(g_failureMutex);
+    return g_lastFailure;
 }
 
 bool recognize(const MiningImage::Gray& image, Line& out, std::string& error) {

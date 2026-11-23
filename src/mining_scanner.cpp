@@ -40,6 +40,18 @@ namespace {
         return true;
     }
 
+    // Un CSV salvato da Excel (o dal Blocco note di una volta) è nella codifica di Windows
+    // (Windows-1252), non UTF-8: "Ghiaccio (è)" diventerebbe un byte che rompe il JSON.
+    // Se il testo non è UTF-8 valido si converte.
+    std::string toUtf8(const std::string& bytes) {
+        if (bytes.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), (int)bytes.size(), nullptr, 0) > 0) return bytes;
+        const int n = MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+        if (n <= 0) return bytes;
+        std::wstring wide((size_t)n, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), wide.data(), n);
+        return TextUtils::wideToUtf8(wide);
+    }
+
     bool writeFile(const std::wstring& path, const std::string& content) {
         const std::wstring tmp = path + L".tmp";
         {
@@ -153,6 +165,7 @@ void MiningScanner::loadData() {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::string text;
     if (readFile(materialsPath(), text)) {
+        text = toUtf8(text); // modificato a mano con un programma che salva in ANSI
         std::vector<std::string> errors;
         m_materials = Mining::parseTable(text, &errors);
         for (const auto& e : errors) Log::warn("Mining, tabella dei materiali: " + e);
@@ -257,13 +270,13 @@ bool MiningScanner::importFile(const std::wstring& path, bool replace, std::stri
     std::string csv;
     std::string format;
     if (Mining::decodeMscDatabase(bytes, csv)) {
-        imported = Mining::parseTable(csv);
+        imported = Mining::parseTable(toUtf8(csv));
         format = "database di Mining Signature Calculator";
     } else if (parseLookupJson(bytes, imported)) {
         format = "tabella di mining_ocr";
     } else {
         std::vector<std::string> errors;
-        imported = Mining::parseTable(bytes, &errors);
+        imported = Mining::parseTable(toUtf8(bytes), &errors);
         format = "CSV";
         if (imported.empty()) {
             message = "Nessun materiale valido nel file" + (errors.empty() ? std::string(".") : " (" + errors.front() + ").");
@@ -435,6 +448,15 @@ void MiningScanner::submitText(const std::string& text, const std::string& sourc
 }
 
 void MiningScanner::workerLoop() {
+    {
+        // PP-OCR (ONNX Runtime e modello, qualche decimo di secondo) si carica qui, se il mining
+        // si usa: né la prima lettura né la pagina Mining devono aspettarlo.
+        const AppSettings s = m_host.settings ? m_host.settings() : AppSettings{};
+        if (s.miningEnabled && s.miningRegionW > 0 && s.miningRegionH > 0 && PpOcr::filesPresent()) {
+            std::string error;
+            PpOcr::load(error);
+        }
+    }
     while (!m_stopping) {
         const AppSettings s = m_host.settings ? m_host.settings() : AppSettings{};
         const bool regionOk = s.miningRegionW > 0 && s.miningRegionH > 0;
@@ -588,7 +610,7 @@ MiningScanner::Reading MiningScanner::readImage(const ScreenCapture::Image& imag
         for (size_t i = 0; i < tried.size(); ++i) {
             const auto& d = tried[i].decoded;
             if (!d.hasValue) continue;
-            int score = (d.matches.empty() ? 0 : 100) + (d.corrected ? 0 : 20) + (int)std::to_string(d.value).size();
+            int score = (d.matches.empty() ? 0 : 100) + (d.corrected ? 0 : 20) + (d.wellFormed ? 5 : 0) + (int)std::to_string(d.value).size();
             if (tried[i].confidence >= 0) score += (int)(tried[i].confidence * 15);
             for (size_t k = 0; k < tried.size(); ++k) {
                 if (k != i && tried[k].decoded.hasValue && tried[k].decoded.value == d.value) score += 10;
@@ -613,8 +635,10 @@ MiningScanner::Reading MiningScanner::readImage(const ScreenCapture::Image& imag
             for (const auto& t : tried) agree += t.decoded.readValue == r.decoded.readValue ? 1 : 0;
             if (agree >= 2) {
                 const int read = r.decoded.readValue;
+                const bool wellFormed = r.decoded.wellFormed; // com'era scritto il numero letto
                 const std::string alternative = Mining::summary(r.decoded);
                 r.decoded = Mining::decodeValue(read, materials, maxQuantity);
+                r.decoded.wellFormed = wellFormed;
                 r.decoded.note = "letto uguale da " + std::to_string(agree) + " versioni dell'immagine; se è una cifra sbagliata: " + alternative;
             }
         }
@@ -667,13 +691,21 @@ void MiningScanner::runScan(const AppSettings& s, const std::string& source, boo
         r.error = "zona non scelta: sceglila nella pagina Mining";
     } else {
         const ScreenCapture::Image image = ScreenCapture::capture(s.miningRegionX, s.miningRegionY, s.miningRegionW, s.miningRegionH);
+        bool sameScreen = false;
         if (continuous) {
-            // Schermo fermo: stessa lettura di prima, niente OCR.
+            // Schermo fermo: la stessa lettura di prima, senza rifare l'OCR (prima si saltava del
+            // tutto, e con la nave ferma il riquadro spariva anche se la roccia era ancora lì).
             const uint64_t h = ScreenCapture::hash(image);
-            if (h == m_autoLastHash) return;
+            sameScreen = !image.empty() && h == m_autoLastHash && m_autoLastRead.valid;
             m_autoLastHash = h;
         }
-        r = readImage(image, materials(), s.miningMaxQuantity, s.miningSaveImages ? imagesDir() : std::wstring());
+        if (sameScreen) {
+            r = m_autoLastRead;
+            r.durationMs = 0;
+        } else {
+            r = readImage(image, materials(), s.miningMaxQuantity, s.miningSaveImages ? imagesDir() : std::wstring());
+            if (continuous) m_autoLastRead = r;
+        }
     }
     r.time = nowTime(false);
     r.tick = GetTickCount64();
@@ -685,7 +717,9 @@ void MiningScanner::runScan(const AppSettings& s, const std::string& source, boo
         // mostra subito, ma solo se a schermo non c'è già un altro valore: per CAMBIARE un
         // numero mostrato servono sempre due letture uguali (l'OCR può alternare due valori
         // entrambi validi, es. 8.000 e 28.000 con una cifra vicina, e il riquadro ballerebbe).
-        if (!r.decoded.hasValue) {
+        // Un numero che non torna e non ha nemmeno la forma del badge ("021565", la distanza
+        // incollata) è un pezzo dell'HUD letto male, non una signature sconosciuta: non si mostra.
+        if (!r.decoded.hasValue || (r.decoded.matches.empty() && !r.decoded.wellFormed)) {
             m_autoCandidate = 0;
             return;
         }
@@ -742,7 +776,10 @@ void MiningScanner::publish(Reading r, bool remember) {
                              (r.ocrText.empty() ? "" : "   [OCR: \"" + r.ocrText + "\"]") +
                              (r.durationMs > 0 ? "   " + std::to_string(r.durationMs) + " ms" : "");
     Log::info(line);
-    const bool unknown = r.decoded.hasValue && r.decoded.matches.empty() && !r.decoded.corrected && r.decoded.value >= 1000;
+    // Tra le sconosciute (e nel registro) solo i numeri letti puliti, nella forma del badge
+    // ("32,300"), o scritti e detti: un pezzo dell'HUD letto male non è una signature da identificare.
+    const bool unknown = r.decoded.hasValue && r.decoded.matches.empty() && !r.decoded.corrected && r.decoded.value >= 1000 && r.decoded.wellFormed;
+    const bool record = r.decoded.hasValue && (!r.decoded.matches.empty() || unknown);
     const int value = r.decoded.value;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -751,7 +788,7 @@ void MiningScanner::publish(Reading r, bool remember) {
         if (m_history.size() > kHistory) m_history.pop_back();
     }
     if (remember && unknown) noteUnknown(value);
-    if (m_onReading && m_last.source != "prova" && m_last.decoded.hasValue) m_onReading(m_last);
+    if (m_onReading && r.source != "prova" && record) m_onReading(r);
     notify(Event::Reading);
 }
 
@@ -763,6 +800,9 @@ MiningScanner::ManualState MiningScanner::manualState() const {
 }
 
 void MiningScanner::beginManualInput() {
+    // Il tasto (thread dei tasti), la pagina e la chiusura possono arrivare insieme: uno alla volta.
+    std::lock_guard<std::recursive_mutex> control(m_manualControl);
+    if (m_stopping) return;
     if (manualState().active) {
         // Secondo tocco del tasto: annulla.
         cancelManualInput();
@@ -780,6 +820,7 @@ void MiningScanner::beginManualInput() {
 }
 
 void MiningScanner::cancelManualInput() {
+    std::lock_guard<std::recursive_mutex> control(m_manualControl);
     bool wasActive;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -796,25 +837,44 @@ void MiningScanner::manualThread() {
     MSG msg;
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE); // la coda dei messaggi del thread
     m_manualThreadId = GetCurrentThreadId();
-    g_manualOwner = this;
-    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, &MiningScanner::keyboardHook, GetModuleHandleW(nullptr), 0);
-    if (!hook) Log::warn("Mining: inserimento manuale senza blocco dei tasti (hook non riuscito)");
-    const UINT_PTR timer = SetTimer(nullptr, 0, 500, nullptr);
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_TIMER) {
-            if (!manualState().active) break;
-            if (GetTickCount64() - m_manualStartTick > kManualTimeoutMs) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_manual.active = false;
-                m_manual.buffer.clear();
-                break;
-            }
+    // Il blocco dei tasti si toglie SEMPRE uscendo di qui, anche per un errore: un tastierino che
+    // resta "mangiato" toglierebbe le cifre e l'Invio a tutto il PC.
+    struct Release {
+        HHOOK hook = nullptr;
+        UINT_PTR timer = 0;
+        void now() {
+            g_manualOwner = nullptr;
+            if (hook) UnhookWindowsHookEx(hook);
+            if (timer) KillTimer(nullptr, timer);
+            hook = nullptr;
+            timer = 0;
         }
-        DispatchMessageW(&msg);
+        ~Release() { now(); }
+    } release;
+    g_manualOwner = this;
+    release.hook = SetWindowsHookExW(WH_KEYBOARD_LL, &MiningScanner::keyboardHook, GetModuleHandleW(nullptr), 0);
+    if (!release.hook) Log::warn("Mining: inserimento manuale senza blocco dei tasti (hook non riuscito)");
+    release.timer = SetTimer(nullptr, 0, 500, nullptr);
+    try {
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == WM_TIMER) {
+                if (!manualState().active) break;
+                if (GetTickCount64() - m_manualStartTick > kManualTimeoutMs) {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_manual.active = false;
+                    m_manual.buffer.clear();
+                    break;
+                }
+            }
+            DispatchMessageW(&msg);
+        }
+    } catch (...) {
+        Log::warn("Mining: inserimento manuale interrotto da un errore");
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_manual.active = false;
+        m_manual.buffer.clear();
     }
-    KillTimer(nullptr, timer);
-    if (hook) UnhookWindowsHookEx(hook);
-    g_manualOwner = nullptr;
+    release.now();
     m_manualThreadId = 0;
     notify(Event::Manual);
 }
@@ -828,7 +888,11 @@ LRESULT CALLBACK MiningScanner::keyboardHook(int code, WPARAM wp, LPARAM lp) {
             const bool ours = (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || (vk >= '0' && vk <= '9') || vk == VK_BACK || vk == VK_RETURN ||
                               vk == VK_ESCAPE || vk == VK_DECIMAL || vk == VK_OEM_PERIOD || vk == VK_OEM_COMMA;
             if (ours) {
-                if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) owner->onManualKey(vk);
+                // Niente eccezioni attraverso Windows: un errore qui non deve far cadere Iris.
+                try {
+                    if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) owner->onManualKey(vk);
+                } catch (...) {
+                }
                 return 1; // il tasto non arriva al gioco
             }
         }

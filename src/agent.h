@@ -41,13 +41,29 @@ public:
     void reset();
     size_t exchanges() const { return m_history.size(); }
 
+    // Prepara il modello alla prossima domanda: istruzioni, strumenti e conversazione già
+    // elaborati (e il modello davvero pronto sulla scheda video), così la risposta parte
+    // subito. freshConversation: senza la conversazione (sta per ricominciare da capo).
+    bool warmUp(const std::atomic<bool>* cancel, bool freshConversation = false);
+
+    // Un comando fatto senza il modello (il dizionario dei comandi di gioco, la memoria): alla
+    // prossima domanda il modello lo trova scritto prima ("Comandi eseguiti poco fa: «rotta per
+    // Crusader»: Errore..."), così "riprova" o "è attiva" hanno un senso. Non come scambi finti
+    // nella conversazione: provato, il 7B ne copiava le risposte e smetteva di usare gli strumenti.
+    void noteAction(const std::string& userText, const std::string& result);
+
     // Le istruzioni per il modello (per le prove).
     std::string systemPrompt() const;
 
 private:
+    void trimHistory();
+    // Il prompt con la conversazione, più "extra" (i messaggi della domanda in corso).
+    std::string buildPrompt(const std::string& system, const std::vector<std::string>& tools, const std::vector<ChatFormat::Message>& extra) const;
+
     LlmEngine& m_llm;
     Tools& m_tools;
     Persona m_persona;
     // Uno scambio = domanda, eventuali strumenti, risposta.
     std::vector<std::vector<ChatFormat::Message>> m_history;
+    std::vector<std::string> m_actions; // vedi noteAction
 };

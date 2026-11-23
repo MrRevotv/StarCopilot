@@ -38,8 +38,12 @@ namespace {
     constexpr UINT WM_APP_ENGINE = WM_APP + 1;  // dall'assistente: wParam = Assistant::Event
     constexpr UINT WM_APP_UPDATE = WM_APP + 2;  // lo stato dell'aggiornamento è cambiato
     constexpr UINT WM_APP_TRAY = WM_APP + 60;   // l'icona nell'area di notifica
-    constexpr UINT kTrayShow = 1, kTrayBar = 2, kTrayQuit = 3;
+    constexpr UINT kTrayShow = 1, kTrayBar = 2, kTrayQuit = 3, kTrayHideAll = 4;
     constexpr UINT_PTR kMeterTimer = 1;
+    constexpr UINT_PTR kTrayRetryTimer = 2;    // l'area di notifica non era pronta (avvio con Windows): si riprova
+    constexpr UINT_PTR kWebViewRestartTimer = 3; // WebView2 chiuso: si ricrea dopo un attimo (se Windows non si sta spegnendo)
+    constexpr int kMaxRecoveries = 3;            // ricaricamenti di fila (in 10 minuti) prima di arrendersi
+    constexpr ULONGLONG kRecoveryWindowMs = 10 * 60 * 1000;
     constexpr int kDefaultWidth = 1220, kDefaultHeight = 820; // a 96 DPI
     constexpr int kMinWidth = 940, kMinHeight = 620;
     constexpr DWORD kStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
@@ -63,6 +67,13 @@ namespace {
         NOTIFYICONDATAW tray{};
         bool trayAdded = false;
         bool trayHintShown = false; // il fumetto "Iris resta qui" una volta sola
+        int trayRetries = 0;
+        bool started = false;        // l'interfaccia è partita almeno una volta
+        bool endingSession = false;  // Windows si spegne (o chiudi la sessione): niente da ricreare
+        bool gaveUp = false;         // WebView2 caduto troppe volte di fila: al suo posto un messaggio
+        bool giveUpPending = false;  // (deciso dentro un evento di WebView2: si fa appena fuori)
+        std::vector<ULONGLONG> recoveries;
+        bool restoreMaximized = false; // avviata nascosta: alla prima apertura torna ingrandita
     };
     UINT g_msgTaskbarCreated = 0; // Explorer riavviato: l'icona va rimessa
     UINT g_msgShowMe = 0;         // una seconda copia di Iris chiede di mostrare la finestra
@@ -206,6 +217,9 @@ namespace {
             MiningOverlay::hide();
             return;
         }
+        // "Nascondi tutto": il risultato resta nascosto finché non lo ripremi (l'inserimento a mano no:
+        // lo stai facendo tu adesso).
+        const bool hidden = HudHost::hiddenAll() && !g->engine->mining().manualState().active;
         const RECT region{ s.miningRegionX, s.miningRegionY, s.miningRegionX + s.miningRegionW, s.miningRegionY + s.miningRegionH };
         const bool hasRegion = s.miningRegionW > 0 && s.miningRegionH > 0;
         using MiningOverlay::Line;
@@ -224,7 +238,7 @@ namespace {
 
         const MiningScanner::Reading r = g->engine->mining().lastReading();
         // Niente lettura recente (es. inserimento manuale annullato): il riquadro si toglie.
-        if (!r.valid || GetTickCount64() - r.tick > (ULONGLONG)s.miningOverlaySeconds * 1000ULL) {
+        if (hidden || !r.valid || GetTickCount64() - r.tick > (ULONGLONG)s.miningOverlaySeconds * 1000ULL) {
             MiningOverlay::hide();
             return;
         }
@@ -276,7 +290,7 @@ namespace {
     void showChatTranslation() {
         // La chat degli altri, tradotta, nel riquadro sotto la chat del gioco.
         GameChat::ScreenView view = g->engine->chat().screenView();
-        if (view.visible && !view.lines.empty()) {
+        if (view.visible && !view.lines.empty() && !HudHost::hiddenAll()) { // "Nascondi tutto": resta nascosta
             RECT region{ view.regionX, view.regionY, view.regionX + view.regionW, view.regionY + view.regionH };
             std::vector<OcrOverlay::Line> lines;
             for (const auto& l : view.lines) lines.push_back({ TextUtils::utf8ToWide(l.prefix), TextUtils::utf8ToWide(l.text), l.pending });
@@ -290,7 +304,8 @@ namespace {
 
     void showMain() {
         if (!g) return;
-        if (!IsWindowVisible(g->hwnd)) ShowWindow(g->hwnd, SW_SHOW);
+        if (!IsWindowVisible(g->hwnd)) ShowWindow(g->hwnd, g->restoreMaximized ? SW_SHOWMAXIMIZED : SW_SHOW);
+        g->restoreMaximized = false;
         if (IsIconic(g->hwnd)) ShowWindow(g->hwnd, SW_RESTORE);
         SetForegroundWindow(g->hwnd);
     }
@@ -306,9 +321,23 @@ namespace {
         n.uCallbackMessage = WM_APP_TRAY;
         n.hIcon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
         wcscpy_s(n.szTip, L"Iris \u2014 copilota di bordo");
+        Shell_NotifyIconW(NIM_DELETE, &n); // (Explorer riavviato: quella di prima non c'è più, ma per sicurezza)
         g->trayAdded = Shell_NotifyIconW(NIM_ADD, &n) != FALSE;
-        n.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &n);
+        if (g->trayAdded) {
+            n.uVersion = NOTIFYICON_VERSION_4;
+            Shell_NotifyIconW(NIM_SETVERSION, &n);
+            KillTimer(g->hwnd, kTrayRetryTimer);
+            if (g->trayRetries > 0) Log::info("Area di notifica pronta: icona di Iris aggiunta");
+            g->trayRetries = 0;
+        } else if (g->trayRetries++ < 40) {
+            // Appena acceso il PC (Iris avviata con Windows) l'area di notifica può non essere ancora
+            // pronta: senza icona Iris, nascosta, non si potrebbe più aprire. Si riprova ogni 3 secondi.
+            if (g->trayRetries == 1) Log::warn("Area di notifica non pronta: riprovo ad aggiungere l'icona");
+            SetTimer(g->hwnd, kTrayRetryTimer, 3000, nullptr);
+        } else {
+            KillTimer(g->hwnd, kTrayRetryTimer);
+            Log::error("Icona nell'area di notifica non aggiunta: riapri Iris per vedere la finestra");
+        }
     }
 
     void removeTrayIcon() {
@@ -331,6 +360,7 @@ namespace {
         HMENU menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, kTrayShow, L"Apri Iris");
         AppendMenuW(menu, MF_STRING, kTrayBar, L"Ruota di Iris");
+        AppendMenuW(menu, MF_STRING | (HudHost::hiddenAll() ? MF_CHECKED : MF_UNCHECKED), kTrayHideAll, L"Nascondi tutto sopra il gioco");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kTrayQuit, L"Esci da Iris");
         SetMenuDefaultItem(menu, kTrayShow, FALSE);
@@ -341,6 +371,7 @@ namespace {
         DestroyMenu(menu);
         if (cmd == kTrayShow) showMain();
         else if (cmd == kTrayBar) HudHost::toggleWheel(false);
+        else if (cmd == kTrayHideAll) HudHost::toggleHideAll();
         else if (cmd == kTrayQuit) PostMessageW(g->hwnd, WM_CLOSE, 0, 0);
     }
 
@@ -364,12 +395,141 @@ namespace {
         g->controller->put_Bounds(rc);
     }
 
+    // Finestra nascosta (area di notifica) o ridotta a icona: la pagina si ferma (niente sfera che gira
+    // a 60 fotogrammi, timer rallentati) e WebView2 tiene meno memoria. Iris passa così gran parte del tempo.
+    void setWebViewVisible(bool visible) {
+        if (!g || !g->controller) return;
+        g->controller->put_IsVisible(visible ? TRUE : FALSE);
+        ComPtr<ICoreWebView2_19> webview19;
+        if (g->webview && SUCCEEDED(g->webview.As(&webview19))) {
+            webview19->put_MemoryUsageTargetLevel(visible ? COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL : COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW);
+        }
+    }
+
+    bool windowShown() { return g && IsWindowVisible(g->hwnd) && !IsIconic(g->hwnd); }
+
+    bool sessionEnding() { return g && (g->endingSession || GetSystemMetrics(SM_SHUTTINGDOWN) != 0); }
+
+    // Ancora un ricaricamento? Al massimo kMaxRecoveries in 10 minuti: se cade sempre, meglio un
+    // messaggio fermo che un'interfaccia che lampeggia.
+    bool allowRecovery() {
+        const ULONGLONG now = GetTickCount64();
+        auto& r = g->recoveries;
+        r.erase(std::remove_if(r.begin(), r.end(), [&](ULONGLONG t) { return now - t > kRecoveryWindowMs; }), r.end());
+        if ((int)r.size() >= kMaxRecoveries) return false;
+        r.push_back(now);
+        return true;
+    }
+
+    void giveUp() {
+        if (!g || g->gaveUp) return;
+        g->gaveUp = true;
+        Log::error("WebView2: l'interfaccia si è chiusa troppe volte di fila. Iris continua a funzionare (voce, tasti, ruota); "
+                   "clic nella finestra per riprovare");
+        if (g->bridge) g->bridge->pageGone();
+        if (g->controller) g->controller->Close();
+        g->webview.Reset();
+        g->controller.Reset();
+        g->env.Reset();
+        InvalidateRect(g->hwnd, nullptr, TRUE);
+    }
+
+    void createWebView();
+
+    // WebView2 ricreato da capo (il suo processo principale si è chiuso): stessa pagina, stesso ponte.
+    void restartWebView() {
+        if (!g || g->gaveUp || sessionEnding()) return;
+        Log::info("WebView2: ricreo l'interfaccia");
+        if (g->bridge) g->bridge->pageGone();
+        if (g->controller) g->controller->Close();
+        g->webview.Reset();
+        g->controller.Reset();
+        g->env.Reset();
+        g->failed = false;
+        createWebView();
+    }
+
+    const char* processKindName(COREWEBVIEW2_PROCESS_FAILED_KIND kind) {
+        switch (kind) {
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED: return "principale";
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED: return "della pagina";
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE: return "della pagina (bloccato)";
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED: return "della scheda video";
+        default: return "di servizio";
+        }
+    }
+
+    const char* failureReasonName(COREWEBVIEW2_PROCESS_FAILED_REASON reason) {
+        switch (reason) {
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE: return "non rispondeva";
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED: return "chiuso da fuori";
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED: return "andato in errore";
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED: return "non partito";
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY: return "memoria finita";
+        case COREWEBVIEW2_PROCESS_FAILED_REASON_PROFILE_DELETED: return "dati cancellati";
+        default: return "chiuso all'improvviso";
+        }
+    }
+
+    void onProcessFailed(ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) {
+        if (!g) return;
+        COREWEBVIEW2_PROCESS_FAILED_KIND kind = COREWEBVIEW2_PROCESS_FAILED_KIND_UNKNOWN_PROCESS_EXITED;
+        args->get_ProcessFailedKind(&kind);
+        std::string detail = std::string("processo ") + processKindName(kind) + ", tipo " + std::to_string((int)kind);
+        ComPtr<ICoreWebView2ProcessFailedEventArgs2> args2;
+        if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2)))) {
+            COREWEBVIEW2_PROCESS_FAILED_REASON reason = COREWEBVIEW2_PROCESS_FAILED_REASON_UNEXPECTED;
+            int exitCode = 0;
+            args2->get_Reason(&reason);
+            args2->get_ExitCode(&exitCode);
+            char code[16];
+            std::snprintf(code, sizeof(code), "0x%08X", (unsigned)exitCode);
+            detail += std::string(", ") + failureReasonName(reason) + ", codice " + code;
+        }
+        // Il processo principale di WebView2 si chiude da solo quando Windows si spegne: è normale.
+        if (sessionEnding()) {
+            Log::info("WebView2 chiuso insieme a Windows (" + detail + ")");
+            return;
+        }
+        switch (kind) {
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
+            // Tutto WebView2 è andato: non si ricarica, si ricrea (tra un attimo: se è Windows che si
+            // spegne, nel frattempo arriva WM_QUERYENDSESSION e non si ricrea niente).
+            if (g->bridge) g->bridge->pageGone();
+            g->giveUpPending = !allowRecovery();
+            if (!g->giveUpPending) Log::warn("WebView2: interfaccia chiusa (" + detail + "), la ricreo");
+            SetTimer(g->hwnd, kWebViewRestartTimer, g->giveUpPending ? 10 : 1500, nullptr);
+            break;
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
+            if (g->bridge) g->bridge->pageGone();
+            if (!allowRecovery()) {
+                g->giveUpPending = true;
+                SetTimer(g->hwnd, kWebViewRestartTimer, 10, nullptr);
+                break;
+            }
+            Log::warn("WebView2: pagina chiusa (" + detail + "), la ricarico");
+            sender->Reload(); // la pagina rimanda "ready" e il ponte le rimanda tutto lo stato
+            break;
+        default:
+            // Scheda video, servizi: WebView2 li fa ripartire da solo, la pagina resta.
+            Log::info("WebView2: " + detail + " (riparte da solo)");
+            break;
+        }
+    }
+
     void webViewFailed(HRESULT hr) {
         if (!g || g->failed) return;
         g->failed = true;
         char code[16];
         std::snprintf(code, sizeof(code), "0x%08lX", (unsigned long)hr);
         Log::error(std::string("WebView2 non disponibile: ") + code);
+        if (g->started) {
+            // Era partito e non si ricrea: Iris resta accesa (voce, tasti, ruota), al posto della pagina un messaggio.
+            g->failed = false;
+            giveUp();
+            return;
+        }
         const int answer = MessageBoxW(g->hwnd,
                                        L"Per mostrare la sua interfaccia Iris usa Microsoft Edge WebView2, che c'è già in Windows 11 e "
                                        L"in quasi tutti i Windows 10, ma su questo PC non si avvia.\n\n"
@@ -481,24 +641,22 @@ namespace {
         }
         g->webview->add_ProcessFailed(Callback<ICoreWebView2ProcessFailedEventHandler>(
                                           [](ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) -> HRESULT {
-                                              COREWEBVIEW2_PROCESS_FAILED_KIND kind;
-                                              args->get_ProcessFailedKind(&kind);
-                                              Log::warn("WebView2: processo terminato (tipo " + std::to_string((int)kind) + "), ricarico la pagina");
-                                              if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED ||
-                                                  kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE) {
-                                                  sender->Reload();
-                                              }
+                                              onProcessFailed(sender, args);
                                               return S_OK;
                                           })
                                           .Get(),
                                       &token);
 
-        g->bridge = std::make_unique<WebBridge>(*g->engine, *g->updates, g->axis, g->hwnd, [](const std::string& json) {
-            if (g && g->webview) g->webview->PostWebMessageAsJson(TextUtils::utf8ToWide(json).c_str());
-        });
+        // Il ponte vive quanto la finestra: se WebView2 si ricrea resta lo stesso (catture in corso, anteprime...).
+        if (!g->bridge) {
+            g->bridge = std::make_unique<WebBridge>(*g->engine, *g->updates, g->axis, g->hwnd, [](const std::string& json) {
+                if (g && g->webview) g->webview->PostWebMessageAsJson(TextUtils::utf8ToWide(json).c_str());
+            });
+        }
+        g->started = true;
 
         resizeWebView();
-        controller->put_IsVisible(TRUE);
+        setWebViewVisible(windowShown()); // avviata con Windows: nascosta, la pagina non disegna niente
         g->webview->Navigate((std::wstring(kHost) + L"index.html").c_str());
         if (GetForegroundWindow() == g->hwnd) controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
     }
@@ -546,11 +704,19 @@ namespace {
         if (!GetWindowPlacement(hwnd, &wp)) return;
         const RECT r = wp.rcNormalPosition; // anche se la finestra è ridotta o ingrandita
         const UINT dpi = Ui::dpiOf(hwnd);
+        const bool maximized = IsZoomed(hwnd) || (IsIconic(hwnd) && (wp.flags & WPF_RESTORETOMAXIMIZED));
+        const AppSettings before = g->engine->settings();
+        const int w96 = MulDiv(r.right - r.left, 96, (int)dpi), h96 = MulDiv(r.bottom - r.top, 96, (int)dpi);
+        if (before.windowX == r.left && before.windowY == r.top && before.windowW == w96 && before.windowH == h96 &&
+            before.windowMaximized == maximized) {
+            return; // niente di nuovo: niente da scrivere sul disco
+        }
         g->engine->updateSettings([&](AppSettings& s) {
             s.windowX = r.left;
             s.windowY = r.top;
-            s.windowW = MulDiv(r.right - r.left, 96, (int)dpi);
-            s.windowH = MulDiv(r.bottom - r.top, 96, (int)dpi);
+            s.windowW = w96;
+            s.windowH = h96;
+            s.windowMaximized = maximized;
         });
     }
 
@@ -565,8 +731,62 @@ namespace {
         }
         case WM_SIZE:
             resizeWebView();
-            if (g && g->controller) g->controller->put_IsVisible(wp != SIZE_MINIMIZED);
+            // Ridotta a icona: la pagina si ferma. (Nascosta o rimessa a schermo: lo dice WM_SHOWWINDOW.)
+            if (g && wp == SIZE_MINIMIZED) setWebViewVisible(false);
+            else if (g && IsWindowVisible(hwnd)) setWebViewVisible(true);
+            if (g && g->gaveUp) InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
+        case WM_SHOWWINDOW:
+            // Nascosta nell'area di notifica (o rimessa): la pagina si ferma e riparte.
+            if (g) setWebViewVisible(wp != 0 && !IsIconic(hwnd));
+            break;
+        case WM_QUERYENDSESSION:
+            // Windows si spegne: Iris non lo blocca. Da qui il processo di WebView2 può chiudersi da solo.
+            if (g) g->endingSession = true;
+            return TRUE;
+        case WM_ENDSESSION:
+            if (g && wp) {
+                // Dopo questo messaggio Windows può chiudere Iris in qualunque momento: si salva adesso.
+                // (Impostazioni, registro del mining, raffineria e assi sono già salvati a ogni modifica.)
+                Log::info("Windows si spegne (o chiudi la sessione): Iris si chiude");
+                saveGeometry(hwnd);
+                removeTrayIcon();
+            } else if (g) {
+                g->endingSession = false; // spegnimento annullato
+            }
+            return 0;
+        case WM_PAINT:
+            if (g && g->gaveUp) {
+                // Al posto della pagina, che non riparte: cosa succede e come riprovare.
+                PAINTSTRUCT ps;
+                HDC dc = BeginPaint(hwnd, &ps);
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                FillRect(dc, &rc, Ui::brush(RGB(6, 10, 17)));
+                const UINT dpi = Ui::dpiOf(hwnd);
+                InflateRect(&rc, -Ui::px(48, dpi), -Ui::px(48, dpi));
+                const std::wstring text =
+                    L"L'interfaccia di Iris si è chiusa più volte di fila.\n\nIris continua a funzionare: voce, tasti, ruota e "
+                    L"riquadri sopra il gioco.\n\nClic qui per riprovare. Se succede ancora, chiudi Iris (tasto destro "
+                    L"sull'icona \u203A Esci) e riaprila; il registro è in %appdata%\\Iris\\log.txt.";
+                RECT measure = rc;
+                const int h = Ui::textHeight(dc, text, rc.right - rc.left, Ui::font(Ui::Font::Normal, dpi));
+                measure.top = rc.top + std::max(0, (int)(rc.bottom - rc.top - h) / 2);
+                Ui::drawText(dc, text, measure, Ui::font(Ui::Font::Normal, dpi), RGB(214, 236, 243), DT_CENTER | DT_WORDBREAK);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (g && g->gaveUp) {
+                g->gaveUp = false;
+                g->recoveries.clear();
+                g->failed = false;
+                InvalidateRect(hwnd, nullptr, TRUE);
+                createWebView();
+                return 0;
+            }
+            break;
         case WM_MOVE:
         case WM_MOVING:
             if (g && g->controller) g->controller->NotifyParentWindowPositionChanged();
@@ -590,6 +810,20 @@ namespace {
             return 1;
         }
         case WM_TIMER:
+            if (g && wp == kTrayRetryTimer) {
+                addTrayIcon();
+                return 0;
+            }
+            if (g && wp == kWebViewRestartTimer) {
+                KillTimer(hwnd, kWebViewRestartTimer);
+                if (g->giveUpPending) {
+                    g->giveUpPending = false;
+                    giveUp();
+                } else {
+                    restartWebView();
+                }
+                return 0;
+            }
             if (g && wp == kMeterTimer) {
                 // La sfera fluttuante si muove sempre (anche con la finestra ridotta: è lì per il gioco).
                 Overlay::animate(orbMode(g->engine->status().state), g->engine->micLevel(), g->engine->voiceLevel(), g->engine->userSpeaking());
@@ -650,6 +884,8 @@ namespace {
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kMeterTimer);
+            KillTimer(hwnd, kTrayRetryTimer);
+            KillTimer(hwnd, kWebViewRestartTimer);
             HudHost::stop();
             removeTrayIcon();
             AxisOverlay::stop();
@@ -794,7 +1030,10 @@ HWND create(HINSTANCE instance, Assistant& engine, UpdateManager& updates, int s
 
     SetTimer(hwnd, kMeterTimer, 33, nullptr); // ~30 al secondo: la sfera si muove fluida
     // Avviata con Windows: niente finestra, solo l'icona nell'area di notifica.
-    if (showCommand != SW_HIDE) ShowWindow(hwnd, showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE ? showCommand : SW_SHOWNORMAL);
+    // Ingrandita l'ultima volta: torna ingrandita (anche quando la apri dall'icona).
+    const bool minimized = showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMINNOACTIVE;
+    if (showCommand == SW_HIDE) g->restoreMaximized = remembered && s.windowMaximized;
+    else ShowWindow(hwnd, minimized ? showCommand : remembered && s.windowMaximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
     UpdateWindow(hwnd);
     createWebView();
     return hwnd;

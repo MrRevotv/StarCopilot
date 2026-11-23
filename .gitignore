@@ -13,6 +13,3 @@ campioni-voce/
 
 # Kit di WebView2 (lo scarica compila.bat da NuGet)
 external/webview2/
-
-# Header di ONNX Runtime (lo scarica compila.bat da GitHub)
-external/onnxruntime/

@@ -25,6 +25,7 @@ namespace {
     constexpr size_t kMaxEntries = 300;
     constexpr int kWakeWindowMs = 8000;     // dopo "Iris" da sola: tempo per dire la richiesta
     constexpr int kEchoGuardMs = 400;       // dopo che Iris ha smesso di parlare, la sua eco può arrivare ancora
+    constexpr int kEchoTailMs = 1500;       // fin qui una frase che comincia si confronta ancora con quello che ha detto
     constexpr int kPttGuardMs = 400;
     constexpr double kMinVoicedSeconds = 0.15;
     // Suggerimento per whisper. Una frase intera, non solo "Iris": con il nome
@@ -91,6 +92,30 @@ namespace {
         const std::string n = WakeWord::normalize(command);
         return n == "nuova conversazione" || n == "ricominciamo" || n == "ricominciamo da capo" || n == "dimentica tutto" ||
                n == "dimentica la conversazione" || n == "cambiamo argomento";
+    }
+
+    // Spazio libero sul disco della cartella di "path" (byte); -1 se non si sa.
+    long long freeDiskBytes(const std::wstring& path) {
+        const std::wstring dir = path.substr(0, path.find_last_of(L"\\/") + 1);
+        ULARGE_INTEGER free{};
+        if (dir.empty() || !GetDiskFreeSpaceExW(dir.c_str(), &free, nullptr, nullptr)) return -1;
+        return (long long)free.QuadPart;
+    }
+
+    // Il risultato di un comando di gioco come lo vede il modello (strumento game_command).
+    std::string gameToolResult(const GameController::Result& r) {
+        return (r.ok ? "Fatto: " : "Errore: ") + (r.shown.empty() ? r.spoken : r.shown) +
+               (r.spoken.empty() || r.spoken == r.shown ? "" : " (" + r.spoken + ")");
+    }
+
+    // "Imposta la rotta per..." -> "Imposta la rotta per" (il resto arriva dopo).
+    std::string withoutTrailingDots(std::string s) {
+        while (true) {
+            s = TextUtils::trim(s);
+            if (s.size() >= 3 && s.compare(s.size() - 3, 3, "\xE2\x80\xA6") == 0) s.resize(s.size() - 3); // …
+            else if (!s.empty() && s.back() == '.') s.pop_back();
+            else return s;
+        }
     }
 }
 
@@ -194,7 +219,7 @@ void Assistant::start() {
     host.micOpen = [this]() { return m_audio.isOpen(); };
     host.onWritten = [this](const std::string& heard, const std::string& written, bool typed) {
         addEntry(Entry::Kind::Tool, std::string(typed ? "In chat: " : "Per la chat (non scritto, in primo piano c'era Iris): ") + written +
-                                        (written != heard ? "   (detto: \"" + heard + "\")" : ""));
+                                        (written != heard ? "   (detto: «" + heard + "»)" : ""));
     };
     m_chat.start(std::move(host));
 
@@ -242,11 +267,14 @@ void Assistant::startupThread() {
         if (custom.empty()) {
             if (!ensureModel(kLlmUrl, AppPaths::llmModelPath(), true, kLlmMinBytes, "modello di linguaggio", 3)) return;
         } else if (!fileExists(AppPaths::llmModelPath(custom))) {
-            setStatus(State::Error, "Il modello \"" + custom + "\" non c'è in %appdata%\\VoiceToChat\\models. Mettilo lì o torna al modello predefinito.", true);
+            setStatus(State::Error, "Il modello «" + custom + "» non c'è in %appdata%\\VoiceToChat\\models. Mettilo lì o torna al modello predefinito.", true);
             return;
         }
         if (m_stopping) return;
     }
+    // Finché la voce neurale si carica, le frasi la aspettano (niente frasi con la voce di Windows
+    // in mezzo); loadModels lo spegne se poi non c'è.
+    m_tts.setUseNeural(settings().voiceEngine == "neurale" && Gpu::bestDevice());
     // La voce neurale: se il download non riesce, parla la voce di Windows (Iris parte lo stesso).
     if (settings().voiceEngine == "neurale" && !m_neural.isReady() && Gpu::bestDevice()) {
         if (!ensureModel(kVoiceUrl, AppPaths::neuralVoiceModelPath(), true, kVoiceMinBytes, "modello della voce", 4, 5) ||
@@ -255,7 +283,10 @@ void Assistant::startupThread() {
         }
         if (m_stopping) return;
     }
-    if (!loadModels()) return;
+    if (!loadModels()) {
+        m_tts.setUseNeural(m_neural.isReady() && settings().voiceEngine == "neurale"); // niente attese per una voce che non arriva
+        return;
+    }
     if (!m_vad.usesModel()) m_vad.init(AppPaths::toLibraryPath(AppPaths::vadModelPath()), 1);
 
     AppSettings s = settings();
@@ -268,6 +299,9 @@ void Assistant::startupThread() {
     }
     refreshState();
     Log::info("Iris pronta");
+    // Il modello elabora subito istruzioni e strumenti: la prima domanda non aspetta (nel registro
+    // la prima risposta dopo l'avvio, col gioco aperto, arrivava fino a 15 secondi dopo).
+    requestWarmUp();
     // Il saluto all'avvio solo se lo vuoi (Impostazioni): di base Iris si accende in silenzio.
     if (s.speechEnabled && s.greetOnStart) {
         say(s.userName.empty() ? "Sistemi online. Sono pronta." : "Ciao " + s.userName + ", sono online e pronta.");
@@ -319,8 +353,11 @@ bool Assistant::loadModels() {
             setStatus(State::Starting, "Carico la voce neurale...");
             if (m_neural.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()),
                               inferenceThreads())) {
-                // La prima frase sulla scheda video è lenta (prepara i suoi programmi): una a vuoto adesso.
-                m_neural.speak("Pronta.", [](const float*, size_t) { return true; });
+                // La voce scelta (la prima volta il modello genera la predefinita: qualche secondo)
+                // e una frase a vuoto con lei: la prima sulla scheda video è lenta.
+                setStatus(State::Starting, "Preparo la voce neurale...");
+                m_neural.setVoice(s.neuralVoice, s.neuralVoiceFile);
+                m_neural.prepare();
             } else {
                 Log::warn("Voce neurale non caricata: uso la voce di Windows");
             }
@@ -387,10 +424,14 @@ void Assistant::reloadModels() {
             ~Done() { flag = false; }
         } done{ m_startupRunning };
         Log::info("Ricarico i modelli");
-        if (!loadModels()) return;
+        if (!loadModels()) {
+            m_tts.setUseNeural(false); // le frasi non devono aspettare una voce neurale che non c'è
+            return;
+        }
         m_ready = true;
         m_chat.setReady(true);
         refreshState();
+        requestWarmUp();
     });
 }
 
@@ -415,6 +456,16 @@ bool Assistant::ensureModel(const std::wstring& url, const std::wstring& path, b
         }
     }
     const std::string what = std::string(label) + " (" + std::to_string(index) + " di " + std::to_string(total) + ")";
+    // Prima di cominciare: c'è posto? (Con il disco pieno il download si fermava a metà con
+    // "controlla la connessione", che non c'entrava.)
+    const long long already = std::max(0LL, fileSize(path + L".part"));
+    const long long freeBytes = freeDiskBytes(path);
+    if (freeBytes >= 0 && freeBytes < minBytes - already + (200LL << 20)) {
+        setStatus(State::Error, "Non c'è abbastanza spazio sul disco per il " + std::string(label) + ": servono circa" +
+                                    gigabytes(minBytes - already + (200LL << 20)) + " liberi in %appdata%\\VoiceToChat\\models (ora" +
+                                    gigabytes(freeBytes) + "). Libera spazio e premi Riprova.", true);
+        return false;
+    }
     setStatus(State::Starting, "Scarico il " + what + "...");
     Log::info("Download: " + TextUtils::wideToUtf8(url));
     auto lastUpdate = Clock::now() - std::chrono::seconds(1);
@@ -432,8 +483,13 @@ bool Assistant::ensureModel(const std::wstring& url, const std::wstring& path, b
         &m_stopping, error);
     if (!ok) {
         if (m_stopping) return false;
-        setStatus(State::Error, "Download del " + std::string(label) + " non riuscito (" + error +
-                  "). Controlla la connessione e premi Riprova: riparte da dove si era fermato.", true);
+        if (error.find("disco") != std::string::npos) {
+            setStatus(State::Error, "Download del " + std::string(label) + " interrotto: il disco è pieno (o la cartella è protetta). "
+                                    "Libera spazio e premi Riprova: riparte da dove si era fermato.", true);
+        } else {
+            setStatus(State::Error, "Download del " + std::string(label) + " non riuscito (" + error +
+                      "). Controlla la connessione e premi Riprova: riparte da dove si era fermato.", true);
+        }
         return false;
     }
     if (!ModelDownloader::looksValid(path, kind)) {
@@ -547,6 +603,9 @@ void Assistant::applyChanges(const AppSettings& before, const AppSettings& after
     if (before.outputDeviceName != after.outputDeviceName) m_tts.setOutputDevice(after.outputDeviceName);
     if (before.wakeWordEnabled != after.wakeWordEnabled) m_audio.setStreaming(after.wakeWordEnabled);
     if (before.gpuMemoryLimitMb != after.gpuMemoryLimitMb || before.llmModelFile != after.llmModelFile) reloadModels();
+    if (before.neuralVoice != after.neuralVoice || before.neuralVoiceFile != after.neuralVoiceFile) {
+        m_neural.setVoice(after.neuralVoice, after.neuralVoiceFile); // si prepara alla prossima frase
+    }
     if (before.voiceEngine != after.voiceEngine) {
         // Verso Windows: subito. Verso la voce neurale: la si carica (qualche secondo; se manca, la si scarica al prossimo avvio).
         m_tts.setUseNeural(after.voiceEngine == "neurale" && m_neural.isReady());
@@ -606,9 +665,9 @@ void Assistant::refreshState() {
     else if (m_pttActive) setStatus(State::Listening, "Ti ascolto: rilascia il tasto quando hai finito");
     else if (recentNotice) setStatus(chatNotice.error ? State::Error : State::Idle, chatNotice.text);
     else if (now < m_awakeUntilMs) setStatus(State::Listening, "Ti ascolto...");
-    else if (s.wakeWordEnabled) setStatus(State::Idle, "Dì \"Iris\" per chiamarmi");
+    else if (s.wakeWordEnabled) setStatus(State::Idle, "Dì «Iris» per chiamarmi");
     else if (!s.triggers.empty()) setStatus(State::Idle, "Tieni premuto " + HotkeyListener::describeTrigger(s.triggers.front()) + " per parlarmi");
-    else setStatus(State::Idle, "Scrivimi qui sotto, o accendi l'ascolto di \"Iris\" nelle impostazioni");
+    else setStatus(State::Idle, "Scrivimi qui sotto, o accendi l'ascolto di «Iris» nelle impostazioni");
 }
 
 size_t Assistant::addEntry(Entry::Kind kind, const std::string& text, bool pending) {
@@ -651,12 +710,14 @@ void Assistant::setLastHeard(const std::string& text) {
 void Assistant::listenLoop() {
     VadSegmenter segmenter;
     std::vector<float> buffer, probs;
-    bool startedAwake = false, startedWhileSpeaking = false;
+    bool startedAwake = false, startedWhileSpeaking = false, startedAfterSpeaking = false;
     bool streaming = false;
 
     int tick = 0;
     while (!m_stopping) {
         Sleep(30);
+        // Un errore qui non deve fermare l'ascolto per sempre: si registra e si riparte.
+        try {
         refreshState();
         if (++tick % 66 == 0 && m_ready) checkDevices(); // ogni 2 secondi
         const AppSettings s = settings();
@@ -699,6 +760,9 @@ void Assistant::listenLoop() {
             if (!was && segmenter.inSpeech()) {
                 startedAwake = now < m_awakeUntilMs;
                 startedWhileSpeaking = m_tts.isSpeaking() || now - m_ttsEndedMs < kEchoGuardMs;
+                startedAfterSpeaking = !startedWhileSpeaking && now - m_ttsEndedMs < kEchoTailMs;
+                // Mentre parli il modello si prepara (se la frase è per Iris, la risposta parte prima).
+                if (!startedWhileSpeaking) requestWarmUp();
             }
             if (was && !segmenter.inSpeech() && !done) Log::info("Ascolto: rumore troppo breve, scartato");
             if (done) {
@@ -710,6 +774,7 @@ void Assistant::listenLoop() {
                 Log::info(info);
                 u.startedAwake = startedAwake;
                 u.startedWhileSpeaking = startedWhileSpeaking;
+                u.startedAfterSpeaking = startedAfterSpeaking;
                 if (u.startedAwake && !u.startedWhileSpeaking) m_pendingForIris++;
                 m_vad.reset();
                 {
@@ -723,6 +788,13 @@ void Assistant::listenLoop() {
         m_voiceProbability = segmenter.lastProbability();
         m_noiseFloor = segmenter.noiseFloor();
         buffer.erase(buffer.begin(), buffer.begin() + (size_t)frames * VoiceDetector::kFrameSamples);
+        } catch (const std::exception& e) {
+            Log::error(std::string("Ascolto: errore interno, riparto (") + e.what() + ")");
+            buffer.clear();
+            segmenter.reset();
+            m_userSpeaking = false;
+            Sleep(500);
+        }
     }
 }
 
@@ -796,6 +868,7 @@ void Assistant::pttDown(bool forChat) {
     m_chat.setRecording(true);
     m_audio.startRecording();
     m_pttActive = true;
+    if (!forChat) requestWarmUp(); // mentre parli il modello si prepara
 }
 
 void Assistant::pttUp(bool forChat) {
@@ -898,6 +971,24 @@ std::string Assistant::chatCommandText(const std::string& command) {
     return TextUtils::trim(rest);
 }
 
+std::string Assistant::memoryCommandText(const std::string& command) {
+    std::string low = command;
+    for (char& c : low) {
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    }
+    static const char* const prefixes[] = { "ricordati che", "ricordati:", "ricorda che", "ricorda:", "tieni a mente che", "segnati che",
+                                            "memorizza che", "prendi nota che", "annotati che" };
+    for (const char* p : prefixes) {
+        if (!TextUtils::startsWith(low, p)) continue;
+        std::string fact = command.substr(std::strlen(p));
+        while (!fact.empty() && (fact.front() == ' ' || fact.front() == ':' || fact.front() == ',')) fact.erase(0, 1);
+        fact = TextUtils::trim(fact);
+        while (!fact.empty() && (fact.back() == '.' || fact.back() == '!')) fact.pop_back();
+        return WakeWord::wordCount(fact) >= 2 ? fact : std::string();
+    }
+    return {};
+}
+
 void Assistant::speechLoop() {
     while (true) {
         Utterance u;
@@ -909,16 +1000,21 @@ void Assistant::speechLoop() {
             m_utterances.pop_front();
         }
         const bool counted = u.fromPtt || (u.startedAwake && !u.startedWhileSpeaking);
-        std::string text;
-        const auto t0 = Clock::now();
-        // Tasto in comune con la chat: anche i nomi di Star Citizen (potrebbe essere un messaggio per gli altri).
-        if (m_whisper.isReady()) text = m_whisper.transcribe(u.samples, "it", gameActive() || u.sharedKey ? kWhisperHintGame : kWhisperHint);
-        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-        if (text.empty()) Log::info("Whisper (" + std::to_string(ms) + " ms): niente di comprensibile");
-        else Log::info("Whisper (" + std::to_string(ms) + " ms): \"" + text + "\"");
-        if (!text.empty()) {
-            setLastHeard(text);
-            handleTranscript(u, text);
+        try {
+            std::string text;
+            const auto t0 = Clock::now();
+            // Tasto in comune con la chat: anche i nomi di Star Citizen (potrebbe essere un messaggio per gli altri).
+            if (m_whisper.isReady()) text = m_whisper.transcribe(u.samples, "it", gameActive() || u.sharedKey ? kWhisperHintGame : kWhisperHint);
+            const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+            if (text.empty()) Log::info("Whisper (" + std::to_string(ms) + " ms): niente di comprensibile");
+            else Log::info("Whisper (" + std::to_string(ms) + " ms): \"" + text + "\"");
+            if (!text.empty()) {
+                setLastHeard(text);
+                handleTranscript(u, text);
+            }
+        } catch (const std::exception& e) {
+            // Una frase andata storta non ferma l'ascolto delle prossime.
+            Log::error(std::string("Trascrizione: errore interno (") + e.what() + ")");
         }
         if (counted) m_pendingForIris--;
     }
@@ -926,8 +1022,8 @@ void Assistant::speechLoop() {
 
 void Assistant::handleTranscript(const Utterance& u, const std::string& text) {
     const bool awake = u.fromPtt || (u.startedAwake && !u.startedWhileSpeaking);
-    // Sentita mentre Iris parlava e uguale a quello che diceva: è la sua voce dalle casse.
-    if (u.startedWhileSpeaking && !u.fromPtt && isOwnEcho(text)) {
+    // Sentita mentre Iris parlava (o appena dopo) e uguale a quello che diceva: è la sua voce dalle casse.
+    if (!u.fromPtt && (u.startedWhileSpeaking || u.startedAfterSpeaking) && isOwnEcho(text, !u.startedWhileSpeaking)) {
         Log::info("Eco della mia voce, ignorata: \"" + text + "\"");
         return;
     }
@@ -939,24 +1035,50 @@ void Assistant::handleTranscript(const Utterance& u, const std::string& text) {
         m_chat.sendText(text);
         return;
     }
+    // Il pezzo di una frase detta prima ("Iris, imposta la rotta per..."), che aspetta il resto.
+    std::string fragment;
+    if (!m_pendingFragment.empty()) {
+        if (nowMs() - m_pendingFragmentMs < kWakeWindowMs + 2000) fragment = m_pendingFragment;
+        m_pendingFragment.clear();
+    }
+    // Solo "Iris" (o "Iris, ehm..."): ti ascolta, e se stava parlando si ferma.
+    auto wakeUp = [&](const char* why) {
+        Log::info(std::string(why) + ": \"" + text + "\"");
+        if (m_busy || m_tts.isSpeaking()) {
+            m_cancel = true;
+            m_tts.stop();
+        }
+        m_tts.chime(TtsEngine::Chime::Wake);
+        m_awakeUntilMs = nowMs() + kWakeWindowMs;
+        requestWarmUp();
+    };
     std::string command;
     if (m.found) {
-        if (m.command.empty()) {
-            // Solo "Iris": ti ascolta (e se stava parlando, si ferma).
-            Log::info("Chiamata: \"" + text + "\"");
-            if (m_busy || m_tts.isSpeaking()) {
-                m_cancel = true;
-                m_tts.stop();
-            }
-            m_tts.chime(TtsEngine::Chime::Wake);
-            m_awakeUntilMs = nowMs() + kWakeWindowMs;
+        if (m.command.empty() || WakeWord::isHesitation(m.command)) {
+            wakeUp("Chiamata");
             return;
         }
-        command = m.command;
+        command = m.command; // ricominciata con "Iris": il pezzo di prima non c'entra più
     } else if (awake) {
-        command = text;
+        // Senza "Iris", nella finestra di ascolto dopo una risposta: "Ehm.", "Integra...", "Poi..."
+        // sono pezzi di chiacchiere (dal registro vero), non richieste. Col tasto per parlare invece sì.
+        if (!u.fromPtt && (WakeWord::isHesitation(text) || (WakeWord::isUnfinished(text) && WakeWord::wordCount(text) <= 2))) {
+            Log::info("Sentito (non una richiesta): \"" + text + "\"");
+            if (!fragment.empty()) m_pendingFragment = fragment; // il pezzo di prima aspetta ancora
+            return;
+        }
+        command = fragment.empty() ? text : fragment + " " + text;
     } else {
         Log::info("Sentito (non per Iris): \"" + text + "\"");
+        return;
+    }
+
+    // La frase è rimasta a metà ("Iris, imposta la rotta per..." e una pausa): invece di chiedere un
+    // pezzo al modello, il suono di ascolto e si aspetta il resto, che si attacca a questo.
+    if (WakeWord::isUnfinished(command) && WakeWord::wordCount(command) <= 6 && !WakeWord::isStopCommand(command)) {
+        m_pendingFragment = withoutTrailingDots(command);
+        m_pendingFragmentMs = nowMs();
+        wakeUp("Frase a metà, aspetto il resto");
         return;
     }
 
@@ -1039,12 +1161,26 @@ void Assistant::workerLoop() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     while (true) {
         std::string job;
+        bool more = false;
         {
             std::unique_lock<std::mutex> lock(m_jobMutex);
             m_jobCv.wait(lock, [&] { return m_stopping || !m_jobs.empty(); });
             if (m_stopping) break;
             job = std::move(m_jobs.front());
             m_jobs.pop_front();
+            more = !m_jobs.empty();
+        }
+        if (job == "\x01warm") {
+            m_warmQueued = false;
+            // Se intanto è arrivata una richiesta vera, la prepara lei.
+            if (!more) {
+                try {
+                    warmUp();
+                } catch (const std::exception& e) {
+                    Log::warn(std::string("Preparazione del modello non riuscita: ") + e.what());
+                }
+            }
+            continue;
         }
         m_cancel = false;
         if (job == "\x01reset") {
@@ -1052,9 +1188,51 @@ void Assistant::workerLoop() {
             addEntry(Entry::Kind::Info, "Nuova conversazione");
             continue;
         }
-        processCommand(job);
+        // Una richiesta andata storta (errore interno) non deve bloccare Iris: si dice e si va avanti.
+        try {
+            processCommand(job);
+        } catch (const std::exception& e) {
+            Log::error(std::string("Richiesta non riuscita, errore interno: ") + e.what());
+            m_busy = false;
+            addEntry(Entry::Kind::Info, "Qualcosa è andato storto con questa richiesta (dettagli nel registro).");
+            m_tts.chime(TtsEngine::Chime::Error);
+        } catch (...) {
+            Log::error("Richiesta non riuscita, errore interno sconosciuto");
+            m_busy = false;
+            m_tts.chime(TtsEngine::Chime::Error);
+        }
     }
     CoUninitialize();
+}
+
+void Assistant::requestWarmUp() {
+    if (!m_ready || m_stopping || m_busy || !m_llm.isReady()) return;
+    if (m_warmQueued.exchange(true)) return; // già in coda
+    {
+        std::lock_guard<std::mutex> lock(m_jobMutex);
+        m_jobs.push_back(std::string("\x01warm"));
+    }
+    m_jobCv.notify_one();
+}
+
+void Assistant::warmUp() {
+    if (!m_ready || !m_llm.isReady()) return;
+    const AppSettings s = settings();
+    applyPersona();
+    // La conversazione sta per ricominciare da capo (troppo silenzio): si prepara senza.
+    m_agent.warmUp(&m_stopping, conversationExpired(s));
+}
+
+bool Assistant::conversationExpired(const AppSettings& s) const {
+    return m_agent.exchanges() > 0 && Clock::now() - m_lastInteraction > std::chrono::minutes(s.conversationTimeoutMin);
+}
+
+bool Assistant::applyPersona() {
+    Agent::Persona p = persona();
+    if (gameActive()) p.game = m_game.profile().name;
+    p.brief = briefReplies();
+    m_agent.setPersona(p);
+    return p.brief;
 }
 
 bool Assistant::gameActive() {
@@ -1108,6 +1286,24 @@ void Assistant::processCommand(const std::string& text) {
     }
     // Mining: "che minerale è?" legge lo schermo, "signature 16960" decodifica il valore. Istantaneo, senza modello.
     if (s.miningEnabled && runMiningCommand(s, text)) return;
+    // "Ricordati che il mio wingman si chiama Luca": in memoria subito, senza modello (il 7B a volte
+    // scriveva lo strumento come testo, "remember: fact=...", e la voce lo leggeva senza salvare niente).
+    const std::string fact = memoryCommandText(text);
+    if (!fact.empty()) {
+        addEntry(Entry::Kind::User, text);
+        remember(fact);
+        addEntry(Entry::Kind::Tool, "Me lo segno: " + fact);
+        const std::string reply = briefReplies() ? "Segnato." : "Va bene, me lo ricordo.";
+        addEntry(Entry::Kind::Iris, reply);
+        if (s.speechEnabled) say(reply);
+        else m_tts.chime(TtsEngine::Chime::Confirm);
+        if (conversationExpired(s)) m_agent.reset();
+        m_agent.noteAction(text, "salvato in memoria");
+        m_lastInteraction = Clock::now();
+        while (!m_stopping && !m_cancel && m_tts.isSpeaking()) Sleep(40);
+        if (!m_cancel && s.followUpSeconds > 0) m_awakeUntilMs = nowMs() + kEchoGuardMs + s.followUpSeconds * 1000LL;
+        return;
+    }
     // Star Citizen aperto: prima il dizionario dei comandi (istantaneo, funziona anche col modello ancora in caricamento).
     if (s.gameEnabled) {
         m_game.reloadIfChanged();
@@ -1126,7 +1322,7 @@ void Assistant::processCommand(const std::string& text) {
         return;
     }
     // Dopo tanto silenzio si ricomincia da capo (le domande di prima non c'entrano più).
-    if (m_agent.exchanges() > 0 && Clock::now() - m_lastInteraction > std::chrono::minutes(s.conversationTimeoutMin)) {
+    if (conversationExpired(s)) {
         m_agent.reset();
         addEntry(Entry::Kind::Info, "Nuova conversazione");
     }
@@ -1140,11 +1336,7 @@ void Assistant::processCommand(const std::string& text) {
         m_speakingText.clear();
     }
     m_busy = true;
-    Agent::Persona currentPersona = persona();
-    if (gameActive()) currentPersona.game = m_game.profile().name;
-    const bool brief = briefReplies();
-    currentPersona.brief = brief;
-    m_agent.setPersona(currentPersona);
+    const bool brief = applyPersona();
 
     size_t irisEntry = (size_t)-1;
     auto lastUpdate = Clock::now() - std::chrono::seconds(1);
@@ -1219,18 +1411,19 @@ void Assistant::say(const std::string& text) {
     m_tts.speak(text);
 }
 
-bool Assistant::isOwnEcho(const std::string& heard) {
+bool Assistant::isOwnEcho(const std::string& heard, bool strict) {
     const std::string h = WakeWord::normalize(heard);
     if (h.empty()) return false;
     const long long now = nowMs();
-    std::lock_guard<std::mutex> lock(m_mutex);
-    std::string joined; // un pezzo sentito può stare a cavallo di due frasi
-    for (const auto& [when, said] : m_recentSpoken) {
-        if (now - when > 60000) continue;
-        if (said.find(h) != std::string::npos || TextUtils::similarity(h, said) > 0.6) return true;
-        joined += (joined.empty() ? "" : " ") + said;
+    std::vector<std::string> said;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [when, text] : m_recentSpoken) {
+            if (now - when <= 60000) said.push_back(text);
+        }
     }
-    return !joined.empty() && joined.find(h) != std::string::npos;
+    // Anche con qualche parola capita male ("Ciao Rebo, sono Iris" per "Ciao REVO, sono Iris").
+    return SpeechUtils::soundsLikeEcho(h, said, strict);
 }
 
 // --- Gioco --------------------------------------------------------------------------------
@@ -1258,7 +1451,7 @@ void Assistant::runGameCommand(const std::string& text, const Cmd::Match& match)
     };
     const GameController::Result r = m_game.execute(match, announce, &m_cancel);
     m_busy = false;
-    addEntry(Entry::Kind::Tool, "Comando di gioco: " + r.shown + " (\"" + match.phrase + "\", " + score + ")");
+    addEntry(Entry::Kind::Tool, "Comando di gioco: " + r.shown + " («" + match.phrase + "», " + score + ")");
     const std::string spoken = brief ? briefSpoken(r) : r.spoken;
     if (!r.spoken.empty()) addEntry(Entry::Kind::Iris, r.spoken); // per intero, scritto: i dettagli restano leggibili
     if (!spoken.empty()) {
@@ -1269,6 +1462,15 @@ void Assistant::runGameCommand(const std::string& text, const Cmd::Match& match)
         speak(spoken);
     }
     if (spoken.empty() || !s.speechEnabled) m_tts.chime(r.ok ? TtsEngine::Chime::Confirm : TtsEngine::Chime::Error);
+    // Alla prossima domanda il modello sa cosa è appena successo: dal registro vero, "Riprova!" o
+    // "È attiva." dopo una rotta ricevevano risposte a caso ("Sono attiva e pronta...").
+    const std::string intent = match.command.intent;
+    if (intent != "repeat" && intent != "toggle_dry_run") {
+        if (conversationExpired(s)) m_agent.reset();
+        // A parole, senza "Fatto:" né JSON: il modello li copierebbe nelle sue risposte.
+        const std::string what = r.spoken.empty() ? r.shown : r.spoken;
+        m_agent.noteAction(text, std::string(r.ok ? "eseguito" : "non riuscito") + (what.empty() ? "" : " (" + what + ")"));
+    }
     // Come dopo una risposta: qualche secondo per il comando successivo senza dire "Iris".
     while (!m_stopping && !m_cancel && m_tts.isSpeaking()) Sleep(40);
     if (!m_cancel && s.followUpSeconds > 0) m_awakeUntilMs = nowMs() + kEchoGuardMs + s.followUpSeconds * 1000LL;
@@ -1340,7 +1542,7 @@ bool Assistant::runExtraTool(const std::string& name, const std::string& argumen
         if (speech && !t.empty()) say(t);
     }, cancel);
     addEntry(Entry::Kind::Tool, "Comando di gioco: " + r.shown);
-    result = (r.ok ? "Fatto: " : "Errore: ") + (r.shown.empty() ? r.spoken : r.shown) + (r.spoken.empty() || r.spoken == r.shown ? "" : " (" + r.spoken + ")");
+    result = gameToolResult(r);
     return true;
 }
 
@@ -1542,7 +1744,8 @@ void Assistant::tickRefinery() {
         const std::string where = j.place.empty() ? "" : " a " + j.place;
         addEntry(Entry::Kind::Tool, "Raffineria: ordine pronto" + where + (j.note.empty() ? "" : " (" + j.note + ")"));
         // Finito mentre Iris era spenta da un pezzo: solo scritto, niente voce all'avvio.
-        if (now - j.end > 10 * 60) continue;
+        // Finito con il PC sospeso (Iris accesa): la voce sì, appena il PC si risveglia.
+        if (j.beforeStart && now - j.end > 10 * 60) continue;
         if (s.refinerySpeak && s.speechEnabled) say("Ordine di raffineria pronto" + where + ".");
         else m_tts.chime(TtsEngine::Chime::Confirm);
     }

@@ -68,12 +68,22 @@ struct GameProfile {
     std::map<std::string, std::map<std::string, std::vector<std::string>>> aliases; // slot -> nome vero -> come lo pronunci
     StarMapSettings starMap;
     OcrSettings ocr;
+    // La versione dei predefiniti con cui il profilo è stato scritto: quando Iris aggiunge comandi,
+    // frasi, tasti, luoghi o correzioni, i profili di prima li ricevono una volta (i tuoi restano).
+    int defaultsVersion = 0;
+    static constexpr int kDefaultsVersion = 2;
 
     // Il profilo predefinito di Star Citizen (tasti predefiniti del gioco, comandi in italiano).
     static GameProfile defaults();
 
-    // Lettura tollerante (commenti // e /* */, virgole in più). false = JSON rotto.
+    // Lettura tollerante (commenti // /* */ e # a inizio riga, virgole in più o dimenticate a fine
+    // riga, virgolette “tipografiche”). false = JSON rotto: error dice riga e colonna.
     static bool parse(const std::string& json, GameProfile& out, std::string& error);
+
+    // Aggiunge quello che manca dei predefiniti: comandi nuovi, frasi nuove dei comandi che hai già
+    // (non quelle già usate da un altro comando), tasti, luoghi, correzioni. Niente si toglie e
+    // niente di tuo cambia. Ritorna quante cose ha aggiunto e porta defaultsVersion all'ultima.
+    int addMissingDefaults();
     std::string toJson() const;
 
     // La vecchia Iris (C#): settings.json + dictionary.json. Si parte dai
@@ -81,8 +91,10 @@ struct GameProfile {
     static bool importOldIris(const std::string& settingsJson, const std::string& dictionaryJson, GameProfile& out, std::string& error);
 };
 
-// Toglie commenti e virgole finali, per leggere i JSON scritti a mano.
-std::string relaxedJson(const std::string& text);
+// Toglie commenti e virgole finali (e aggiunge quelle dimenticate a fine riga), per leggere i JSON
+// scritti a mano. sourcePos, se c'è, riceve per ogni carattere del risultato la sua posizione nel
+// testo originale (per dire riga e colonna di un errore).
+std::string relaxedJson(const std::string& text, std::vector<size_t>* sourcePos = nullptr);
 
 // --- L'editor dei comandi (pagina Star Citizen) ----------------------------------------------------
 

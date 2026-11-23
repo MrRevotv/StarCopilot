@@ -42,8 +42,19 @@ namespace Updater {
     // La risposta di /releases/latest. Pura: provata nei test.
     bool parseRelease(const std::string& json, Release& out, std::string& error);
 
-    // L'ultima release pubblicata (rete).
-    bool fetchLatest(Release& out, std::string& error, const std::atomic<bool>* cancel);
+    // Un controllo non riuscito detto in italiano, e tra quanti minuti riprovare: GitHub che limita le
+    // richieste (403/429) va lasciato in pace un'ora, un errore suo (5xx) o la rete che manca mezz'ora.
+    // status = codice HTTP (0 se non è arrivata nessuna risposta). Pura: provata nei test.
+    struct Failure {
+        std::string text;
+        int retryMinutes = 240;
+    };
+    Failure describeFailure(int status, const std::string& networkError);
+    // Il ritardo dopo "failures" errori di fila: raddoppia a ogni errore, al massimo 4 ore. Pura.
+    int retryDelayMinutes(int baseMinutes, int failures);
+
+    // L'ultima release pubblicata (rete). retryMinutes (se non è riuscito): quando riprovare.
+    bool fetchLatest(Release& out, std::string& error, const std::atomic<bool>* cancel, int* retryMinutes = nullptr);
 
     std::wstring updatesDir(); // %appdata%\Iris\aggiornamenti
     // Il file dove sta (o starà) l'exe di quella versione, già controllato.
@@ -62,6 +73,14 @@ namespace Updater {
 
     // All'avvio: toglie l'exe vecchio e gli scaricati che non servono più.
     void cleanup();
+
+    // Una versione scaricata che, installata, non parte come quella versione (es. release pubblicata
+    // con l'exe sbagliato): si cancella e non si riscarica più, così Iris non si reinstalla in cerchio.
+    void markBroken(const std::string& version);
+    bool isBroken(const std::string& version);
+    // Da chiamare all'avvio dopo un aggiornamento (--dopo-aggiornamento): se c'è ancora uno scaricato
+    // più nuovo di questa versione, l'exe installato non era quello giusto e lo scaricato si scarta.
+    void confirmInstalled();
 
     // SHA-256 di un file, in esadecimale minuscolo.
     bool sha256File(const std::wstring& path, std::string& hex);
@@ -82,6 +101,7 @@ public:
         std::string pageUrl;
         std::string error;
         std::string checkedAt; // "21:43"
+        std::string retryAt;   // dopo un errore: a che ora riprova da sola ("22:13"), vuoto = tra 4 ore
         int progress = 0;      // 0-100 durante il download
     };
 
@@ -100,7 +120,7 @@ public:
 
 private:
     void loop();
-    void runCheck(bool manual);
+    int runCheck(bool manual); // minuti fino al prossimo controllo
     void set(const std::function<void(State&)>& change);
 
     mutable std::mutex m_mutex;
@@ -112,5 +132,6 @@ private:
     std::condition_variable m_cv;
     bool m_wake = false;
     bool m_manual = false;
+    int m_failures = 0; // controlli non riusciti di fila (per aspettare sempre di più)
     std::atomic<bool> m_stopping{ false };
 };

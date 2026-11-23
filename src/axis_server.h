@@ -41,6 +41,12 @@ public:
 
     std::string urlFor(const std::string& key) const { return "http://localhost:" + std::to_string(m_port) + "/" + key; }
 
+    // Solo richieste da questo computer e dalle pagine del server stesso: Host "localhost",
+    // "127.0.0.1" o "[::1]" (un sito che si fa passare per localhost, il "DNS rebinding", ha il suo
+    // nome) e Origin vuoto (OBS) o la pagina del server. Senza, un sito qualsiasi aperto nel browser
+    // potrebbe leggere dal WebSocket assi e tasti. Pura: provata nei test.
+    static bool allowedRequest(const std::string& host, const std::string& origin, int port);
+
 private:
     void acceptLoop();
     void serve(uintptr_t socket);

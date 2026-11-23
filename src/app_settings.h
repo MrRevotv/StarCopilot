@@ -28,6 +28,8 @@ struct AppSettings {
     std::string voiceEngine = "neurale"; // "neurale" (Qwen3-TTS, sulla scheda video) o "windows"
     std::string voiceName = "Elsa";       // parte del nome della voce di Windows
     std::string voiceEffect = "nessuno";  // effetto da macchina, apposta: "nessuno", "ia", "androide", "robot"
+    std::string neuralVoice = "aurora";   // la voce neurale: una predefinita (NeuralVoice::presets) o "file"
+    std::string neuralVoiceFile;          // il tuo WAV di riferimento, se neuralVoice = "file"
     std::string outputDeviceName;         // dove parla Iris (vuoto = uscita predefinita di Windows)
     double speechRate = 1.1;              // 0.5 - 2.0
 
@@ -43,6 +45,7 @@ struct AppSettings {
     int overlayX = -1, overlayY = -1;
     int windowX = -1, windowY = -1;
     int windowW = -1, windowH = -1;       // dimensione della finestra (a 96 DPI; -1 = quella di partenza)
+    bool windowMaximized = false;         // ingrandita l'ultima volta: si riapre ingrandita
 
     // --- Aggiornamenti ------------------------------------------------------------------
     bool autoUpdate = true;               // controlla e scarica da solo le versioni nuove (GitHub)

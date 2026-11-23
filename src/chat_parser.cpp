@@ -3,9 +3,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <cwchar>
+#include <vector>
 
 namespace {
     // Parentesi come le legge l'OCR quando il testo è piccolo: [ ( { < |
@@ -508,11 +510,111 @@ std::vector<ChatMessage> parse(const std::vector<std::string>& rawLines) {
     // Un messaggio senza testo (il resto è fuori dalla zona letta) non serve.
     std::vector<ChatMessage> result;
     for (auto& m : messages) {
+        // Due righe fuse dall'OCR con il canale della seconda letto male in mezzo ("...extra hands?
+        // IBALEJ BloodHeavenCResend..."): il messaggio finisce lì, il resto senza due punti non si capisce.
+        {
+            size_t start = 0;
+            while (start < m.body.size()) {
+                size_t end = m.body.find(' ', start);
+                if (end == std::string::npos) end = m.body.size();
+                const std::string token = m.body.substr(start, end - start);
+                const std::string c = start > 0 && token.size() >= 4 ? canonicalChannel(token) : std::string();
+                bool upper = !token.empty();
+                for (unsigned char ch : token) upper = upper && !std::islower(ch);
+                if (!c.empty() && token != c && upper) {
+                    m.body = TextUtils::trim(m.body.substr(0, start));
+                    break;
+                }
+                start = end + 1;
+            }
+        }
         if (m.body.empty()) continue;
         m.body = fixEnglishMisreads(m.body);
+        // I canali letti male tornano col loro nome: "[GLCBALE]", "[BALE]" -> "[GLOBALE]". Un pezzo
+        // di una o due lettere rimasto dopo ("[tGLOBA][E]") è la fine del nome: via.
+        std::vector<std::string> tags;
+        bool fixedBefore = false;
+        std::string lastCanonical;
+        for (const auto& t : m.tags) {
+            const std::string c = canonicalChannel(t);
+            if (fixedBefore && t.size() <= 2 && !lastCanonical.empty() &&
+                lastCanonical.size() > t.size() && lastCanonical.compare(lastCanonical.size() - t.size(), t.size(), t) == 0) {
+                continue;
+            }
+            fixedBefore = !c.empty() && c != t;
+            lastCanonical = c;
+            tags.push_back(c.empty() ? t : c);
+        }
+        m.tags = std::move(tags);
         result.push_back(std::move(m));
     }
     return result;
+}
+
+namespace {
+    // La distanza di modifica più piccola tra name e un pezzo qualsiasi di text (inizio e fine liberi).
+    size_t distanceInside(const std::string& text, const std::string& name) {
+        std::vector<size_t> prev(text.size() + 1, 0), cur(text.size() + 1);
+        for (size_t i = 1; i <= name.size(); ++i) {
+            cur[0] = i;
+            for (size_t j = 1; j <= text.size(); ++j) {
+                const size_t cost = name[i - 1] == text[j - 1] ? 0 : 1;
+                cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
+            }
+            std::swap(prev, cur);
+        }
+        return *std::min_element(prev.begin(), prev.end());
+    }
+}
+
+std::string canonicalChannel(const std::string& tag) {
+    // Solo lettere e cifre, in maiuscolo, con le cifre che somigliano a lettere. Ai bordi una
+    // minuscola o una I/J/L/1 di troppo è una quadra letta male ("tGLOBA", "OBALEJ").
+    std::string u;
+    std::vector<bool> edgeLike;
+    for (unsigned char c : tag) {
+        if (!std::isalnum(c)) continue;
+        const bool lower = std::islower(c) != 0;
+        char x = (char)std::toupper(c);
+        if (x == '0') x = 'O';
+        else if (x == '5') x = 'S';
+        else if (x == '8') x = 'B';
+        u += x;
+        edgeLike.push_back(lower || x == 'I' || x == 'J' || x == 'L' || x == '1');
+    }
+    if (u.empty()) return {};
+    for (const char* known : kKnownChannels) {
+        if (u == known) return known;
+    }
+    // GLOBALE tagliato: la fine ("BALE", "OBALE") o l'inizio ("GLOBA"), anche con una quadra
+    // letta male a un bordo. Prima del confronto con le lettere sbagliate: "GLOBA" è anche
+    // "GLOBAL" con una lettera in meno, ma nella chat di Iris (in italiano) è GLOBALE.
+    const std::string g = "GLOBALE";
+    for (int cutFront = 0; cutFront <= 1; ++cutFront) {
+        for (int cutBack = 0; cutBack <= 1; ++cutBack) {
+            if ((cutFront && !edgeLike.front()) || (cutBack && !edgeLike.back())) continue;
+            if ((int)u.size() - cutFront - cutBack < 4) continue;
+            const std::string core = u.substr((size_t)cutFront, u.size() - (size_t)cutFront - (size_t)cutBack);
+            if (core == "GLOBAL") continue; // il nome inglese, intero
+            if (core.size() >= 4 && core.size() < g.size() && g.compare(g.size() - core.size(), core.size(), core) == 0) return "GLOBALE";
+            if (core.size() >= 5 && core.size() < g.size() && g.compare(0, core.size(), core) == 0) return "GLOBALE";
+        }
+    }
+    // I nomi lunghi con una o due lettere sbagliate (due solo se non mancano lettere).
+    for (const char* known : { "GLOBALE", "GLOBAL", "GRUPPO" }) {
+        const std::string n = known;
+        if (u.size() > n.size() + 3) continue;
+        const size_t d = distanceInside(u, n);
+        const size_t allowed = n.size() >= 7 && u.size() >= n.size() ? 2 : 1;
+        if (d <= allowed) return known;
+    }
+    return {};
+}
+
+bool tooShortToTranslate(const std::string& text) {
+    int letters = 0;
+    for (wchar_t c : TextUtils::utf8ToWide(text)) letters += IsCharAlphaW(c) ? 1 : 0;
+    return letters < 3;
 }
 
 bool matchesFilter(const ChatMessage& message, const std::string& filterTag) {

@@ -44,6 +44,8 @@ public:
     WebBridge& operator=(const WebBridge&) = delete;
 
     void onMessage(const std::string& json);
+    // La pagina non c'è più (WebView2 ricaricato o ricreato): fino al suo "ready" non si manda niente.
+    void pageGone();
     void onEngineEvent(int event); // Assistant::Event
     void onUpdateChanged();
     void onTimer();                // circa 30 volte al secondo

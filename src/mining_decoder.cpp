@@ -43,14 +43,25 @@ namespace {
 
     // --- Candidati numerici dal testo dell'OCR ----------------------------------------
 
-    enum class Origin { Plain, Joined, Stripped };
+    // Plain: letto così; Joined: due pezzi uniti ("16 960"); Split: le prime tre cifre dopo la
+    // virgola, con altre cifre attaccate dietro ("11,5659.0kM": la distanza incollata);
+    // Stripped: senza la prima cifra (il segnaposto incollato davanti).
+    enum class Origin { Plain, Joined, Split, Stripped };
     struct Candidate {
         long long value;      // 0 = ci sono cifre illeggibili (vedi pattern)
         Origin origin;
         int digits;
         std::string pattern;  // le cifre, con '?' al posto di quelle illeggibili
         bool grouped = false; // scritto con la virgola delle migliaia ("16,960"): il formato del badge
+        std::string soft;     // come pattern: '1' dove la cifra viene da una lettera ("S" -> 5)
     };
+
+    bool weakOrigin(Origin o) { return o == Origin::Joined || o == Origin::Split; }
+
+    // Letto pulito, nella forma del badge: cifre vere e la virgola delle migliaia al posto giusto.
+    bool wellFormedCandidate(const Candidate& c) {
+        return c.origin == Origin::Plain && c.grouped && c.value > 0 && c.soft.find('1') == std::string::npos;
+    }
 
     bool isSep(char c) { return c == ',' || c == '.' || c == '\''; }
     bool isDigitLike(char c) { return isDigit(c) || c == '?'; }
@@ -70,42 +81,81 @@ namespace {
         }
     }
 
+    // L'unità di misura in fondo a una "parola" numerica: la distanza dell'HUD ("245m",
+    // "9.0km", "19.5kM", "5.0KTP", "11,5SS9.OkM" con la signature incollata davanti).
+    // Restituisce dove finisce il numero (j se non c'è un'unità).
+    size_t unitStart(const std::string& text, size_t i, size_t j) {
+        auto numberish = [](char c) { return isDigit(c) || isSep(c) || confusableDigit(c) != 0; };
+        for (size_t p = j; p-- > i + 1;) {
+            if (text[p] != 'k' && text[p] != 'K') continue;
+            bool lettersAfter = j - p <= 3;
+            for (size_t q = p + 1; q < j && lettersAfter; ++q) lettersAfter = std::isalpha((unsigned char)text[q]) != 0;
+            if (lettersAfter && numberish(text[p - 1])) return p;
+            break;
+        }
+        if (j - i >= 2 && (text[j - 1] == 'm' || text[j - 1] == 'M') && isDigit(text[j - 2])) return j - 1;
+        return j;
+    }
+
     // Dentro una "parola" fatta soprattutto di cifre ("l6,96O", "7,OCO", "17,08d"):
     // le lettere confondibili diventano cifre, le altre '?' (cifra illeggibile).
-    // Le parole vere ("Iron", "SHIP PORTS", "245m") restano come sono.
-    std::string cleanForNumbers(const std::string& text) {
+    // Le parole vere ("Iron", "SHIP PORTS") e le unità di misura ("245m") restano come sono.
+    // soft: lungo come il risultato, '1' dove la cifra viene da una lettera (la meno sicura).
+    std::string cleanForNumbers(const std::string& raw, std::string& soft) {
+        // Lo zero col taglio del carattere dell'HUD: l'OCR di Windows lo legge "ø" o "Ø"
+        // ("16.96ø", "3øø"). È uno zero vero, non una lettera.
+        std::string text;
+        text.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) {
+            const unsigned char c = (unsigned char)raw[i];
+            if (c == 0xC3 && i + 1 < raw.size() && ((unsigned char)raw[i + 1] == 0xB8 || (unsigned char)raw[i + 1] == 0x98)) {
+                text += '0';
+                ++i;
+            } else {
+                text += raw[i];
+            }
+        }
         std::string out;
+        soft.clear();
+        auto put = [&](char c, bool fromLetter) {
+            out += c;
+            soft += fromLetter ? '1' : '0';
+        };
         auto isWordByte = [](unsigned char c) { return std::isalnum(c) || c == '|' || c == '!' || c == '$' || c >= 0x80 || isSep((char)c); };
         size_t i = 0;
         while (i < text.size()) {
             if (!isWordByte((unsigned char)text[i])) {
-                out += text[i++];
+                put(text[i++], false);
                 continue;
             }
             size_t j = i;
             while (j < text.size() && isWordByte((unsigned char)text[j])) ++j;
+            const size_t end = unitStart(text, i, j);
             // Cifre vere, lettere "quasi cifre" (O, l, S...) e altre lettere.
             int digits = 0, similar = 0, letters = 0;
-            for (size_t k = i; k < j; ++k) {
+            for (size_t k = i; k < end; ++k) {
                 const unsigned char ch = (unsigned char)text[k];
                 if (isDigit((char)ch)) ++digits;
                 else if (isSep((char)ch) || (ch >= 0x80 && ch < 0xC0)) continue; // separatore o seguito di una lettera UTF-8
                 else if (confusableDigit((char)ch)) ++similar;
                 else ++letters;
             }
-            const bool hasSep = std::any_of(text.begin() + i, text.begin() + j, [](char ch) { return isSep(ch); });
+            const bool hasSep = std::any_of(text.begin() + i, text.begin() + end, [](char ch) { return isSep(ch); });
             const bool numberLike = (digits >= 1 && letters <= 2 && (digits + similar) * 2 >= digits + similar + letters) ||
                                     (digits == 0 && letters == 0 && similar >= 3 && hasSep); // "IS,soo" = 15,500
             if (numberLike) {
-                for (size_t k = i; k < j; ++k) {
+                for (size_t k = i; k < end; ++k) {
                     const unsigned char ch = (unsigned char)text[k];
-                    if (isDigit((char)ch) || isSep((char)ch)) out += (char)ch;
+                    if (isDigit((char)ch) || isSep((char)ch)) put((char)ch, false);
                     else if (ch >= 0x80 && ch < 0xC0) continue;
-                    else if (const char d = confusableDigit((char)ch)) out += d;
-                    else out += '?';
+                    else if (const char d = confusableDigit((char)ch)) put(d, true);
+                    else put('?', false);
                 }
+                // L'unità resta testo, staccata: non diventa una cifra e non si attacca al numero.
+                if (end < j) put(' ', false);
+                for (size_t k = end; k < j; ++k) put(text[k], false);
             } else {
-                out.append(text, i, j - i);
+                for (size_t k = i; k < j; ++k) put(text[k], false);
             }
             i = j;
         }
@@ -113,10 +163,14 @@ namespace {
     }
 
     std::vector<Candidate> candidatesIn(const std::string& rawText) {
-        const std::string s = cleanForNumbers(rawText);
+        std::string soft;
+        const std::string s = cleanForNumbers(rawText, soft);
         std::vector<Candidate> out;
-        auto add = [&](std::string pattern, Origin o, bool grouped = false) {
-            while (pattern.size() > 1 && pattern[0] == '0') pattern.erase(0, 1);
+        auto add = [&](std::string pattern, std::string mask, Origin o, bool grouped = false) {
+            while (pattern.size() > 1 && pattern[0] == '0') {
+                pattern.erase(0, 1);
+                mask.erase(0, 1);
+            }
             if (pattern.empty() || pattern.size() > 9) return;
             const size_t wild = (size_t)std::count(pattern.begin(), pattern.end(), '?');
             if (wild > 2) return;
@@ -125,7 +179,7 @@ namespace {
             for (const auto& c : out) {
                 if (c.pattern == pattern) return;
             }
-            out.push_back({ v, o, (int)pattern.size(), pattern, grouped });
+            out.push_back({ v, o, (int)pattern.size(), pattern, grouped, mask });
         };
 
         size_t i = 0;
@@ -134,48 +188,57 @@ namespace {
             // Primo gruppo: le cifre di fila.
             size_t j = i;
             while (j < s.size() && isDigitLike(s[j])) ++j;
-            const std::string first = s.substr(i, j - i);
+            const std::string first = s.substr(i, j - i), firstMask = soft.substr(i, j - i);
 
             // Gruppi delle migliaia con virgola, punto o apostrofo: "16,960", "1.234.567".
-            std::string grouped = first;
+            std::string grouped = first, groupedMask = firstMask;
             size_t k = j;
             bool usedHardSeparator = false;
             if (first.size() <= 3) {
                 while (k + 3 < s.size() && isSep(s[k]) && isDigitLike(s[k + 1]) && isDigitLike(s[k + 2]) && isDigitLike(s[k + 3]) &&
                        (k + 4 >= s.size() || !isDigitLike(s[k + 4]))) {
                     grouped += s.substr(k + 1, 3);
+                    groupedMask += soft.substr(k + 1, 3);
                     k += 4;
                     usedHardSeparator = true;
                 }
+                // Dopo la virgola più di tre cifre: un'altra cifra incollata dietro (la distanza,
+                // "11,5659.0kM"). Ipotesi debole: le prime tre.
+                if (!usedHardSeparator && k + 4 < s.size() && isSep(s[k]) && isDigit(s[k + 1]) && isDigit(s[k + 2]) && isDigit(s[k + 3]) &&
+                    isDigitLike(s[k + 4]) && first.find('?') == std::string::npos) {
+                    add(first + s.substr(k + 1, 3), firstMask + soft.substr(k + 1, 3), Origin::Split);
+                }
             }
             if (usedHardSeparator) {
-                add(grouped, Origin::Plain, true);
+                add(grouped, groupedMask, Origin::Plain, true);
                 i = k;
                 continue;
             }
 
             if (first.find('?') != std::string::npos) {
                 // Senza separatori una cifra illeggibile non si indovina: valgono i pezzi sicuri.
-                std::string part;
-                for (char ch : first) {
-                    if (ch == '?') {
-                        if (!part.empty()) add(part, Origin::Plain);
+                std::string part, partMask;
+                for (size_t c = 0; c < first.size(); ++c) {
+                    if (first[c] == '?') {
+                        if (!part.empty()) add(part, partMask, Origin::Plain);
                         part.clear();
+                        partMask.clear();
                     } else {
-                        part += ch;
+                        part += first[c];
+                        partMask += firstMask[c];
                     }
                 }
-                if (!part.empty()) add(part, Origin::Plain);
+                if (!part.empty()) add(part, partMask, Origin::Plain);
                 i = j;
                 continue;
             }
-            add(first, Origin::Plain);
+            add(first, firstMask, Origin::Plain);
 
             // Spazio come separatore ("16 960"): è un'ipotesi in più, non l'unica
             // (potrebbe essere il segnaposto letto come "2" seguito da "700").
             if (first.size() <= 3 && j + 4 <= s.size() && s[j] == ' ' && isDigit(s[j + 1]) && isDigit(s[j + 2]) && isDigit(s[j + 3]) &&
                 (j + 4 == s.size() || !isDigitLike(s[j + 4]))) {
-                add(first + s.substr(j + 1, 3), Origin::Joined);
+                add(first + s.substr(j + 1, 3), firstMask + soft.substr(j + 1, 3), Origin::Joined);
             }
             i = j;
         }
@@ -185,7 +248,7 @@ namespace {
         // ha la virgola dopo il "17", la prima cifra è vera.
         const size_t n = out.size();
         for (size_t c = 0; c < n; ++c) {
-            if (out[c].value >= 100000) add(std::to_string(out[c].value).substr(1), Origin::Stripped);
+            if (out[c].value >= 100000 && out[c].origin == Origin::Plain) add(std::to_string(out[c].value).substr(1), out[c].soft.substr(1), Origin::Stripped);
         }
         return out;
     }
@@ -397,7 +460,11 @@ std::string formatTable(const std::vector<Material>& materials) {
         if (a.kind != b.kind) return order(a.kind) < order(b.kind);
         return a.base < b.base;
     });
-    for (const auto& m : sorted) out += m.name + "," + std::to_string(m.base) + "," + (m.kind.empty() ? "minerale" : m.kind) + "\n";
+    for (const auto& m : sorted) {
+        // Un nome con la virgola ("Rame, puro") si scrive con il punto e virgola: si rilegge uguale.
+        const char* sep = m.name.find(',') != std::string::npos ? ";" : ",";
+        out += m.name + sep + std::to_string(m.base) + sep + (m.kind.empty() ? "minerale" : m.kind) + "\n";
+    }
     return out;
 }
 
@@ -447,15 +514,33 @@ Decoded decodeValue(int value, const std::vector<Material>& materials, int maxQu
     d.value = d.readValue = value;
     d.matches = findMatches(value, materials, maxQuantity);
     d.candidates = { value };
+    d.wellFormed = d.hasValue; // scritto o detto: è proprio quel numero
     return d;
 }
 
 Decoded decodeText(const std::string& ocrText, const std::vector<Material>& materials, int maxQuantity) {
     Decoded d;
     std::vector<Candidate> cands = candidatesIn(ocrText);
-    // Le signature sono sempre almeno di qualche centinaio: "2", "16" da soli sono pezzi o segnaposto.
+    // Una signature è almeno la firma base più piccola della tabella (2.000, lo Scrap): i numeri
+    // più piccoli sono altro dell'HUD (le tacche "280 300 320", "100%", "240") o pezzi ("2", "16").
+    int minBase = 0;
+    for (const auto& m : materials) {
+        if (m.base > 0 && (minBase == 0 || m.base < minBase)) minBase = m.base;
+    }
+    const long long minValue = std::max(100, minBase);
+    // E al massimo firma × quantità massima: due numeri dell'HUD uniti ("280 300" = 280.300) che
+    // vanno oltre non sono un'ipotesi da mostrare.
+    long long maxValue = 0;
+    for (const auto& m : materials) {
+        const int limit = m.kind == "roc" || m.kind == "fps" ? std::min(maxQuantity, 8) : maxQuantity;
+        maxValue = std::max(maxValue, (long long)std::max(0, m.base) * std::max(1, limit));
+    }
     cands.erase(std::remove_if(cands.begin(), cands.end(),
-                               [](const Candidate& c) { return c.value != 0 && (c.value < 100 || c.value > 9999999); }),
+                               [&](const Candidate& c) {
+                                   if (c.value == 0) return false;
+                                   if (c.value < minValue || c.value > 9999999) return true;
+                                   return weakOrigin(c.origin) && maxValue > 0 && c.value > maxValue;
+                               }),
                 cands.end());
     std::vector<Candidate> direct, stripped, wild;
     for (const auto& c : cands) {
@@ -487,12 +572,37 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
         d.matches = findMatches(d.value, materials, maxQuantity);
     };
 
+    // Le cifre venute da una lettera ("S" letta 5, "B" letta 8) potrebbero essere anche una
+    // cifra simile: i valori così, una cifra alla volta, che tornano con la tabella.
+    auto softAlternatives = [&](const Candidate& c) {
+        std::set<long long> out;
+        if (c.value <= 0) return out;
+        const std::string digits = std::to_string(c.value);
+        if (digits.size() != c.soft.size()) return out;
+        for (size_t pos = 0; pos < digits.size(); ++pos) {
+            if (c.soft[pos] != '1') continue;
+            for (const char* alt = similarDigits(digits[pos]); *alt; ++alt) {
+                std::string v = digits;
+                v[pos] = *alt;
+                if (v[0] == '0') continue;
+                const long long value = std::atoll(v.c_str());
+                if (value != c.value && matchesFix(value)) out.insert(value);
+            }
+        }
+        return out;
+    };
+    auto listOf = [](const std::set<long long>& values) {
+        std::string list;
+        for (long long f : values) list += (list.empty() ? "" : ", ") + withDots(f);
+        return list;
+    };
+
     // 1. Un numero letto così com'è che torna con la tabella. Prima quelli con la virgola delle
     //    migliaia (il formato del badge: "16,960"), poi i più lunghi; gli altri numeri dell'HUD
-    //    ("80 100", "245m") vengono dopo.
+    //    ("80 100", "245m") e le ipotesi (pezzi uniti) vengono dopo.
     auto better = [](const Candidate& a, const Candidate& b) {
         if (a.grouped != b.grouped) return a.grouped;
-        if ((a.origin == Origin::Joined) != (b.origin == Origin::Joined)) return b.origin == Origin::Joined;
+        if (weakOrigin(a.origin) != weakOrigin(b.origin)) return weakOrigin(b.origin);
         return a.digits > b.digits;
     };
     std::stable_sort(direct.begin(), direct.end(), better);
@@ -500,6 +610,14 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
         if (matches(c.value)) {
             choose(c.value, false, "");
             d.readValue = d.value;
+            d.wellFormed = wellFormedCandidate(c);
+            // Una lettera letta come cifra che potrebbe essere anche un'altra cifra in tabella:
+            // non è certa (con "S" = 5 o 6 si sbaglierebbe minerale a colpo sicuro).
+            const std::set<long long> other = softAlternatives(c);
+            if (!other.empty()) {
+                d.corrected = true;
+                d.note = "una lettera letta come cifra: forse " + listOf(other);
+            }
             return d;
         }
     }
@@ -510,6 +628,7 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
         if (!best || better(c, *best) || (!better(*best, c) && c.value > best->value)) best = &c;
     }
     if (best) d.readValue = (int)best->value;
+    const bool bestWellFormed = best && wellFormedCandidate(*best);
 
     // 2. Senza la prima cifra (il segnaposto incollato davanti a un numero da 6 cifre in su).
     for (const auto& c : stripped) {
@@ -533,6 +652,21 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
         return d;
     }
 
+    // 3b. Una lettera presa per cifra ("11,5SS" = 11.555, ma "S" può essere anche 6): si prova a
+    //     cambiare solo le cifre venute da lettere. Si accetta se la correzione possibile è una sola.
+    std::set<long long> softFixes;
+    const Candidate* softFrom = nullptr;
+    for (const auto& c : direct) {
+        for (long long v : softAlternatives(c)) {
+            softFixes.insert(v);
+            if (!softFrom) softFrom = &c;
+        }
+    }
+    if (softFixes.size() == 1) {
+        choose(*softFixes.begin(), true, "letto " + withDots(softFrom->value) + ", corretta una lettera presa per cifra");
+        return d;
+    }
+
     // 4. Una cifra confusa dall'OCR (8/0/3/6...): si accetta solo se la correzione possibile è una sola.
     std::set<long long> fixes;
     if (best) {
@@ -550,6 +684,7 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
     if (fixes.size() == 1) {
         choose(*fixes.begin(), true, "letto " + withDots(best->value) + ", corretta una cifra simile");
         d.digitFix = true;
+        d.wellFormed = bestWellFormed; // com'era scritto il numero letto (vedi readValue)
         return d;
     }
 
@@ -562,14 +697,12 @@ Decoded decodeText(const std::string& ocrText, const std::vector<Material>& mate
             strippedShown = true;
         }
         choose(shown, strippedShown, strippedShown ? "tolta la prima cifra (il segnaposto letto come numero)" : "");
+        d.wellFormed = !strippedShown && bestWellFormed;
         std::set<long long> maybe = fixes;
         maybe.insert(wildFixes.begin(), wildFixes.end());
-        if (maybe.size() > 1) {
-            std::string list;
-            for (long long f : maybe) list += (list.empty() ? "" : ", ") + withDots(f);
-            d.note = "forse " + list + " (cifra letta male dall'OCR)";
-        }
-    } else {
+        maybe.insert(softFixes.begin(), softFixes.end());
+        if (maybe.size() > 1) d.note = "forse " + listOf(maybe) + " (cifra letta male dall'OCR)";
+    } else if (!wildPattern.empty()) {
         // Solo cifre illeggibili: niente valore, ma si dice cosa si è visto.
         d.note = "cifre illeggibili: " + wildPattern;
         if (wildFixes.size() > 1) {

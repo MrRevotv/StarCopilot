@@ -39,4 +39,12 @@ namespace AppPaths {
     // Se contiene caratteri non ASCII usiamo il nome corto 8.3; altrimenti UTF-8.
     std::string toLibraryPath(const std::wstring& widePath);
 
+    // Scrive un file "tutto o niente": prima una copia a parte (path.tmp) mandata davvero sul
+    // disco, poi al posto di quello vero; il vecchio, se era buono, resta come path.bak.
+    // Se il PC si spegne a metà resta il file di prima, mai uno troncato.
+    bool writeFileSafely(const std::wstring& path, const std::string& content);
+    // Il contenuto del file; se manca o è vuoto (rovinato da uno spegnimento), quello di path.bak
+    // (fromBackup = true). false se non c'è né l'uno né l'altro.
+    bool readFileOrBackup(const std::wstring& path, std::string& content, bool* fromBackup = nullptr);
+
 } // namespace AppPaths

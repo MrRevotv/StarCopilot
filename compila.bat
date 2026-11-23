@@ -31,10 +31,12 @@ if not exist external\webview2\build\native\include\WebView2.h (
 )
 
 rem L'OCR del mining (PP-OCR) usa ONNX Runtime caricato al volo: per compilare serve solo
-rem il suo header C, della stessa versione della DLL che Iris scarica (1.20.1).
+rem il suo header C (1.20.1, licenza MIT), gia' nel repository in external\onnxruntime
+rem (preso dal pacchetto NuGet Microsoft.ML.OnnxRuntime 1.20.1: il repository GitHub
+rem di onnxruntime non e' piu' raggiungibile).
 if not exist external\onnxruntime\include\onnxruntime_c_api.h (
-    echo Scarico l'header di ONNX Runtime ^(1.20.1^)...
-    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force external\onnxruntime\include | Out-Null; Invoke-WebRequest 'https://raw.githubusercontent.com/microsoft/onnxruntime/v1.20.1/include/onnxruntime/core/session/onnxruntime_c_api.h' -OutFile external\onnxruntime\include\onnxruntime_c_api.h" || exit /b 1
+    echo Manca external\onnxruntime\include\onnxruntime_c_api.h ^(e' nel repository^).
+    exit /b 1
 )
 
 if not defined VULKAN_SDK (

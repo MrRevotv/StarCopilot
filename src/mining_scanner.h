@@ -163,6 +163,7 @@ private:
     int m_autoShown = 0;
     unsigned long long m_autoShownTick = 0;
     uint64_t m_autoLastHash = 0;
+    Reading m_autoLastRead; // l'ultima lettura vera (per lo schermo fermo)
 
     // Annuncio a voce: la roccia già detta (minerale, quantità, valore) e quando, per non ripeterla.
     std::string m_spokenKey;
@@ -175,6 +176,7 @@ public:
     static std::string spokenText(const Mining::Decoded& d);
 
     std::thread m_manualThread;
+    std::recursive_mutex m_manualControl; // inizio e fine del tastierino, uno alla volta
     std::atomic<DWORD> m_manualThreadId{ 0 };
     unsigned long long m_manualStartTick = 0;
 };

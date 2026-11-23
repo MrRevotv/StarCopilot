@@ -19,6 +19,19 @@ namespace GameInput {
     // una frase prese come comandi).
     std::recursive_mutex& inputLock();
 
+    // Iris sta mandando tasti o clic finti (o li ha mandati da pochissimo): i tasti globali
+    // (hotkey_listener) non li devono prendere per tasti premuti da te. Esempio vero: il "-" di
+    // "CRU-L1" si scrive col meno del tastierino, che è anche il tasto del mining a mano.
+    bool injectingInput();
+    // Per tutta la durata di un blocco di tasti finti (anche la chat, InputSender).
+    class InjectionScope {
+    public:
+        InjectionScope();
+        ~InjectionScope();
+        InjectionScope(const InjectionScope&) = delete;
+        InjectionScope& operator=(const InjectionScope&) = delete;
+    };
+
     // "F2" -> scancode (0xE0xx = tasti estesi), "0x3C" accettato. 0 = sconosciuto.
     unsigned short scanCode(const std::string& keyName);
     // "LAlt+N" -> {0x38, 0x31}. Vuoto se un tasto non esiste.
@@ -45,6 +58,8 @@ namespace GameInput {
     POINT cursorPosition();
 
     // La finestra del gioco: per nome del processo ("StarCitizen" = StarCitizen.exe), se no per titolo.
+    // Se il processo ne ha più d'una visibile, la più grande (le finestre "di servizio", larghe 0x0,
+    // non sono il gioco); una ridotta a icona conta con la sua misura normale.
     HWND findGameWindow(const std::string& processName, const std::string& windowTitle);
     bool isForeground(HWND window);
     // Star Citizen (StarCitizen.exe, o la finestra "Star Citizen") è la finestra in primo piano?
