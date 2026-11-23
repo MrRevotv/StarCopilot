@@ -20,6 +20,7 @@ namespace Cmd {
         double score = 0.0;
         std::map<std::string, std::string> slots; // es. destination = "Stazione Orbitale Seraphim"
         std::string phrase;                        // la frase del dizionario che ha vinto
+        std::string heard;                         // la frase detta, normalizzata e corretta (il pezzo che ha vinto)
     };
 
     // Minuscolo, senza accenti né punteggiatura, spazi singoli ("Modalità VTOL!" -> "modalita vtol").
@@ -38,6 +39,23 @@ namespace Cmd {
     std::string resolveAlias(const GameProfile& profile, const std::string& slot, const std::string& spoken, double* score = nullptr);
 
     // Il testo letto dall'OCR più simile a quello cercato (indice, o -1 sotto la soglia).
+    // Le lettere che l'OCR confonde contano uguali ("CRU-LI" = "Cru-L1", "ANNULIA" = "ANNULLA").
     int bestText(const std::vector<std::string>& candidates, const std::string& target, double threshold, double* score = nullptr);
+
+    // Normalizzato e con le lettere che l'OCR confonde portate a una sola: I/l/1/i -> l, O/0 -> o,
+    // S/5 -> s, B/8 -> b, rn -> m. Si usa su tutte e due le parti di un confronto.
+    std::string ocrFold(const std::string& text);
+    // Quanto il testo letto dall'OCR contiene quello cercato (0..1): il pezzo più simile tra le
+    // parole lette (la ricerca della mappa aggiunge il suggerimento: "CRU-L1 STAZIONE AMBITIOUS"),
+    // anche senza spazi ("ORISONORISON" contiene "ORISON").
+    double ocrContains(const std::string& read, const std::string& wanted);
+
+    // Il "verso" di una frase: +1 accendere/aprire/attivare/alzare, -1 spegnere/chiudere/
+    // disattivare/abbassare/annullare, 0 nessuno o tutti e due. Due frasi di verso opposto non si
+    // confondono mai ("disattiva gli scudi" non diventa "alza gli scudi").
+    int polarity(const std::string& normalized);
+    // C'è un verbo col pronome attaccato ("spegnile", "riaccendilo", "alzali"): la frase parla di
+    // qualcosa detto prima, non lo nomina.
+    bool hasPronounVerb(const std::string& normalized);
 
 } // namespace Cmd

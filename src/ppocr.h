@@ -41,7 +41,9 @@ namespace PpOcr {
 
     // Carica runtime e modello (una volta sola; poi è un controllo veloce). Thread-safe.
     bool load(std::string& error);
-    bool ready();
+    bool ready(); // caricato (non aspetta un caricamento in corso)
+    // Perché l'ultimo caricamento non è riuscito ("" = nessun errore, o non ancora provato).
+    std::string failure();
 
     // Una riga di testo (immagine in grigi, testo chiaro o scuro). Thread-safe.
     bool recognize(const MiningImage::Gray& image, Line& out, std::string& error);

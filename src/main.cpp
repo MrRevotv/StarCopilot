@@ -62,7 +62,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
         }
         if (!free) {
             // Iris è già aperta (magari nascosta nell'area di notifica): le si chiede di mostrarsi.
+            // Se si sta ancora aprendo (doppio clic due volte di fila) la finestra arriva tra poco.
             HWND other = FindWindowW(MainWindow::kClassName, nullptr);
+            for (int i = 0; i < 40 && !other && !fromWindows; ++i) {
+                Sleep(250);
+                other = FindWindowW(MainWindow::kClassName, nullptr);
+            }
             if (other && !fromWindows) {
                 DWORD pid = 0;
                 GetWindowThreadProcessId(other, &pid);
@@ -77,6 +82,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     AppPaths::ensureDirectoriesExist();
     Log::info("Iris " + Updater::currentVersion() + (afterUpdate ? " (appena aggiornata)" : ""));
     Updater::cleanup();
+    // Appena aggiornata: se l'exe installato non è la versione scaricata, quella non si riprova
+    // (se no a ogni avvio Iris si reinstallerebbe da sola, in cerchio).
+    if (afterUpdate) Updater::confirmInstalled();
     // Una versione nuova già scaricata e controllata: si installa subito, prima di
     // aprire la finestra e caricare i modelli (la nuova riparte da sola).
     if (!afterUpdate) {

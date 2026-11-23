@@ -100,6 +100,41 @@ namespace {
         for (size_t pos = 0; (pos = s.find(what, pos)) != std::string::npos; pos += with.size()) s.replace(pos, what.size(), with);
         return s;
     }
+
+    // Il valore di un'intestazione ("Host", "Origin"), vuoto se manca. lower = la richiesta in minuscolo.
+    std::string header(const std::string& request, const std::string& lower, const std::string& name) {
+        const std::string key = "\r\n" + TextUtils::toLower(name) + ":";
+        const size_t at = lower.find(key);
+        if (at == std::string::npos) return {};
+        const size_t start = at + key.size(), stop = request.find("\r\n", start);
+        return TextUtils::trim(request.substr(start, stop == std::string::npos ? std::string::npos : stop - start));
+    }
+
+    // "localhost:8787", "127.0.0.1", "[::1]:8787": questo computer (e, se c'è, la porta giusta)?
+    bool localHostAndPort(const std::string& text, int port) {
+        const std::string t = TextUtils::toLower(TextUtils::trim(text));
+        std::string host, rest;
+        if (!t.empty() && t[0] == '[') {
+            const size_t close = t.find(']');
+            if (close == std::string::npos) return false;
+            host = t.substr(1, close - 1);
+            rest = t.substr(close + 1);
+        } else {
+            const size_t colon = t.find(':');
+            host = t.substr(0, colon);
+            rest = colon == std::string::npos ? std::string() : t.substr(colon);
+        }
+        if (host != "localhost" && host != "127.0.0.1" && host != "::1") return false;
+        return rest.empty() || rest == ":" + std::to_string(port);
+    }
+}
+
+bool AxisServer::allowedRequest(const std::string& host, const std::string& origin, int port) {
+    if (!host.empty() && !localHostAndPort(host, port)) return false; // (HTTP/1.0 senza Host: va bene)
+    if (origin.empty()) return true;                                 // OBS, curl: nessuna pagina dietro
+    const std::string o = TextUtils::toLower(TextUtils::trim(origin));
+    const std::string prefix = "http://";
+    return o.rfind(prefix, 0) == 0 && localHostAndPort(o.substr(prefix.size()), port);
 }
 
 void AxisServer::setPages(std::string overlayHtml, std::string indexHtml) {
@@ -214,6 +249,11 @@ void AxisServer::acceptLoop() {
             if (!FD_ISSET((SOCKET)s, &set)) continue;
             SOCKET client = accept((SOCKET)s, nullptr, nullptr);
             if (client == INVALID_SOCKET) continue;
+            // Per OBS bastano poche connessioni: oltre, qualcosa non va (un programma che martella).
+            if (m_activeClients.load() >= 32) {
+                closesocket(client);
+                continue;
+            }
             ++m_activeClients;
             std::thread([this, client]() {
                 serve(client);
@@ -248,7 +288,9 @@ void AxisServer::serve(uintptr_t raw) {
 
     std::string lower = TextUtils::toLower(request);
     const size_t keyPos = lower.find("\r\nsec-websocket-key:");
-    if (lower.find("upgrade: websocket") != std::string::npos && keyPos != std::string::npos) {
+    if (!allowedRequest(header(request, lower, "Host"), header(request, lower, "Origin"), m_port)) {
+        sendHttp(s, 403, "Forbidden", "text/plain; charset=utf-8", "Solo da questo computer (OBS o le pagine di Iris).");
+    } else if (lower.find("upgrade: websocket") != std::string::npos && keyPos != std::string::npos) {
         const size_t start = keyPos + 20, stop = request.find("\r\n", start);
         const std::string key = TextUtils::trim(request.substr(start, stop - start));
         const std::string reply = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +

@@ -18,7 +18,7 @@
   --red: #ff5d6c;
   --text: #d6ecf3;
   --text-2: #8fa9b6;
-  --text-3: #57707e;
+  --text-3: #6b8796; /* spento, ma leggibile: contrasto 4,5:1 anche sui pannelli */
   --display: "Bahnschrift SemiCondensed", "Bahnschrift", "Segoe UI", sans-serif;
   --body: "Segoe UI Variable Text", "Segoe UI", sans-serif;
   --mono: "Cascadia Mono", "Consolas", monospace;
@@ -247,6 +247,8 @@ select {
   background-position: calc(100% - 17px) 55%, calc(100% - 12px) 55%; background-size: 5px 5px; background-repeat: no-repeat;
 }
 select option { background: #0b1520; color: var(--text); }
+select:hover:not(:disabled):not(:focus) { border-color: var(--line-3); }
+select:disabled { opacity: .45; cursor: default; }
 textarea.code { font: 12.5px/1.5 var(--mono); resize: vertical; min-height: 220px; }
 .inline-form { display: flex; gap: 10px; align-items: stretch; margin-top: 4px; }
 .inline-form input, .inline-form select { flex: 1; min-width: 0; }
@@ -382,6 +384,17 @@ pre.notes { margin: 12px 0 0; padding: 12px; max-height: 180px; overflow: auto; 
 .zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 14px; }
 .zone { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); background: rgba(2, 6, 10, .6); }
 .zone span { flex: 1; font-size: 13px; color: var(--text-2); }
+
+/* --- Star Citizen: telemetria del gioco ------------------------------------------------------------------- */
+.row-text small.telemetry-state { margin-top: 4px; font: 12px/1.4 var(--mono); color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.telemetry-state::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: var(--text-3); vertical-align: 1px; transition: background-color .18s, box-shadow .18s; }
+.telemetry-state.ok { color: var(--green); }
+.telemetry-state.ok::before { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.telemetry-state.warn { color: var(--amber); }
+.telemetry-state.warn::before { background: var(--amber); }
+.telemetry-help { padding-bottom: 12px; }
+.telemetry-cfg { display: flex; align-items: flex-start; gap: 12px; margin-top: 8px; }
+.telemetry-cfg .readout { flex: 1; min-width: 0; margin: 0; color: var(--cyan); white-space: pre; overflow-x: auto; }
 
 /* --- Aggiornamenti ----------------------------------------------------------------------------------------- */
 .update-box { padding: 14px 16px; border: 1px solid var(--line-2); background: rgba(2, 6, 10, .7); }
@@ -679,3 +692,60 @@ pre.notes { margin: 12px 0 0; padding: 12px; max-height: 180px; overflow: auto; 
 .check input { accent-color: var(--cyan); width: 15px; height: 15px; margin: 0; cursor: pointer; }
 .check:hover { color: var(--text); }
 .mlog-box .callout { margin: 16px 0 0; }
+/* --- Rifinitura: finestra piccola, tasti lunghi, stati da tastiera (regole aggiunte, non sostituite) ------- */
+/* Iris: la pagina riempie la finestra (la conversazione e la casella restano sempre a vista). */
+.page[data-page="home"].active { display: flex; flex-direction: column; height: 100%; min-height: 560px; padding-bottom: 24px; }
+.page[data-page="home"] .home { flex: 1 1 auto; height: auto; min-height: 0; }
+.convo-panel { min-height: 0; }
+/* Finestra stretta: la sfera diventa una striscia in alto, la conversazione prende il resto. */
+@media (max-width: 1080px) {
+  .page[data-page="home"] .home { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .orb-panel {
+    display: grid; grid-template-columns: 96px minmax(0, 1fr); column-gap: 20px; align-items: center; justify-items: start;
+    text-align: left; padding: 12px 20px;
+  }
+  #orb { grid-row: 1 / span 4; width: 96px; }
+  .orb-state { margin: 0; font-size: 20px; letter-spacing: .24em; }
+  .orb-detail { margin-top: 4px; min-height: 0; max-width: none; }
+  .orb-heard { margin-top: 4px; max-width: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
+  #retry { margin-top: 8px; }
+  .convo-panel { min-height: 320px; }
+}
+
+/* Finestra bassa: la barra laterale si stringe, così si vedono tutte le pagine anche a 620 px. */
+@media (max-height: 760px) {
+  .brand { padding: 14px 20px 10px; }
+  .brand-mark { width: 32px; height: 32px; }
+  .nav-group { margin: 10px 10px 4px; }
+  .nav-item { padding: 6px 12px; margin: 1px 0; }
+  .update-card { padding: 8px 12px; margin-bottom: 8px; }
+  .update-text { margin: 4px 0 8px; }
+  .status { margin-bottom: 12px; padding: 8px 12px; }
+  .status-text { -webkit-line-clamp: 2; margin-top: 4px; }
+}
+@media (max-height: 660px) {
+  .brand-sub { display: none; }
+  .nav-group { margin: 8px 10px 2px; }
+  .nav-item { padding: 5px 12px; }
+  .update-text { display: none; }
+}
+
+/* Tasti: il nome lungo di un joystick si taglia con «…» invece di andare a capo dentro il riquadro. */
+.key { min-width: 0; max-width: 100%; }
+.key-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key em.off { color: var(--text-3); }
+.keys-table { grid-template-columns: minmax(96px, 1fr) minmax(0, max-content); }
+.keys-table .cell { min-width: 0; }
+.keys-table .cell .key { max-width: 210px; }
+
+/* Stati dei controlli che mancavano: passaggio del mouse sugli interruttori, fuoco da tastiera,
+   campi disattivati. */
+.switch:hover i { border-color: var(--line-3); }
+.switch input:disabled + i { opacity: .4; }
+.switch input:disabled { cursor: default; }
+.key button:focus-visible, .phrase button:focus-visible, .ax-names summary:focus-visible, .check input:focus-visible,
+.ax-invert input:focus-visible, .history .item:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+input[type="text"]:disabled, select:disabled, textarea:disabled { opacity: .45; cursor: default; }
+.seg button:active, .ax-pick:active, .preset:active { transform: translateY(1px); }
+.seg button:disabled { opacity: .4; cursor: default; }
+.panel-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

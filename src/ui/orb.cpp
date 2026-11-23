@@ -23,15 +23,17 @@ namespace {
         return std::clamp((db + 55.0f) / 45.0f, 0.0f, 1.0f);
     }
 
+    // Gli stessi colori degli stati della pagina (app.css): verde ti ascolta, ambra pensa o si avvia,
+    // azzurro chiaro parla, rosso errore; a riposo il ciano scuro (--cyan-2), per non distrarre in gioco.
     void targetColor(Orb::Mode m, float out[3]) {
         COLORREF c;
         switch (m) {
-        case Orb::Mode::Listening: c = RGB(70, 220, 255); break;
-        case Orb::Mode::Thinking: c = RGB(240, 180, 60); break;
-        case Orb::Mode::Speaking: c = RGB(60, 200, 255); break;
-        case Orb::Mode::Error: c = RGB(230, 70, 70); break;
-        case Orb::Mode::Starting: c = RGB(200, 160, 60); break;
-        default: c = RGB(30, 150, 200); break;
+        case Orb::Mode::Listening: c = RGB(70, 227, 160); break;   // --green
+        case Orb::Mode::Thinking: c = RGB(246, 183, 64); break;    // --amber
+        case Orb::Mode::Speaking: c = RGB(158, 240, 255); break;   // [data-state="speaking"]
+        case Orb::Mode::Error: c = RGB(255, 93, 108); break;       // --red
+        case Orb::Mode::Starting: c = RGB(246, 183, 64); break;    // --amber
+        default: c = RGB(27, 156, 187); break;                     // --cyan-2
         }
         out[0] = GetRValue(c);
         out[1] = GetGValue(c);

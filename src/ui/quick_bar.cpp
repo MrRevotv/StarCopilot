@@ -36,7 +36,7 @@ namespace {
     constexpr double kPi = 3.14159265358979323846;
 
     // I colori dell'interfaccia (app.css).
-    const Color kText(255, 214, 236, 243), kText2(255, 143, 169, 182), kText3(255, 87, 112, 126);
+    const Color kText(255, 214, 236, 243), kText2(255, 143, 169, 182), kText3(255, 107, 135, 150); // --text-3 leggibile
     const Color kCyan(255, 63, 216, 245), kGreen(255, 70, 227, 160), kAmber(255, 246, 183, 64), kRed(255, 255, 93, 108);
 
     Color withAlpha(const Color& c, int a) { return Color((BYTE)std::clamp(a, 0, 255), c.GetR(), c.GetG(), c.GetB()); }

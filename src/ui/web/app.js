@@ -187,6 +187,11 @@ function renderSettings() {
   const chosen = voices.find((v) => v.toLowerCase().includes(wanted)) || voices[0];
   fillSelect($("#voice-select"), voices.map((v) => [v, v]), chosen);
   $$("#engine-seg button").forEach((b) => b.classList.toggle("on", b.dataset.engine === (s.voiceEngine === "windows" ? "windows" : "neurale")));
+  const neuralVoices = (S.lists.neuralVoices || []).map((v) => [v.id, v.label]);
+  if (s.neuralVoiceFile) neuralVoices.push(["file", "Il tuo file: " + s.neuralVoiceFile.split(/[\\/]/).pop()]);
+  neuralVoices.push(["pick", "Un tuo file WAV…"]);
+  fillSelect($("#neural-voice-select"), neuralVoices, s.neuralVoice);
+  $("#neural-voice-select").disabled = s.voiceEngine === "windows";
 
   // Traduzione chat
   const r = s.ocrRegion;
@@ -221,9 +226,11 @@ function setChip(sel, [kind, text]) {
 
 // --- Tasti (tastiera o joystick) -----------------------------------------------------------------------------
 function keyChip(k, onRemove) {
-  return h("span", { class: "key" + (k.shared ? " shared" : "") + (k.missing ? " missing" : ""), title: k.missing ? "Non collegato" : "" },
-    k.label, k.shared ? h("em", {}, "anche Iris") : null,
-    onRemove ? h("button", { type: "button", title: "Togli", onclick: onRemove }, "✕") : null);
+  // Il nome lungo di un joystick si taglia con «…»: intero nel suggerimento.
+  return h("span", { class: "key" + (k.shared ? " shared" : "") + (k.missing ? " missing" : ""), title: k.label + (k.missing ? " · non collegato" : "") },
+    h("span", { class: "key-label" }, k.label), k.shared ? h("em", {}, "anche Iris") : null,
+    k.missing ? h("em", { class: "off" }, "scollegato") : null,
+    onRemove ? h("button", { type: "button", title: "Togli", "aria-label": "Togli " + k.label, onclick: onRemove }, "✕") : null);
 }
 
 function renderKeys(target, keys) {
@@ -249,7 +256,7 @@ function renderMiningKeys(rows) {
     cells.push(h("div", { class: "cell" },
       capturing ? h("span", { class: "key-empty" }, "premi il tasto…") : keys.length ? keyChip(keys[0]) : h("span", { class: "key-empty" }, "— nessuno —"),
       h("button", { class: "btn small" + (capturing ? " busy" : ""), type: "button", onclick: () => post({ a: "captureKey", target }) }, capturing ? "Annulla" : "Cambia"),
-      keys.length ? h("button", { class: "btn small danger", type: "button", onclick: () => post({ a: "removeKey", target }) }, "Togli") : null));
+      keys.length ? h("button", { class: "icon-x", type: "button", title: "Togli il tasto", "aria-label": "Togli il tasto: " + name, onclick: () => post({ a: "removeKey", target }) }, "✕") : null));
   });
   host.replaceChildren(...cells);
   if (/^mining:[0-3]$/.test(S.captureText.target) && S.captureText.text) host.append(h("div", { class: "capture-hint", style: "grid-column: 1 / -1" }, S.captureText.text));
@@ -285,21 +292,47 @@ function scrollConvo(force) {
   if (force || convoStick) el.scrollTop = el.scrollHeight;
 }
 
+// Un messaggio della conversazione. Mentre Iris risponde cambia solo l'ultimo, più volte al secondo:
+// si aggiorna quello, senza ricreare (e rifar comparire) tutti gli altri.
+function fillBubble(node, e) {
+  const small = e.kind === "tool" || e.kind === "info";
+  node.className = `bubble ${e.kind}${e.pending ? " pending" : ""}`;
+  node.title = small ? "" : "Doppio clic per copiare";
+  node._text = e.text;
+  node.replaceChildren(e.text, ...(small && e.time ? [h("time", {}, "· " + e.time)] : []));
+  return node;
+}
+const sameEntry = (a, b) => !!a && !!b && a.kind === b.kind && a.time === b.time && a.text === b.text && a.pending === b.pending;
+
 function renderConversation(list) {
   const el = $("#convo");
   convoStick = el.scrollTop >= el.scrollHeight - el.clientHeight - 24;
   if (!list.length) {
+    el._entries = null;
     el.replaceChildren(h("div", { class: "convo-empty" },
       h("b", {}, "Canale aperto"),
       "Chiamala dicendo «Iris» e poi cosa ti serve: «Iris, carrello», «Iris, rotta per Crusader», «Iris, che minerale è?», «Iris, scrivi in chat: arrivo».",
       h("br"), "Oppure scrivile qui sotto."));
     return;
   }
-  el.replaceChildren(...list.map((e) => {
-    const small = e.kind === "tool" || e.kind === "info";
-    return h("div", { class: `bubble ${e.kind}${e.pending ? " pending" : ""}`, title: small ? "" : "Doppio clic per copiare", ondblclick: () => post({ a: "copy", text: e.text }) },
-      e.text, small && e.time ? h("time", {}, "· " + e.time) : null);
-  }));
+  const before = el._entries || [];
+  // Iris tiene gli ultimi 300 messaggi: in cima possono esserne usciti alcuni. (Se il conto sbaglia,
+  // il confronto riga per riga qui sotto rimette a posto lo stesso: costa solo un po' di più.)
+  let shift = before.findIndex((b, i) => i < 60 && sameEntry(b, list[0]));
+  if (shift < 0) shift = 0;
+  const bubble = (e) => fillBubble(h("div", { ondblclick: (ev) => post({ a: "copy", text: ev.currentTarget._text }) }), e);
+  if (el.children.length !== before.length) {
+    el.replaceChildren(...list.map(bubble)); // prima volta, o dopo il messaggio «Canale aperto»
+  } else {
+    for (let i = 0; i < shift; i++) el.firstElementChild.remove();
+    list.forEach((e, i) => {
+      const node = el.children[i];
+      if (!node) el.append(bubble(e));
+      else if (!sameEntry(before[shift + i], e)) fillBubble(node, e);
+    });
+    while (el.children.length > list.length) el.lastElementChild.remove();
+  }
+  el._entries = list.slice();
   scrollConvo(false);
 }
 
@@ -456,6 +489,11 @@ function renderGame(g) {
   $("#led-game").classList.toggle("on", !!g.running);
   $("#dry-run").checked = !!g.dryRun;
   $("#profile-error").textContent = g.profileError ? `Profilo non valido: ${g.profileError} (resta in uso quello di prima)` : "";
+  const tel = g.telemetry || {};
+  const telState = $("#telemetry-state");
+  telState.textContent = tel.text || "—";
+  telState.className = "telemetry-state " + (!tel.on ? "off" : tel.connected ? "ok" : "warn");
+  $(".telemetry-help").classList.toggle("hidden", !!tel.connected); // collegata: le righe per user.cfg non servono più
   const lines = [...g.actions];
   if (g.unrecognized.length) {
     lines.push(h("div", { class: "sep" }, "Frasi non capite dal profilo (passate al modello)"));
@@ -484,12 +522,12 @@ function renderUpdate(u) {
     uptodate: ["ok", `Hai l'ultima versione${u.checkedAt ? " (controllato alle " + u.checkedAt + ")" : ""}.`],
     downloading: ["warn", `Scarico la versione ${u.latest}… ${u.progress}%`],
     ready: ["warn", `Versione ${u.latest} pronta: si installa da sola al prossimo avvio, o subito con «Riavvia e aggiorna».`],
-    error: ["bad", `Controllo non riuscito: ${u.error}`],
+    error: ["bad", `Controllo non riuscito: ${u.error}.${u.retryAt ? " Riprovo da sola alle " + u.retryAt + "." : ""}`],
     disabled: ["", "Aggiornamenti automatici spenti: usa «Controlla ora»."],
   };
   const [kind, text] = texts[u.phase] || ["", ""];
   state.className = "update-state " + kind;
-  state.textContent = text + (u.phase === "ready" && u.error ? ` (ultimo tentativo: ${u.error})` : "");
+  state.textContent = text + (u.phase === "ready" && u.error ? ` (ultimo controllo non riuscito: ${u.error})` : "");
   const downloading = u.phase === "downloading";
   for (const bar of [$("#update-progress"), $("#update-card-progress")]) {
     bar.classList.toggle("hidden", !downloading);
@@ -515,16 +553,24 @@ function renderUpdate(u) {
 function toast(text, ok = true) {
   if (!text) return;
   const el = h("div", { class: "toast" + (ok ? "" : " bad") }, text);
-  $("#toasts").append(el);
+  const box = $("#toasts");
+  while (box.children.length >= 4) box.firstElementChild.remove(); // tanti di fila: restano gli ultimi
+  box.append(el);
   setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 320); }, ok ? 3200 : 6000);
 }
 
 function ask(title, text, buttons) {
   return new Promise((resolve) => {
     const modal = $("#modal");
+    const opener = document.activeElement; // il fuoco torna lì quando si chiude (tastiera)
     $("#modal-title").textContent = title;
     $("#modal-text").textContent = text;
-    const close = (value) => { modal.classList.add("hidden"); document.removeEventListener("keydown", onKey); resolve(value); };
+    const close = (value) => {
+      modal.classList.add("hidden");
+      document.removeEventListener("keydown", onKey);
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+      resolve(value);
+    };
     const onKey = (e) => { if (e.key === "Escape") close(null); };
     $("#modal-buttons").replaceChildren(...buttons.map(([label, value, kind]) => h("button", { class: "btn " + (kind || ""), type: "button", onclick: () => close(value) }, label)));
     modal.classList.remove("hidden");
@@ -629,6 +675,10 @@ function wire() {
   $("#output-select").addEventListener("change", (e) => post({ a: "setOutput", name: e.target.value }));
   $("#voice-select").addEventListener("change", (e) => post({ a: "setVoice", name: e.target.value }));
   $("#effect-select").addEventListener("change", (e) => post({ a: "setEffect", id: e.target.value }));
+  $("#neural-voice-select").addEventListener("change", (e) => {
+    if (e.target.value === "pick") e.target.blur(); // se annulli la scelta del file, la tendina torna alla voce di prima
+    post({ a: "setNeuralVoice", id: e.target.value });
+  });
   $$("#engine-seg button").forEach((b) => b.addEventListener("click", () => post({ a: "setEngine", engine: b.dataset.engine })));
 
   // Moduli con una casella e un pulsante
@@ -643,6 +693,7 @@ function wire() {
   form("#filter-form", (text) => { post({ a: "filterSave", tag: text }); return false; });
   form("#name-form", (text) => { post({ a: "set", k: "userName", v: text }); toast("Salvato."); return false; });
   $("#dry-run").addEventListener("change", (e) => post({ a: "dryRun", on: e.target.checked }));
+  $("#telemetry-copy").addEventListener("click", () => post({ a: "copy", text: $("#telemetry-cfg").textContent.trim().replace(/\n/g, "\r\n") }));
 
   // Mappa stellare
   const zones = ["Casella di ricerca (un punto)", "Zona dei risultati", "Pulsante Imposta rotta", "Pulsante Annulla (rotta attiva)"];

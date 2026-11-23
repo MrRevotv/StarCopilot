@@ -183,6 +183,17 @@ private:
     int m_emptyReads = 0;
     int m_ocrMaxDimension = 0;
     int m_ocrScale = 3;
+    // Dopo una scelta dell'ingrandimento non si riprova per un minuto: prima x2 e x3 si davano il
+    // cambio a ogni lettura (nel registro "testo alto 24 px, x2" / "19 px, x3" di continuo).
+    unsigned long long m_ocrScaleLockedUntil = 0;
+    // Gli ultimi messaggi tradotti, anche quelli già usciti dal riquadro: la stessa riga riletta
+    // male dopo un po' ("—-1 wasstuck In servererror...") non è un messaggio nuovo.
+    struct RecentMessage {
+        std::string key, player;
+        unsigned long long tick = 0;
+    };
+    std::deque<RecentMessage> m_recent;
+    std::string m_lastRepeat; // per scriverlo nel registro una volta sola
     std::string m_lastOcrText;
     std::string m_lastOcrError;
 };

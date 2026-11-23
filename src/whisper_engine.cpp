@@ -7,6 +7,7 @@
 #include "whisper.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
     void quietLog(ggml_log_level level, const char* text, void*) {
@@ -60,6 +61,21 @@ bool WhisperEngine::init(const std::string& modelPath, const std::string& vadMod
     m_threads = threads;
     m_onGpu = cp.use_gpu;
     m_gpuBytes = cp.use_gpu && usedBefore >= 0 ? std::max(0LL, Gpu::processMemory() - usedBefore) : 0;
+    if (m_onGpu) {
+        // La prima trascrizione sulla scheda video è lenta (prepara i suoi programmi: nel registro
+        // la prima frase dopo l'avvio arrivava a 1,6 s): una a vuoto adesso, su un secondo di suono
+        // finto. Senza il rilevatore di voce, se no non trascriverebbe niente.
+        std::vector<float> tone(SpeechUtils::kSampleRate);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = 0.05f * (float)std::sin(6.2831853 * 220.0 * (double)i / SpeechUtils::kSampleRate);
+        whisper_full_params wp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        wp.print_progress = wp.print_special = wp.print_realtime = wp.print_timestamps = false;
+        wp.language = "it";
+        wp.n_threads = threads;
+        wp.no_context = true;
+        wp.single_segment = true;
+        wp.max_tokens = 4;
+        whisper_full(ctx, wp, tone.data(), (int)tone.size());
+    }
     m_ready = true;
     Log::info("Whisper pronto (" +
               (cp.use_gpu ? "scheda video " + Gpu::bestDeviceName() + ", " + std::to_string(m_gpuBytes >> 20) + " MB"

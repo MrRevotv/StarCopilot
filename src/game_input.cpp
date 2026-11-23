@@ -15,6 +15,25 @@ std::recursive_mutex& inputLock() {
 }
 
 namespace {
+    std::atomic<int> g_injecting{ 0 };
+    std::atomic<unsigned long long> g_injectionEnd{ 0 };
+}
+
+bool injectingInput() {
+    // Un attimo anche dopo: il thread dei tasti globali legge lo stato ogni 8 ms.
+    return g_injecting.load() > 0 || GetTickCount64() - g_injectionEnd.load() < 150;
+}
+
+InjectionScope::InjectionScope() {
+    g_injecting++;
+}
+
+InjectionScope::~InjectionScope() {
+    g_injectionEnd = GetTickCount64();
+    g_injecting--;
+}
+
+namespace {
     struct KeyEntry { const char* name; unsigned short scan; };
     const KeyEntry kKeys[] = {
         { "Escape", 0x01 }, { "Esc", 0x01 }, { "1", 0x02 }, { "2", 0x03 }, { "3", 0x04 }, { "4", 0x05 }, { "5", 0x06 }, { "6", 0x07 },
@@ -136,6 +155,7 @@ void pressCombo(const std::string& combo, int holdMs, int gapMs, bool dryRun) {
         Sleep(gapMs);
         return;
     }
+    InjectionScope injecting;
     for (auto c : codes) keyEvent(c, false);
     Sleep(holdMs);
     for (auto it = codes.rbegin(); it != codes.rend(); ++it) keyEvent(*it, true);
@@ -152,6 +172,7 @@ void holdCombo(const std::string& combo, int ms, int gapMs, bool dryRun) {
         Log::info("[PROVA] terrei premuto " + combo + " per " + std::to_string(ms) + " ms");
         return;
     }
+    InjectionScope injecting;
     for (auto c : codes) keyEvent(c, false);
     Sleep(ms);
     for (auto it = codes.rbegin(); it != codes.rend(); ++it) keyEvent(*it, true);
@@ -163,6 +184,7 @@ void typeScanCodes(const std::string& text, int perCharMs, bool dryRun) {
         Log::info("[PROVA] scriverei \"" + text + "\"");
         return;
     }
+    InjectionScope injecting;
     for (wchar_t raw : TextUtils::utf8ToWide(text)) {
         const wchar_t ch = deaccent(raw);
         unsigned short sc = 0;
@@ -187,6 +209,7 @@ void typeUnicode(const std::string& text, int perCharMs, bool dryRun) {
         Log::info("[PROVA] scriverei (Unicode) \"" + text + "\"");
         return;
     }
+    InjectionScope injecting;
     for (wchar_t ch : TextUtils::utf8ToWide(text)) {
         INPUT in[2] = {};
         in[0].type = in[1].type = INPUT_KEYBOARD;
@@ -228,6 +251,7 @@ void click(int x, int y, bool smooth, int steps, int stepDelayMs, int settleMs, 
         return;
     }
     Sleep(120); // il gioco deve "vedere" il cursore fermo lì
+    InjectionScope injecting;
     mouseButton(MOUSEEVENTF_LEFTDOWN);
     Sleep(45);
     mouseButton(MOUSEEVENTF_LEFTUP);
@@ -237,7 +261,9 @@ void click(int x, int y, bool smooth, int steps, int stepDelayMs, int settleMs, 
 HWND findGameWindow(const std::string& processName, const std::string& windowTitle) {
     struct Search {
         std::wstring exe;
-        HWND found = nullptr;
+        HWND found = nullptr;      // la più grande
+        long long foundArea = -1;
+        HWND first = nullptr;      // la prima trovata (se nessuna ha un'area)
     } search;
     search.exe = TextUtils::utf8ToWide(lower(processName));
     if (!search.exe.empty() && search.exe.size() < 4) search.exe += L".exe";
@@ -262,13 +288,30 @@ HWND findGameWindow(const std::string& processName, const std::string& windowTit
             }
             CloseHandle(p);
             if (match) {
-                s->found = h;
-                return FALSE;
+                // Un processo può avere più finestre visibili: Esplora risorse ne ha di servizio
+                // larghe 0x0, prima di quelle vere. Si tiene la più grande.
+                if (!s->first) s->first = h;
+                long long area = 0;
+                if (IsIconic(h)) {
+                    WINDOWPLACEMENT wp{};
+                    wp.length = sizeof(wp);
+                    if (GetWindowPlacement(h, &wp)) {
+                        area = (long long)(wp.rcNormalPosition.right - wp.rcNormalPosition.left) * (wp.rcNormalPosition.bottom - wp.rcNormalPosition.top);
+                    }
+                } else {
+                    RECT cr{};
+                    if (GetClientRect(h, &cr)) area = (long long)(cr.right - cr.left) * (cr.bottom - cr.top);
+                }
+                if (area > 0 && area > s->foundArea) {
+                    s->found = h;
+                    s->foundArea = area;
+                }
             }
             return TRUE;
         },
         reinterpret_cast<LPARAM>(&search));
     if (search.found) return search.found;
+    if (search.first) return search.first;
     if (!windowTitle.empty()) return FindWindowW(nullptr, TextUtils::utf8ToWide(windowTitle).c_str());
     return nullptr;
 }
@@ -343,7 +386,10 @@ bool focus(HWND window) {
     alt[0].type = alt[1].type = INPUT_KEYBOARD;
     alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
     alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, alt, sizeof(INPUT));
+    {
+        InjectionScope injecting;
+        SendInput(2, alt, sizeof(INPUT));
+    }
     SetForegroundWindow(window);
     for (int i = 0; i < 10 && GetForegroundWindow() != window; ++i) Sleep(30);
     return GetForegroundWindow() == window;

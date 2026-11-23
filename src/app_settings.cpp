@@ -1,7 +1,9 @@
 #include "app_settings.h"
 #include "app_paths.h"
 #include "languages.h"
+#include "log.h"
 #include "text_utils.h"
+#include "neural_voice.h"
 #include "voice_effect.h"
 
 #include <windows.h>
@@ -50,13 +52,11 @@ namespace {
 }
 
 AppSettings AppSettings::load() {
-    std::ifstream file(AppPaths::settingsPath(), std::ios::binary);
     std::string content;
-    if (file.is_open()) {
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        content = buffer.str();
-    }
+    bool fromBackup = false;
+    // Il file rovinato (vuoto: il PC si è spento mentre si salvava) lascia il posto alla copia di sicurezza.
+    AppPaths::readFileOrBackup(AppPaths::settingsPath(), content, &fromBackup);
+    if (fromBackup) Log::warn("Impostazioni: settings.cfg vuoto o illeggibile, uso la copia di sicurezza (settings.cfg.bak)");
     // Anche senza file: parse() mette i valori predefiniti che dipendono dal file (tasti del mining).
     AppSettings s = parse(content);
     s.sanitize();
@@ -124,11 +124,14 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "voiceEngine") s.voiceEngine = v;
         else if (key == "voiceName") s.voiceName = v;
         else if (key == "voiceEffect") s.voiceEffect = v;
+        else if (key == "neuralVoice") s.neuralVoice = v;
+        else if (key == "neuralVoiceFile") s.neuralVoiceFile = v;
         else if (key == "outputDeviceName") s.outputDeviceName = v;
         else if (key == "speechRate") s.speechRate = toDouble(v, 1.1);
         else if (key == "llmModelFile") s.llmModelFile = v;
         else if (key == "gpuMemoryLimitMb") s.gpuMemoryLimitMb = toInt(v, -1);
         else if (key == "gameEnabled") s.gameEnabled = toBool(v);
+        else if (key == "gameTelemetryEnabled") s.gameTelemetryEnabled = toBool(v);
         else if (key == "overlayEnabled") s.overlayEnabled = toBool(v);
         else if (key == "overlayOpacity") s.overlayOpacity = toInt(v, 230);
         else if (key == "overlaySize") s.overlaySize = toInt(v, 160);
@@ -138,6 +141,7 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "windowY") s.windowY = toInt(v, -1);
         else if (key == "windowW") s.windowW = toInt(v, -1);
         else if (key == "windowH") s.windowH = toInt(v, -1);
+        else if (key == "windowMaximized") s.windowMaximized = toBool(v);
         else if (key == "autoUpdate") s.autoUpdate = toBool(v);
         // Chat di gioco (stesse chiavi di Voice to Chat)
         else if (key == "chatEnabled") s.chatEnabled = toBool(v);
@@ -283,11 +287,14 @@ std::string AppSettings::serialize() const {
     o << "voiceEngine=" << oneLine(voiceEngine) << "\n";
     o << "voiceName=" << oneLine(voiceName) << "\n";
     o << "voiceEffect=" << oneLine(voiceEffect) << "\n";
+    o << "neuralVoice=" << oneLine(neuralVoice) << "\n";
+    o << "neuralVoiceFile=" << oneLine(neuralVoiceFile) << "\n";
     o << "outputDeviceName=" << oneLine(outputDeviceName) << "\n";
     o << "speechRate=" << speechRate << "\n";
     o << "llmModelFile=" << oneLine(llmModelFile) << "\n";
     o << "gpuMemoryLimitMb=" << gpuMemoryLimitMb << "\n";
     o << "gameEnabled=" << (gameEnabled ? 1 : 0) << "\n";
+    o << "gameTelemetryEnabled=" << (gameTelemetryEnabled ? 1 : 0) << "\n";
     o << "overlayEnabled=" << (overlayEnabled ? 1 : 0) << "\n";
     o << "overlayOpacity=" << overlayOpacity << "\n";
     o << "overlaySize=" << overlaySize << "\n";
@@ -297,6 +304,7 @@ std::string AppSettings::serialize() const {
     o << "windowY=" << windowY << "\n";
     o << "windowW=" << windowW << "\n";
     o << "windowH=" << windowH << "\n";
+    o << "windowMaximized=" << (windowMaximized ? 1 : 0) << "\n";
     o << "autoUpdate=" << (autoUpdate ? 1 : 0) << "\n";
     auto writeTriggers = [&](const char* key, const std::vector<TalkTrigger>& list) {
         for (const auto& t : list) {
@@ -391,6 +399,14 @@ std::string AppSettings::serialize() const {
 }
 
 void AppSettings::sanitize() {
+    // Numeri non numeri ("nan", "inf" scritti a mano): std::clamp non li correggerebbe.
+    auto finite = [](auto& v, auto fallback) {
+        if (!std::isfinite(v)) v = fallback;
+    };
+    finite(micGain, 1.0f);
+    finite(vadThreshold, 0.5);
+    finite(speechRate, 1.1);
+    finite(silenceThreshold, 0.01);
     micGain = std::clamp(micGain, 0.2f, 8.0f);
     vadThreshold = std::clamp(vadThreshold, 0.1, 0.95);
     endSilenceMs = std::clamp(endSilenceMs, 300, 2500);
@@ -404,6 +420,9 @@ void AppSettings::sanitize() {
     if (voiceName.empty()) voiceName = "Elsa";
     if (voiceEngine != "neurale" && voiceEngine != "windows") voiceEngine = "neurale";
     if (!VoiceEffect::isValid(voiceEffect)) voiceEffect = "nessuno";
+    if (!NeuralVoice::isPreset(neuralVoice) && !(neuralVoice == NeuralVoice::kFileVoice && !neuralVoiceFile.empty())) {
+        neuralVoice = NeuralVoice::presets().front().id;
+    }
     // Chat di gioco (come in Voice to Chat)
     sourceLanguageIndex = clampLanguageIndex(sourceLanguageIndex);
     targetLanguageIndex = clampLanguageIndex(targetLanguageIndex);
@@ -429,16 +448,7 @@ void AppSettings::sanitize() {
 
 bool AppSettings::save() const {
     AppPaths::ensureDirectoriesExist();
-    const std::string content = serialize();
-    // Prima in un file a parte, poi al posto di quello vero: se il PC si
-    // spegne a metà, le impostazioni di prima restano buone.
-    const std::wstring path = AppPaths::settingsPath();
-    const std::wstring tmp = path + L".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f.is_open()) return false;
-        f << content;
-        if (!f.good()) return false;
-    }
-    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    // Prima in un file a parte mandato davvero sul disco, poi al posto di quello vero (il vecchio
+    // resta come settings.cfg.bak): se il PC si spegne a metà, le impostazioni di prima restano buone.
+    return AppPaths::writeFileSafely(AppPaths::settingsPath(), serialize());
 }

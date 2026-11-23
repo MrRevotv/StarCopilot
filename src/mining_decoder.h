@@ -11,10 +11,15 @@
 // Signature Calculator (divisibilità esatta), con la tabella di mining_ocr
 // (Scrap del salvage compreso) e in più:
 //  - le letture dell'OCR "sporche" ("2 16,960" col segnaposto letto come 2,
-//    "16.96O", "l6 960") si ripuliscono;
+//    "16.96O", "l6 960") si ripuliscono; le distanze dell'HUD ("19.5kM",
+//    "245m") e i numeri più piccoli della firma base più piccola (le tacche,
+//    "100%") non sono signature;
 //  - se il numero non torna con nessun materiale si prova a correggere UNA
-//    cifra confusa dall'OCR (8/3/6/0/9, 1/7, 5/6): si accetta solo se la
-//    correzione possibile è una sola, e il risultato è segnato "probabile".
+//    cifra confusa dall'OCR (8/3/6/0/9, 1/7, 5/6), prima al posto delle
+//    lettere lette come cifre ("11,5SS"): si accetta solo se la correzione
+//    possibile è una sola, e il risultato è segnato "probabile";
+//  - una lettera letta come cifra che potrebbe essere anche un'altra cifra in
+//    tabella toglie la certezza ("probabile", con l'alternativa nella nota).
 // Tutto puro: niente finestre né file (le prove lo usano direttamente).
 namespace Mining {
 
@@ -69,6 +74,11 @@ namespace Mining {
         int readValue = 0;         // il numero letto, prima di un'eventuale correzione
         bool corrected = false;    // valore corretto (segnaposto tolto, cifra illeggibile o confusa): "probabile"
         bool digitFix = false;     // corretta una cifra letta pulita ma simile (8/0/3...): la più incerta
+        // Il numero letto (readValue) ha la forma del badge: cifre vere con il separatore delle
+        // migliaia al posto giusto ("32,300"), niente lettere né cifre illeggibili; o è stato
+        // scritto/detto. Solo così una signature "sconosciuta" è una lettura vera, non un pezzo
+        // dell'HUD letto male ("021565", "1622 5.0M"): le altre non si annotano.
+        bool wellFormed = false;
         std::string note;          // perché è stato corretto, o i dubbi
         std::vector<Match> matches;
         std::vector<int> candidates; // i numeri trovati nel testo (per la diagnosi)

@@ -3,6 +3,7 @@
 #include "game_input.h"
 #include "log.h"
 #include "screen_ocr.h"
+#include "ship_toggle.h"
 #include "text_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -84,7 +85,8 @@ namespace {
         return out;
     }
 
-    // Il pulsante cercato: per etichetta esatta (quasi), se no per parola chiave.
+    // Il pulsante cercato: per etichetta esatta (quasi), se no per parola chiave. Le lettere che
+    // l'OCR confonde contano uguali ("ANNULIA" è "ANNULLA": così si perdeva la conferma della rotta).
     int findButton(const ScreenOcr::Result& r, const std::vector<std::string>& labels, const std::vector<std::string>& keywords) {
         const std::vector<std::string> t = texts(r);
         for (const auto& label : labels) {
@@ -92,13 +94,72 @@ namespace {
             if (i >= 0) return i;
         }
         for (size_t i = 0; i < t.size(); ++i) {
-            const std::string n = Cmd::normalize(t[i]);
+            const std::string n = Cmd::normalize(t[i]), f = Cmd::ocrFold(t[i]);
             if (n.size() < 4 || n.find("non valid") != std::string::npos || n.find("invalid") != std::string::npos) continue;
             for (const auto& k : keywords) {
-                if (n.find(k) != std::string::npos) return (int)i;
+                if (n.find(k) != std::string::npos || f.find(Cmd::ocrFold(k)) != std::string::npos) return (int)i;
             }
         }
         return -1;
+    }
+
+    // Il gioco dice "destinazione non valida" (il clic sul risultato non l'ha selezionata).
+    bool saysInvalid(const ScreenOcr::Result& r) {
+        for (const auto& h : r.hits) {
+            const std::string n = Cmd::normalize(h.text);
+            if (n.find("non valid") != std::string::npos || n.find("invalid") != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    // Il segnaposto della ricerca ("CERCA LOCALITÀ...", anche letto "q CERCA LOCALITÅ..."): il campo è vuoto.
+    bool isPlaceholder(const StarMapSettings& m, const std::string& text) {
+        if (Cmd::normalize(text).size() < 3) return false;
+        for (const auto& ph : m.searchPlaceholders) {
+            if (Cmd::ocrContains(text, ph) >= 0.75) return true;
+        }
+        return false;
+    }
+
+    // Quanto del campo deve cambiare perché i tasti siano arrivati (vedi ScreenOcr::textChange):
+    // sopra il cursore che lampeggia, sotto due lettere.
+    constexpr double kTypedChange = 0.0025;
+    // Quanto il testo letto nel campo deve somigliare al nome scritto.
+    constexpr double kTypedMatch = 0.7;
+
+    // L'area del gioco sullo schermo. In prova non si cattura niente di vero: se la finestra non ha
+    // area (ridotta a icona, o una finestra di servizio) va bene lo schermo principale.
+    bool gameArea(const GameProfile& p, HWND window, RECT& out, std::string& why, std::string& brief) {
+        if (!window) {
+            why = p.name + " non è aperto.";
+            brief = "Gioco chiuso.";
+            return false;
+        }
+        if (GameInput::clientRect(window, out)) return true;
+        if (p.dryRun) {
+            out = RECT{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+            return true;
+        }
+        if (IsIconic(window)) {
+            why = p.name + " è ridotto a icona: riaprilo, in finestra senza bordi, e riprova.";
+            brief = "Gioco ridotto a icona.";
+        } else {
+            why = "la finestra di " + p.name + " non ha un'area visibile: tienilo in finestra senza bordi.";
+            brief = "Finestra non visibile.";
+        }
+        return false;
+    }
+
+    std::string seconds(long long ms) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f s", ms / 1000.0);
+        return buf;
+    }
+
+    std::string percent(double fraction) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f%%", fraction * 100.0);
+        return buf;
     }
 
     std::string firstLines(const ScreenOcr::Result& r, int max) {
@@ -110,6 +171,13 @@ namespace {
             out += (out.empty() ? "" : " | ") + h.text;
         }
         return out;
+    }
+
+    // "Le armi sono già accese." -> "le armi sono già accese" (dentro una frase più lunga).
+    std::string sentenceInside(std::string s) {
+        while (!s.empty() && (s.back() == '.' || s.back() == ' ')) s.pop_back();
+        if (!s.empty() && s[0] >= 'A' && s[0] <= 'Z') s[0] = (char)(s[0] - 'A' + 'a');
+        return s;
     }
 
     const std::vector<std::string> kRouteKeywords = { "rotta", "percorso", "route", "destinazione", "destination" };
@@ -130,17 +198,34 @@ void GameController::load() {
     if (readFile(path, text)) {
         GameProfile p;
         std::string error;
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (GameProfile::parse(text, p, error)) {
-            m_profile = p;
-            m_profileError.clear();
-            Log::info("Profilo di gioco: " + std::to_string(p.commands.size()) + " comandi, " + std::to_string(p.keys.size()) + " tasti");
-        } else {
-            m_profileError = error;
-            Log::error("Profilo di gioco non valido (" + error + "): resta quello di prima");
+        const bool ok = GameProfile::parse(text, p, error);
+        int added = 0;
+        const bool upgrade = ok && p.defaultsVersion < GameProfile::kDefaultsVersion;
+        if (upgrade) {
+            // Comandi, frasi, luoghi e correzioni nuovi di Iris: una volta, senza toccare i tuoi.
+            // Il file di prima resta accanto (il salvataggio toglie i commenti scritti a mano).
+            const std::wstring backup = AppPaths::getAppDataDir() + L"\\star_citizen.prima-dei-predefiniti-" +
+                                        std::to_wstring(GameProfile::kDefaultsVersion) + L".json";
+            CopyFileW(path.c_str(), backup.c_str(), TRUE);
+            added = p.addMissingDefaults();
         }
-        m_profileTime = fileTime(path);
-        m_statusTime = {};
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (ok) {
+                m_profile = p;
+                m_profileError.clear();
+                Log::info("Profilo di gioco: " + std::to_string(p.commands.size()) + " comandi, " + std::to_string(p.keys.size()) + " tasti");
+            } else {
+                m_profileError = error;
+                Log::error("Profilo di gioco non valido (" + error + "): resta quello di prima");
+            }
+            m_profileTime = fileTime(path);
+            m_statusTime = {};
+        }
+        if (upgrade) {
+            Log::info("Profilo di gioco: aggiunte " + std::to_string(added) + " cose nuove dei predefiniti (comandi, frasi, tasti, luoghi, correzioni)");
+            saveProfile(p);
+        }
         return;
     }
     // Primo avvio: si importa la vecchia Iris (C#), se c'è.
@@ -225,32 +310,78 @@ bool GameController::gameInForeground() {
 }
 
 Cmd::Match GameController::match(const std::string& text) {
-    return Cmd::match(profile(), text);
+    const GameProfile p = profile();
+    Cmd::Match m = Cmd::match(p, text);
+    if (m.found) return m;
+    // "Allora spegnile!", "riaccendile", "alzali": l'ultimo interruttore usato (da poco), col verso detto
+    // adesso. Prima la frase finiva al modello, che a volte sceglieva un altro interruttore (gli scudi
+    // invece delle armi appena nominate).
+    const std::string heard = Cmd::applyCorrections(Cmd::normalize(text), p.corrections);
+    if (Cmd::polarity(heard) == 0 || !Cmd::hasPronounVerb(heard)) return m;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_hasLast || m_last.command.intent != "press" || Clock::now() - m_lastTime > std::chrono::minutes(3)) return m;
+    const auto key = m_last.command.args.find("key");
+    if (key == m_last.command.args.end() || ShipToggle::fieldFor(key->second) == ShipToggle::Field::None) return m;
+    Cmd::Match follow = m_last;
+    follow.found = true;
+    follow.score = 0.9;
+    follow.heard = heard; // il verso viene da qui ("spegnile" = spegni)
+    follow.slots.clear();
+    return follow;
 }
 
 GameController::Result GameController::execute(const Cmd::Match& match, const std::function<void(const std::string&)>& say,
                                                const std::atomic<bool>* cancel) {
+    return executeWith(match, {}, say, cancel);
+}
+
+GameController::Result GameController::executeWith(const Cmd::Match& match, const std::string& state,
+                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
     if (!match.found) return { false, "", "Non è un comando di gioco.", "" };
     if (match.command.intent == "repeat") {
         Cmd::Match last;
+        std::string lastState;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_hasLast) return { false, "Non ho niente da ripetere.", "Niente da ripetere.", "Niente da ripetere." };
             last = m_last;
+            lastState = m_lastState;
         }
-        return run(last.command, last.slots, say, cancel);
+        return run(last, lastState, say, cancel);
     }
-    Result r = run(match.command, match.slots, say, cancel);
+    Result r = run(match, state, say, cancel);
     if (r.ok && match.command.intent != "status" && match.command.intent != "toggle_dry_run") {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_last = match;
+        m_lastState = state;
+        m_lastTime = Clock::now();
         m_hasLast = true;
     }
     return r;
 }
 
+void GameController::setShipStateProvider(ShipStateProvider provider) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_shipState = std::move(provider);
+}
+
+std::optional<ScTelemetry::ShipState> GameController::shipState() {
+    ShipStateProvider provider;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        provider = m_shipState;
+    }
+    if (!provider) return std::nullopt;
+    try {
+        return provider();
+    } catch (...) {
+        return std::nullopt; // la telemetria non deve mai fermare un comando
+    }
+}
+
 GameController::Result GameController::executeById(const std::string& id, const std::string& destination,
-                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
+                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel,
+                                                   const std::string& state, const std::string& heard) {
     const GameProfile p = profile();
     Cmd::Match m;
     for (const auto& c : p.commands) {
@@ -272,7 +403,16 @@ GameController::Result GameController::executeById(const std::string& id, const 
         m.slots["destination"] = canonical.empty() ? TextUtils::trim(destination) : canonical;
     }
     m.score = 1.0;
-    return execute(m, say, cancel);
+    // Il verso: quello dato dal modello (state); se non c'è, dalla richiesta dell'utente, ma solo dal pezzo
+    // che parla di questo interruttore ("alza gli scudi, poi carrello": per il carrello niente verso).
+    auto key = m.command.args.find("key");
+    const ShipToggle::Field field = key == m.command.args.end() ? ShipToggle::Field::None : ShipToggle::fieldFor(key->second);
+    if (field != ShipToggle::Field::None) {
+        std::vector<std::string> parts = ShipToggle::clauses(heard);
+        for (auto& part : parts) part = Cmd::applyCorrections(part, p.corrections);
+        m.heard = ShipToggle::clauseAbout(field, parts);
+    }
+    return executeWith(m, state, say, cancel);
 }
 
 bool GameController::prepareGame(const GameProfile& p, HWND& window, std::string& why, std::string& brief) {
@@ -310,12 +450,13 @@ void GameController::pressLogical(const GameProfile& p, const std::string& logic
     note = combo;
 }
 
-GameController::Result GameController::run(const GameCommand& command, const std::map<std::string, std::string>& slots,
+GameController::Result GameController::run(const Cmd::Match& match, const std::string& state,
                                            const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
+    const GameCommand& command = match.command;
     GameProfile p = profile();
     auto slotValue = [&](const char* name) {
-        auto it = slots.find(name);
-        return it == slots.end() ? std::string() : it->second;
+        auto it = match.slots.find(name);
+        return it == match.slots.end() ? std::string() : it->second;
     };
     const std::string destination = slotValue("destination");
     const std::string sayText = replaceAll(command.say, "{destination}", destination);
@@ -337,8 +478,77 @@ GameController::Result GameController::run(const GameCommand& command, const std
         return { true, st.text, st.text, !st.running ? "Gioco chiuso." : st.elevationProblem ? "Serve amministratore." : "Tutto pronto." };
     }
 
+    const std::string prefix = p.dryRun ? "[prova] " : "";
+
+    // La telemetria: com'è la nave prima di premere un tasto "interruttore" (vedi ship_toggle.h).
+    // Senza (nullopt) tutto resta come sempre.
+    using ShipToggle::Field;
+    using ShipToggle::Value;
+    auto wantFor = [&](Field f) {
+        int want = state.empty() ? 0 : ShipToggle::wantedFromState(f, state);
+        if (want == 0) want = ShipToggle::wanted(f, match.heard, match.phrase);
+        if (want == 0 && intent == "sequence") want = ShipToggle::commandDirection(f, command.phrases);
+        return want;
+    };
+    ShipToggle::Env env;
+    env.state = [this]() { return shipState(); };
+    env.press = [&](const std::string& logical, bool& ok) {
+        std::string n;
+        pressLogical(p, logical, n);
+        ok = n.find("nessun tasto") == std::string::npos;
+        return n;
+    };
+    env.wait = [&](int ms) {
+        if (cancelled(cancel)) return false;
+        Sleep(ms);
+        return !cancelled(cancel);
+    };
+    env.pause = [&]() { return stepPause(p, cancel); };
+    env.cancelled = [&]() { return cancelled(cancel); };
+    env.dryRun = p.dryRun;
+
+    Field toggleField = Field::None;
+    Value toggleNow = Value::Unknown;
+    ShipToggle::Plan togglePlan;
+    std::vector<std::string> steps;
+    bool sequenceWithState = false;
+    if (intent == "press") {
+        toggleField = ShipToggle::fieldFor(arg("key"));
+        if (toggleField != Field::None) {
+            if (const auto st = shipState()) toggleNow = ShipToggle::read(toggleField, *st);
+        }
+        if (toggleNow != Value::Unknown) {
+            togglePlan = ShipToggle::plan(toggleField, wantFor(toggleField), toggleNow);
+            if (!togglePlan.press) {
+                // Già come lo vuoi: niente tasto, e il gioco non serve davanti.
+                auto it = p.keys.find(arg("key"));
+                const std::string combo = it != p.keys.end() ? it->second : arg("key");
+                Log::info("Telemetria: " + togglePlan.spoken + " Non premo " + combo + " (" + arg("key") + ")");
+                Result r{ true, togglePlan.spoken, prefix + arg("key") + ": niente da premere, " + sentenceInside(togglePlan.spoken) + " (lo dice la telemetria)",
+                          togglePlan.brief };
+                addAction(r.shown);
+                return r;
+            }
+        }
+    } else if (intent == "sequence") {
+        steps = ShipToggle::splitSteps(arg("keys"));
+        if (const auto st = shipState()) {
+            for (const auto& step : steps) {
+                if (ShipToggle::read(ShipToggle::fieldFor(step), *st) != Value::Unknown) sequenceWithState = true;
+            }
+            if (sequenceWithState && ShipToggle::nothingToPress(steps, wantFor, *st)) {
+                // Tutto già a posto: niente tasti (la sequenza non ne preme nessuno).
+                const ShipToggle::Outcome o = ShipToggle::sequence(steps, wantFor, sayText, env);
+                Log::info("Telemetria: " + o.shown);
+                Result r{ o.ok, o.spoken, prefix + o.shown, o.brief };
+                addAction(r.shown);
+                return r;
+            }
+        }
+    }
+
     // Un messaggio in chat in corso finisce prima: i tasti non si mescolano.
-    std::lock_guard<std::recursive_mutex> keys(GameInput::inputLock());
+    std::unique_lock<std::recursive_mutex> keys(GameInput::inputLock());
     HWND window = nullptr;
     std::string why, whyBrief;
     if (!prepareGame(p, window, why, whyBrief)) {
@@ -346,7 +556,6 @@ GameController::Result GameController::run(const GameCommand& command, const std
         return { false, why, why, whyBrief };
     }
 
-    const std::string prefix = p.dryRun ? "[prova] " : "";
     std::string note;
     Result r;
     if (intent == "press") {
@@ -355,6 +564,25 @@ GameController::Result GameController::run(const GameCommand& command, const std
         r.shown = prefix + (r.ok ? arg("key") + " (" + note + ")" : note);
         r.spoken = r.ok ? sayText : "Non ho un tasto per " + arg("key") + " nel profilo.";
         if (!r.ok) r.brief = "Tasto mancante.";
+        if (r.ok && toggleNow != Value::Unknown) {
+            if (p.dryRun) {
+                // In prova non si preme niente: lo stato resta quello di prima.
+                r.shown += ", telemetria: " + ShipToggle::name(toggleField) + " " + ShipToggle::valueText(toggleField, toggleNow);
+            } else {
+                // Dopo il tasto: è cambiato davvero? Si risponde con lo stato nuovo. Intanto la tastiera è libera
+                // (un messaggio in chat non aspetta la verifica).
+                keys.unlock();
+                const ShipToggle::Outcome o = ShipToggle::afterPress(toggleField, togglePlan.target, note, env);
+                if (o.used) {
+                    r.ok = o.ok;
+                    r.spoken = o.spoken;
+                    r.brief = o.brief;
+                    r.shown += ", " + o.shown;
+                    if (o.ok) Log::info("Premuto " + note + " (" + arg("key") + "), " + o.shown);
+                    else Log::warn("Telemetria: " + o.spoken);
+                }
+            }
+        }
     } else if (intent == "hold") {
         const std::string logical = arg("key");
         auto it = p.keys.find(logical);
@@ -366,6 +594,16 @@ GameController::Result GameController::run(const GameCommand& command, const std
         r.shown = prefix + logical + " tenuto " + std::to_string(ms) + " ms (" + combo + ")";
         r.spoken = r.ok ? sayText : "Non ho un tasto per " + logical + ".";
         if (!r.ok) r.brief = "Tasto mancante.";
+    } else if (intent == "sequence" && sequenceWithState) {
+        // Con la telemetria: i passi già a posto si saltano, dopo l'alimentazione si aspetta la nave.
+        const ShipToggle::Outcome o = ShipToggle::sequence(steps, wantFor, sayText, env);
+        if (o.interrupted) return { false, "", "Sequenza interrotta." };
+        r.ok = o.ok;
+        r.spoken = o.spoken;
+        r.brief = o.brief;
+        r.shown = prefix + o.shown;
+        if (o.ok) Log::info("Telemetria, " + o.shown);
+        else Log::warn("Telemetria, " + o.shown);
     } else if (intent == "sequence") {
         std::string keys = arg("keys"), done;
         r.ok = true;
@@ -434,105 +672,181 @@ GameController::Result GameController::setRoute(const GameProfile& p, const std:
     const auto& ocr = p.ocr;
     HWND window = GameInput::findGameWindow(p.processName, p.windowTitle);
     RECT game;
-    if (!GameInput::clientRect(window, game)) return { false, p.name + " non è aperto.", "Gioco non trovato.", "Gioco chiuso." };
+    std::string why, whyBrief;
+    if (!gameArea(p, window, game, why, whyBrief)) return { false, why, "Rotta per " + destination + " non impostata: " + why, whyBrief };
+    const auto started = Clock::now();
     std::string note;
+    bool mapOpen = p.dryRun;
+    // La mappa si chiude solo se si è vista aperta: Esc a mappa chiusa aprirebbe il menu del gioco.
     auto fail = [&](const std::string& msg, bool closeMap) {
-        if (closeMap) pressLogical(p, "cancel", note);
+        if (closeMap && mapOpen) pressLogical(p, "cancel", note);
         Log::warn("Rotta: " + msg);
         return Result{ false, msg, "Rotta per " + destination + " non impostata: " + msg, "Rotta non riuscita." };
     };
 
-    // 1) La mappa: si aspetta che la casella di ricerca compaia (non un tempo fisso).
+    // 1) La mappa: si aspetta che la casella di ricerca compaia (non un tempo fisso). Vale il
+    //    segnaposto ("CERCA LOCALITÀ", anche letto male) o del testo fermo per due letture (una
+    //    ricerca di prima rimasta nel campo).
+    const RECT boxZone = zoneRect(game, p, Zone::SearchBox);
     pressLogical(p, "map", note);
-    bool mapOpen = p.dryRun;
+    std::string inField, previous;
     for (auto t0 = Clock::now(); !mapOpen && elapsedMs(t0) < m.mapOpenTimeoutMs;) {
-        if (cancelled(cancel)) return fail("Interrotto.", true);
+        if (cancelled(cancel)) return fail("Interrotto.", false);
         Sleep(250);
-        const ScreenOcr::Result r = ScreenOcr::read(zoneRect(game, p, Zone::SearchBox), ocr, "");
-        const std::string txt = Cmd::normalize(ScreenOcr::linesText(r));
-        // Il segnaposto ("CERCA LOCALITÀ") o del testo già scritto: la casella c'è.
-        if (txt.size() >= 3) mapOpen = true;
-        for (const auto& ph : m.searchPlaceholders) {
-            if (txt.find(Cmd::normalize(ph)) != std::string::npos) mapOpen = true;
+        const ScreenOcr::Result r = ScreenOcr::readUntil(boxZone, ocr, "", [&](const ScreenOcr::Result& x) {
+            return isPlaceholder(m, ScreenOcr::linesText(x));
+        });
+        const std::string txt = TextUtils::collapseSpaces(ScreenOcr::linesText(r));
+        if (isPlaceholder(m, txt)) {
+            mapOpen = true;
+        } else if (Cmd::normalize(txt).size() >= 3 && Cmd::normalize(txt) == Cmd::normalize(previous)) {
+            mapOpen = true;
+            inField = txt;
         }
+        previous = txt;
     }
-    if (!mapOpen) Log::warn("Rotta: non vedo la casella di ricerca della mappa, provo lo stesso");
+    if (!mapOpen) {
+        // Senza la mappa le lettere del nome andrebbero alla nave (R, U, I, O... spengono i sistemi).
+        return fail("non vedo la mappa stellare aperta, quindi non scrivo il nome: i tasti andrebbero alla nave. Controlla il tasto "
+                    "della mappa nel profilo (F2) o ricalibra la casella di ricerca nella pagina Star Citizen.",
+                    false);
+    }
+    if (!p.dryRun) {
+        Log::info("Rotta: mappa aperta in " + seconds(elapsedMs(started)) + (inField.empty() ? "" : ", nel campo c'è già \"" + inField + "\""));
+    }
     if (!stepPause(p, cancel)) return fail("Interrotto.", true);
 
-    // 2) Il nome nella ricerca, verificato con l'OCR: se il campo resta vuoto si riclicca e si riscrive.
+    // 2) Il nome nella ricerca. Verifica in due modi: l'OCR legge il nome nel campo, oppure il
+    //    campo è cambiato (testo chiaro comparso: i tasti sono arrivati anche se l'OCR non lo legge,
+    //    il bianco sul vetro chiaro si perde). Si riprova solo se il campo è rimasto com'era: così il
+    //    nome non si scrive due volte ("ORISONORISON").
     const POINT box{ game.left + (LONG)((game.right - game.left) * m.searchBoxX), game.top + (LONG)((game.bottom - game.top) * m.searchBoxY) };
     bool typed = p.dryRun;
-    std::string seen;
+    bool dirty = !inField.empty(); // una ricerca di prima nel campo: si cancella prima di scrivere
+    std::string seen = inField;
     const int attempts = std::max(1, m.typingAttempts);
     for (int attempt = 1; attempt <= attempts && !typed; ++attempt) {
         if (cancelled(cancel)) return fail("Interrotto.", true);
-        GameInput::click(box.x, box.y, m.smoothMouseMove, m.mouseMoveSteps, m.mouseMoveStepDelayMs, m.focusSettleMs, p.dryRun);
-        if (attempt > 1) GameInput::click(box.x, box.y, false, 1, 0, m.focusSettleMs, p.dryRun); // secondo clic: il campo a volte non prende il fuoco
-        if (!stepPause(p, cancel)) return fail("Interrotto.", true);
-        if (m.clearFieldFirst) {
-            GameInput::pressCombo("LCtrl+A", p.keyHoldMs, 60, p.dryRun);
-            GameInput::pressCombo("Delete", p.keyHoldMs, 60, p.dryRun);
+        // Qualcos'altro ha preso il primo piano (Iris, un altro programma): i tasti andrebbero lì.
+        if (!GameInput::isForeground(window) && !GameInput::focus(window)) {
+            return fail("il gioco non è più in primo piano: non scrivo il nome.", false);
         }
-        // All'ultimo tentativo si cambia metodo: caratteri Unicode invece degli scancode.
-        if (attempt < attempts || attempts == 1) GameInput::typeScanCodes(destination, m.typeCharDelayMs, p.dryRun);
-        else GameInput::typeUnicode(destination, 25, p.dryRun);
-        Sleep(400);
-        const ScreenOcr::Result r = ScreenOcr::read(zoneRect(game, p, Zone::SearchBox), ocr, "mappa-ricerca");
-        seen = ScreenOcr::linesText(r);
-        const std::string sn = Cmd::normalize(seen), dn = Cmd::normalize(destination);
-        typed = !dn.empty() && (Cmd::similarity(sn, dn) > 0.45 || sn.find(dn.substr(0, std::min<size_t>(4, dn.size()))) != std::string::npos);
-        if (!typed) Log::warn("Rotta, tentativo " + std::to_string(attempt) + ": nel campo leggo \"" + TextUtils::collapseSpaces(seen) + "\"");
+        GameInput::click(box.x, box.y, m.smoothMouseMove, m.mouseMoveSteps, m.mouseMoveStepDelayMs, m.focusSettleMs, false);
+        if (attempt > 1) GameInput::click(box.x, box.y, false, 1, 0, m.focusSettleMs, false); // secondo clic: il campo a volte non prende il fuoco
+        if (m.clearFieldFirst) {
+            GameInput::pressCombo("LCtrl+A", p.keyHoldMs, 60, false);
+            GameInput::pressCombo("Delete", p.keyHoldMs, 60, false);
+        }
+        if (dirty) {
+            // Backspace quanti sono i caratteri letti (più qualcuno): vale in ogni campo di testo.
+            const int n = std::min(40, (int)TextUtils::utf8ToWide(seen).size() + 4);
+            for (int k = 0; k < n; ++k) GameInput::pressCombo("Backspace", p.keyHoldMs, 25, false);
+            Sleep(150);
+        }
+        const ScreenOcr::Shot before = ScreenOcr::grab(boxZone);
+        // L'ultimo tentativo più lento. (Non più con i caratteri Unicode: Star Citizen non li prende,
+        // nelle immagini di controllo il campo restava com'era o ci finiva una lettera a caso.)
+        const bool last = attempt == attempts && attempts > 1;
+        GameInput::typeScanCodes(destination, last ? std::max(90, m.typeCharDelayMs * 2) : m.typeCharDelayMs, false);
+        // Si aspetta che il testo compaia (al massimo 1,5 s), non un tempo fisso.
+        double change = 0.0;
+        for (auto t1 = Clock::now(); elapsedMs(t1) < 1500;) {
+            Sleep(120);
+            change = ScreenOcr::textChange(before, ScreenOcr::grab(boxZone));
+            if (change >= kTypedChange) break;
+        }
+        Sleep(200); // le ultime lettere e il suggerimento della ricerca
+        const ScreenOcr::Result r = ScreenOcr::readUntil(boxZone, ocr, "mappa-ricerca", [&](const ScreenOcr::Result& x) {
+            return Cmd::ocrContains(ScreenOcr::linesText(x), destination) >= kTypedMatch;
+        });
+        seen = TextUtils::collapseSpaces(ScreenOcr::linesText(r));
+        typed = Cmd::ocrContains(seen, destination) >= kTypedMatch;
+        if (typed) {
+            Log::info("Rotta, tentativo " + std::to_string(attempt) + ": nel campo leggo \"" + seen + "\" (" + r.variant + ")");
+        } else if (change >= kTypedChange) {
+            typed = true;
+            Log::info("Rotta, tentativo " + std::to_string(attempt) + ": il campo è cambiato (" + percent(change) + ") ma l'OCR legge \"" + seen +
+                      "\": i tasti sono arrivati, controllo i risultati");
+        } else {
+            Log::warn("Rotta, tentativo " + std::to_string(attempt) + ": il campo non è cambiato (" + percent(change) + "), leggo \"" + seen +
+                      "\": i tasti non sono arrivati");
+            dirty = !Cmd::normalize(seen).empty() && !isPlaceholder(m, seen);
+        }
     }
     if (!typed) {
-        return fail("il campo di ricerca della mappa è rimasto vuoto, il gioco non ha ricevuto i tasti. Prova a ricalibrare la casella di "
+        return fail("il campo di ricerca della mappa è rimasto com'era: il gioco non ha ricevuto i tasti. Prova a ricalibrare la casella di "
                     "ricerca nella pagina Star Citizen.",
                     true);
     }
     if (p.dryRun) return { true, "Prova: avrei impostato la rotta per " + destination + ".", "[prova] rotta per " + destination, "Rotta di prova." };
-    if (!stepPause(p, cancel)) return fail("Interrotto.", true);
 
     // 3) I risultati: si aspetta che compaiano, poi si clicca quello giusto.
+    const RECT resultsZone = zoneRect(game, p, Zone::Results);
     ScreenOcr::Result results;
     int best = -1;
     for (auto t0 = Clock::now(); best < 0 && elapsedMs(t0) < std::max(500, m.resultsTimeoutMs);) {
         if (cancelled(cancel)) return fail("Interrotto.", true);
-        results = ScreenOcr::read(zoneRect(game, p, Zone::Results), ocr, "mappa-risultati");
+        results = ScreenOcr::readUntil(resultsZone, ocr, "mappa-risultati", [&](const ScreenOcr::Result& x) {
+            return Cmd::bestText(texts(x), destination, ocr.matchThreshold) >= 0;
+        });
         best = Cmd::bestText(texts(results), destination, ocr.matchThreshold);
-        if (best < 0) Sleep(300);
+        if (best < 0) Sleep(250);
     }
     if (best < 0) {
         const std::string readText = firstLines(results, 6);
         return fail("non trovo " + destination + " tra i risultati della mappa" + (readText.empty() ? "." : " (leggo: " + readText + ")."), true);
     }
-    Log::info("Rotta: risultato scelto \"" + results.hits[best].text + "\"");
+    Log::info("Rotta: risultato scelto \"" + results.hits[best].text + "\" (" + results.variant + ")");
     const POINT hit = results.hits[best].center();
     GameInput::click(hit.x, hit.y, m.smoothMouseMove, m.mouseMoveSteps, m.mouseMoveStepDelayMs, m.clickSettleMs, false);
 
-    // 4) Il pulsante "Imposta rotta".
-    if (!stepPause(p, cancel)) return fail("Interrotto.", true);
-    const ScreenOcr::Result buttons = ScreenOcr::read(zoneRect(game, p, Zone::SetRoute), ocr, "mappa-imposta");
-    for (const auto& h : buttons.hits) {
-        const std::string n = Cmd::normalize(h.text);
-        if (n.find("non valid") != std::string::npos || n.find("invalid") != std::string::npos) {
-            return fail("il gioco dice destinazione non valida: il clic sul risultato non l'ha selezionata. Ricalibra la zona dei risultati.", true);
-        }
+    // 4) Il pulsante "Imposta rotta": si aspetta che compaia (al massimo un paio di secondi più la pausa).
+    const RECT setZone = zoneRect(game, p, Zone::SetRoute);
+    ScreenOcr::Result buttons;
+    int button = -1;
+    bool invalid = false;
+    for (auto t0 = Clock::now(); elapsedMs(t0) < 2000 + p.stepDelayMs;) {
+        if (cancelled(cancel)) return fail("Interrotto.", true);
+        buttons = ScreenOcr::readUntil(setZone, ocr, "mappa-imposta", [&](const ScreenOcr::Result& x) {
+            return findButton(x, m.setRouteLabels, kRouteKeywords) >= 0 && !saysInvalid(x);
+        });
+        invalid = saysInvalid(buttons);
+        button = findButton(buttons, m.setRouteLabels, kRouteKeywords);
+        if (button >= 0 && !invalid) break;
+        Sleep(250);
     }
-    const int button = findButton(buttons, m.setRouteLabels, kRouteKeywords);
-    if (button < 0) return fail("ho selezionato " + destination + " ma non trovo il pulsante Imposta rotta: confermalo tu.", false);
+    if (invalid) return fail("il gioco dice destinazione non valida: il clic sul risultato non l'ha selezionata. Ricalibra la zona dei risultati.", true);
+    if (button < 0) {
+        const std::string readText = firstLines(buttons, 4);
+        return fail("ho selezionato " + destination + " ma non trovo il pulsante Imposta rotta" + (readText.empty() ? "" : " (leggo: " + readText + ")") +
+                        ": confermalo tu.",
+                    false);
+    }
     const POINT bp = buttons.hits[button].center();
     GameInput::click(bp.x, bp.y, m.smoothMouseMove, m.mouseMoveSteps, m.mouseMoveStepDelayMs, 400, false);
 
-    // 5) Verifica: se compare "Annulla", la rotta è attiva.
-    if (!stepPause(p, cancel)) return fail("Interrotto.", false);
-    const ScreenOcr::Result check = ScreenOcr::read(zoneRect(game, p, Zone::CancelRoute), ocr, "mappa-verifica");
-    if (findButton(check, m.cancelRouteLabels, kCancelKeywords) >= 0) {
+    // 5) Verifica: quando compare "Annulla", la rotta è attiva. Si guarda per qualche secondo
+    //    (il pulsante arriva con un'animazione: una lettura sola a volte lo perdeva).
+    const RECT checkZone = zoneRect(game, p, Zone::CancelRoute);
+    ScreenOcr::Result check;
+    bool active = false;
+    for (auto t0 = Clock::now(); !active && elapsedMs(t0) < 3500 + p.stepDelayMs;) {
+        if (cancelled(cancel)) return fail("Interrotto.", false);
+        Sleep(250);
+        check = ScreenOcr::readUntil(checkZone, ocr, "mappa-verifica", [&](const ScreenOcr::Result& x) {
+            return findButton(x, m.cancelRouteLabels, kCancelKeywords) >= 0;
+        });
+        active = findButton(check, m.cancelRouteLabels, kCancelKeywords) >= 0;
+    }
+    if (active) {
         if (m.closeMapAfterSetRoute && stepPause(p, cancel)) pressLogical(p, "cancel", note);
         const std::string msg = "Rotta impostata su " + destination + ".";
-        Log::info("Rotta: " + msg);
+        Log::info("Rotta: " + msg + " (" + seconds(elapsedMs(started)) + ")");
         return { true, msg, msg, "Rotta impostata." };
     }
+    const std::string readText = firstLines(check, 3);
     const std::string msg = "Ho premuto Imposta rotta ma non vedo comparire Annulla: controlla in gioco che la rotta per " + destination + " sia attiva.";
-    Log::warn("Rotta: " + msg);
+    Log::warn("Rotta: " + msg + (readText.empty() ? " (nella zona di Annulla non leggo niente)" : " (nella zona di Annulla leggo: " + readText + ")"));
     return { false, msg, msg, "Rotta da controllare." };
 }
 
@@ -540,30 +854,48 @@ GameController::Result GameController::cancelRoute(const GameProfile& p, const s
     const auto& m = p.starMap;
     HWND window = GameInput::findGameWindow(p.processName, p.windowTitle);
     RECT game;
-    if (!GameInput::clientRect(window, game)) return { false, p.name + " non è aperto.", "Gioco non trovato.", "Gioco chiuso." };
+    std::string why, whyBrief;
+    if (!gameArea(p, window, game, why, whyBrief)) return { false, why, "Rotta non annullata: " + why, whyBrief };
     std::string note;
     pressLogical(p, "map", note);
     if (p.dryRun) return { true, "Prova: avrei annullato la rotta.", "[prova] rotta annullata", "Annullo di prova." };
+    // La mappa si chiude solo se si è vista aperta (Esc a mappa chiusa aprirebbe il menu del gioco).
+    const RECT boxZone = zoneRect(game, p, Zone::SearchBox);
+    bool mapSeen = false;
+    auto boxVisible = [&]() {
+        const std::string t = ScreenOcr::linesText(ScreenOcr::read(boxZone, p.ocr, ""));
+        return isPlaceholder(m, t) || Cmd::normalize(t).size() >= 3;
+    };
+    auto closeMap = [&]() {
+        if (!mapSeen) mapSeen = boxVisible();
+        if (mapSeen) pressLogical(p, "cancel", note);
+        else Log::warn("Rotta: non vedo la mappa aperta, non premo Esc");
+    };
     ScreenOcr::Result r;
     int button = -1;
     for (auto t0 = Clock::now(); button < 0 && elapsedMs(t0) < m.mapOpenTimeoutMs;) {
         if (cancelled(cancel)) break;
         Sleep(300);
-        r = ScreenOcr::read(zoneRect(game, p, Zone::CancelRoute), p.ocr, "mappa-annulla");
+        r = ScreenOcr::readUntil(zoneRect(game, p, Zone::CancelRoute), p.ocr, "mappa-annulla", [&](const ScreenOcr::Result& x) {
+            return findButton(x, m.cancelRouteLabels, kCancelKeywords) >= 0;
+        });
         button = findButton(r, m.cancelRouteLabels, kCancelKeywords);
+        if (button < 0 && !mapSeen) mapSeen = boxVisible();
     }
     if (button < 0) {
-        pressLogical(p, "cancel", note);
+        closeMap();
         return { false, "Non vedo una rotta attiva da annullare.", "Nessuna rotta da annullare.", "Nessuna rotta." };
     }
+    mapSeen = true; // c'è il pulsante Annulla: la mappa è aperta
     if (!stepPause(p, cancel)) {
-        pressLogical(p, "cancel", note);
+        closeMap();
         return { false, "", "Annullamento della rotta interrotto." };
     }
     const POINT c = r.hits[button].center();
     GameInput::click(c.x, c.y, m.smoothMouseMove, m.mouseMoveSteps, m.mouseMoveStepDelayMs, 300, false);
     stepPause(p, nullptr); // la chiusura della mappa va fatta comunque
-    pressLogical(p, "cancel", note);
+    closeMap();
+    Log::info("Rotta annullata");
     return { true, "Rotta annullata.", "Rotta annullata." };
 }
 
@@ -613,7 +945,8 @@ std::string GameController::readZone(Zone zone) {
     const RECT r = zoneRect(game, p, zone);
     OcrSettings o = p.ocr;
     o.saveDebugShots = true;
-    const ScreenOcr::Result res = ScreenOcr::read(r, o, "prova");
+    // Tutte le preparazioni dell'immagine, come durante la rotta: resta quella che legge di più.
+    const ScreenOcr::Result res = ScreenOcr::readUntil(r, o, "prova", [](const ScreenOcr::Result&) { return false; });
     std::string out = "Finestra del gioco " + std::to_string(game.right - game.left) + "x" + std::to_string(game.bottom - game.top) + ", " +
                       zoneName(zone) + " " + std::to_string(r.right - r.left) + "x" + std::to_string(r.bottom - r.top) + " pixel.\r\n" + warning;
     const std::string lines = ScreenOcr::linesText(res);
@@ -622,7 +955,7 @@ std::string GameController::readZone(Zone zone) {
         out += "Nessun testo riconosciuto. Cause tipiche: gioco in schermo intero esclusivo (la cattura esce nera), HDR attivo, zona "
                "sbagliata, lingua OCR non installata in Windows.";
     } else {
-        out += "Testo letto: " + replaceAll(lines, "\n", " | ");
+        out += "Testo letto: " + replaceAll(lines, "\n", " | ") + (res.variant.empty() ? "" : "  (immagine " + res.variant + ")");
     }
     if (!res.savedImage.empty()) out += "\r\nImmagine di controllo: " + res.savedImage;
     return out;
@@ -680,12 +1013,19 @@ std::string GameController::toolDefinition() {
                { "function",
                  { { "name", "game_command" },
                    { "description", "Run a command in " + p.name + " (the game is open): ship keys, set or cancel the route on the star map. "
-                                    "Call it once per action. Commands: " + list },
+                                    "Call it once per action. Switches (lights, weapons, shields, engines, power, landing_gear, decoupled, "
+                                    "cruise): Iris reads the ship state and does not press if it is already as wanted, so pass state when "
+                                    "the user says it. Commands: " + list },
                    { "parameters",
                      { { "type", "object" },
                        { "properties",
                          { { "command", { { "type", "string" }, { "enum", ids } } },
-                           { "destination", { { "type", "string" }, { "description", "only for set_route: the place, as said by the user" } } } } },
+                           { "destination", { { "type", "string" }, { "description", "only for set_route: the place, as said by the user" } } },
+                           { "state", { { "type", "string" },
+                                        { "enum", { "on", "off", "up", "down" } },
+                                        { "description", "only for switches, if the user said it: on/off (turn on/off, activate/deactivate); "
+                                                         "shields: up or down; landing_gear: down = lower/deploy it, up = raise/retract it; "
+                                                         "decoupled: on = decoupled mode, off = coupled mode. Omit it to just toggle." } } } } },
                        { "required", { "command" } } } } } } };
     return f.dump();
 }

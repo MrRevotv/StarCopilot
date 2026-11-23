@@ -169,7 +169,7 @@ function renderExtraSettings(s) {
     cells.push(h("div", { class: "cell" },
       capturing ? h("span", { class: "key-empty" }, "premi il tasto…") : keys.length ? keyChip(keys[0]) : h("span", { class: "key-empty" }, "— nessuno —"),
       h("button", { class: "btn small" + (capturing ? " busy" : ""), type: "button", disabled: !s.quickBarEnabled && !capturing, onclick: () => post({ a: "captureKey", target }) }, capturing ? "Annulla" : "Cambia"),
-      keys.length ? h("button", { class: "btn small danger", type: "button", onclick: () => post({ a: "removeKey", target }) }, "Togli") : null));
+      keys.length ? h("button", { class: "icon-x", type: "button", title: "Togli il tasto", "aria-label": "Togli il tasto: " + name, onclick: () => post({ a: "removeKey", target }) }, "✕") : null));
   });
   host.replaceChildren(...cells);
   if ((S.captureText.target === "mining:4" || S.captureText.target === "mining:5") && S.captureText.text) {

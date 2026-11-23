@@ -48,4 +48,12 @@ namespace ChatParser {
     // Così rovinata che tradurla darebbe solo altre parole a caso.
     bool unreadable(const std::string& text);
 
+    // Il canale conosciuto che l'OCR ha letto male dentro le quadre: "GLCBALE", "CLOBALE",
+    // "BALE", "tGLOBA", "CGI-OBALE", "tel-OBALEJ" -> "GLOBALE". Vuoto se non somiglia abbastanza
+    // (un'organizzazione come "GLOBEX" resta com'è). parse() lo usa già sui canali dei messaggi.
+    std::string canonicalChannel(const std::string& tag);
+
+    // Troppo poco per tradurlo: meno di tre lettere ("o7", "W", "?", "101").
+    bool tooShortToTranslate(const std::string& text);
+
 } // namespace ChatParser

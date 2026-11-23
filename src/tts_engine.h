@@ -9,9 +9,12 @@
 #include <vector>
 
 class NeuralVoice;
+class VoiceEffect;
 
-// La voce di Iris: le voci di Windows (Elsa, Cosimo...), senza librerie in più.
-// - Le frasi si mettono in coda: mentre una suona, la successiva si prepara.
+// La voce di Iris: la voce neurale (vedi NeuralVoice) o le voci di Windows (Elsa, Cosimo...).
+// - Le frasi si mettono in coda: mentre una suona, la successiva si prepara. Un pezzo
+//   corto ("Certo!") con la frase dopo già in coda si dice insieme a lei: una sola
+//   intonazione, senza aspettare niente.
 // - stop() la zittisce subito (la chiami mentre parla, o dici "basta").
 // - level() è il volume di quello che sta dicendo, per l'animazione.
 // - Suoni brevi (il "ding" quando la chiami, il timer) generati qui.
@@ -48,11 +51,17 @@ public:
     // Effetto sulla voce ("nessuno", "ia", "androide", "robot": vedi VoiceEffect), per ogni motore.
     void setEffect(const std::string& id);
 
-    // La voce neurale (Qwen3-TTS): se c'è ed è accesa, parla lei; se una frase
-    // non le riesce, la dice la voce di Windows.
+    // La voce neurale (Qwen3-TTS): se c'è ed è accesa, parla lei, sempre lei.
+    // setUseNeural(true) mentre si sta ancora caricando: le frasi aspettano lei
+    // (fino a kNeuralWaitMs) invece di uscire con la voce di Windows. Se una frase
+    // non le riesce si riprova con lei; Windows solo se proprio non va.
     void setNeuralVoice(NeuralVoice* voice) { m_neural.store(voice); }
-    void setUseNeural(bool on) { m_useNeural = on; }
+    void setUseNeural(bool on) {
+        m_useNeural = on;
+        m_cv.notify_all();
+    }
     bool usingNeural() const;
+    static constexpr int kNeuralWaitMs = 45000;
 
     void speak(const std::string& text);
     void chime(Chime kind);
@@ -67,8 +76,15 @@ public:
 
     static constexpr int kSampleRate = 24000;
 
+    // Toglie dalla coda il prossimo pezzo da dire: un frammento corto si unisce alle
+    // frasi già in coda dopo di lui (al massimo ~220 caratteri). Pura: provata nei test.
+    static std::string takeNext(std::deque<std::string>& texts);
+
 private:
     void synthLoop();
+    enum class NeuralResult { Done, NotReady, Failed };
+    // Una frase con la voce neurale, con un secondo tentativo (altro seme) se non riesce.
+    NeuralResult speakNeural(NeuralVoice* neural, const std::string& text, unsigned long long generation, VoiceEffect& effect);
     void enqueueSamples(std::vector<float> samples, unsigned long long generation);
 
     mutable std::mutex m_mutex;

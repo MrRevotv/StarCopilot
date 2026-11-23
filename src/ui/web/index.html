@@ -98,6 +98,15 @@
           <div class="callout" id="game-status">—</div>
           <div class="row"><div class="row-text"><b>Comandi di gioco attivi</b><small>Quando Star Citizen è aperto, Iris preme i tasti per te.</small></div><label class="switch"><input type="checkbox" data-set="gameEnabled"><i></i></label></div>
           <div class="row"><div class="row-text"><b>Modalità prova</b><small>Scrive cosa farebbe, senza premere tasti.</small></div><label class="switch"><input type="checkbox" id="dry-run"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Leggi lo stato dal gioco</b><small>Prima di premere guarda com'è la nave: «accendi le armi» con le armi già accese non le spegne.</small><small class="telemetry-state" id="telemetry-state">—</small></div><label class="switch"><input type="checkbox" data-set="gameTelemetryEnabled"><i></i></label></div>
+          <div class="telemetry-help">
+            <p class="note first">La telemetria va accesa nel gioco: aggiungi queste due righe al file <code>user.cfg</code> nella cartella di Star Citizen (LIVE o PTU) e riavvia il gioco. Iris la legge soltanto e non modifica mai i file del gioco. Attenzione: con queste righe il gioco accetta comandi anche da altri programmi del PC.</p>
+            <div class="telemetry-cfg">
+              <pre class="readout small" id="telemetry-cfg">grpc.client.server.enabled = 1
+server.game.telemetry.enabled = 1</pre>
+              <button class="btn small" type="button" id="telemetry-copy">Copia le righe</button>
+            </div>
+          </div>
           <div class="btn-row">
             <button class="btn" data-action="openProfile">Modifica il profilo a mano</button>
             <button class="btn" data-action="gameReload">Ricarica</button>
@@ -526,11 +535,12 @@
           <div class="panel-title">Voce</div>
           <div class="row"><div class="row-text"><b>Iris risponde a voce</b></div><label class="switch"><input type="checkbox" data-set="speechEnabled"><i></i></label></div>
           <div class="field"><span class="field-label">Motore della voce</span><div class="seg" id="engine-seg"><button data-engine="neurale">Neurale · Qwen3-TTS</button><button data-engine="windows">Windows</button></div></div>
+          <label class="field"><span class="field-label">Voce neurale</span><select id="neural-voice-select"></select></label>
           <label class="field"><span class="field-label">Effetto sulla voce</span><select id="effect-select"></select></label>
           <div class="field"><span class="field-label">Voce di Windows</span><div class="inline-form"><select id="voice-select"></select><button class="btn" data-action="testVoice">Prova</button></div></div>
           <label class="field"><span class="field-label">Dove parla</span><select id="output-select"></select></label>
           <div data-slider="speechRate"></div>
-          <p class="note">La voce neurale genera il parlato sulla scheda video (licenza Apache 2.0). La velocità vale solo per le voci di Windows.</p>
+          <p class="note">La voce neurale genera il parlato sulla scheda video (licenza Apache 2.0), sempre con la stessa voce: una delle predefinite (la prima volta il modello la prepara da sé, qualche secondo) o quella di un tuo WAV, 5–15 secondi di parlato pulito di una persona sola. La velocità vale solo per le voci di Windows.</p>
         </div>
       </div>
     </section>
@@ -630,7 +640,7 @@
   </main>
 </div>
 
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 <div class="modal hidden" id="mlog-modal" role="dialog" aria-modal="true" aria-labelledby="mlog-title">
   <div class="modal-box panel mlog-box">
     <div class="panel-title" id="mlog-title">Chiudi il registro</div>

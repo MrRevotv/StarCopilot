@@ -90,6 +90,25 @@ namespace {
         return result;
     }
 
+    // Quanto è buona una lettura della chat: messaggi con il canale letto giusto e con il nome,
+    // meno le parole rovinate. Serve a scegliere l'ingrandimento con una prova vera.
+    int readingQuality(const std::vector<OcrEngineWrapper::Line>& lines) {
+        std::vector<std::string> text;
+        for (const auto& l : lines) text.push_back(l.text);
+        int q = 0;
+        for (const ChatMessage& m : ChatParser::parse(text)) {
+            if (!m.playerName.empty()) q += 1;
+            for (const char* c : { "[GLOBALE]", "[GLOBAL]", "[GRUPPO]", "[GROUP]", "[PARTY]", "[SQUAD]" }) {
+                if (m.rawPrefix.find(c) != std::string::npos) {
+                    q += 2;
+                    break;
+                }
+            }
+            q -= ChatParser::garbledWords(m.body);
+        }
+        return q;
+    }
+
     bool sameScreenView(const GameChat::ScreenView& a, const GameChat::ScreenView& b) {
         return a.visible == b.visible && a.regionX == b.regionX && a.regionY == b.regionY && a.regionW == b.regionW &&
                a.regionH == b.regionH && a.lines == b.lines;
@@ -398,19 +417,39 @@ void GameChat::writeToChat(const std::string& heard) {
     // Le impostazioni di invio si rileggono ora: F10 potrebbe essere stato premuto nel frattempo.
     s = settings();
     setBusyText("Scrivo in chat...");
+    std::string notWritten; // il motivo, se alla fine non si scrive
     {
         // Un comando della nave in corso finisce prima: i tasti non si mescolano.
         std::lock_guard<std::recursive_mutex> keys(GameInput::inputLock());
-        InputSender::waitForModifiersReleased(1500);
-        InputSender::Options o;
-        o.openChat = s.chatOpenEnabled;
-        o.openKeyVk = s.chatOpenKeyVk;
-        o.autoSend = s.autoSend;
-        o.sendKeyVk = s.chatSendKeyVk;
-        o.delayAfterOpenMs = s.chatOpenDelayMs;
-        o.interCharDelayMs = s.typingDelayMs;
-        o.unmappable = s.unicodeFallback ? InputSender::Unmappable::Unicode : InputSender::Unmappable::Transliterate;
-        InputSender::sendChatMessage(finalText, o);
+        // Con Shift, Ctrl o Alt tenuti giù le lettere uscirebbero cambiate (o diventerebbero
+        // scorciatoie del gioco): si aspetta, e se restano giù non si scrive.
+        if (!InputSender::waitForModifiersReleased(3000)) {
+            notWritten = "Shift, Ctrl o Alt erano tenuti premuti";
+        } else if (!GameInput::starCitizenInForeground()) {
+            // Solo nella chat di Star Citizen: con un'altra finestra davanti (il browser, Discord,
+            // il desktop) Invio e il testo andrebbero lì. Si guarda adesso, dopo la traduzione.
+            notWritten = "Star Citizen non era in primo piano";
+        } else if (GameInput::windowElevated(GetForegroundWindow()) && !GameInput::selfElevated()) {
+            // Gioco da amministratore e Iris no: Windows scarterebbe i tasti senza dirlo.
+            notWritten = "Star Citizen è avviato come amministratore e Iris no (riapri Iris come amministratore)";
+        } else {
+            InputSender::Options o;
+            o.openChat = s.chatOpenEnabled;
+            o.openKeyVk = s.chatOpenKeyVk;
+            o.autoSend = s.autoSend;
+            o.sendKeyVk = s.chatSendKeyVk;
+            o.delayAfterOpenMs = s.chatOpenDelayMs;
+            o.interCharDelayMs = s.typingDelayMs;
+            o.unmappable = s.unicodeFallback ? InputSender::Unmappable::Unicode : InputSender::Unmappable::Transliterate;
+            InputSender::sendChatMessage(finalText, o);
+        }
+    }
+    if (!notWritten.empty()) {
+        entry.note = "non scritta: " + notWritten;
+        addHistory(entry);
+        if (m_host.onWritten) m_host.onWritten(heard, finalText, false);
+        setNotice("Non scritta in chat (" + notWritten + "): " + finalText, true);
+        return;
     }
     entry.typed = true;
     if (!s.autoSend) entry.note = "scritta, non inviata (invio automatico spento)";
@@ -550,6 +589,7 @@ void GameChat::screenStep(const AppSettings& s) {
         m_memory.clear();
         m_waiting.clear();
         m_memoryFor = memoryFor;
+        m_ocrScaleLockedUntil = 0; // zona nuova: l'ingrandimento si sceglie di nuovo
     }
 
     // La zona fa parte dell'impronta: la stessa immagine in un'altra zona è un'altra lettura.
@@ -573,20 +613,35 @@ void GameChat::screenStep(const AppSettings& s) {
     }
     m_lastOcrError.clear();
 
-    // L'OCR di Windows legge meglio il testo alto circa 54 pixel: si misura
-    // l'altezza vera delle righe e si sceglie l'ingrandimento per le letture successive.
+    // L'OCR di Windows legge meglio il testo alto circa 54 pixel: si misura l'altezza vera delle
+    // righe e, se serve un altro ingrandimento, si prova davvero sulla stessa immagine: resta
+    // quello che legge meglio, e per un minuto non si cambia più. (Solo con la misura, x2 e x3 si
+    // davano il cambio a ogni lettura e le letture peggioravano: "[BALE]", "[GLCBALE]".)
     if (!ocrLines.empty()) {
+        const int usedScale = std::max(1, prepared.width / std::max(1, image.width)); // prepareForOcr lo riduce se l'immagine è troppo grande
         std::vector<int> heights;
         for (const auto& l : ocrLines) heights.push_back(l.height);
         std::sort(heights.begin(), heights.end());
-        const double textHeight = std::max(1.0, (double)heights[heights.size() / 2] / scale);
+        const double textHeight = std::max(1.0, (double)heights[heights.size() / 2] / usedScale);
         const double ideal = 54.0 / textHeight;
         const int wanted = std::clamp((int)std::lround(ideal), 1, 3);
-        if (wanted != m_ocrScale && std::abs(ideal - m_ocrScale) > 0.75) {
-            Log::info("OCR: testo alto " + std::to_string((int)textHeight) + " px, ingrandimento x" + std::to_string(wanted));
-            m_ocrScale = wanted;
-            m_lastScreenHash = 0; // si rilegge subito con la misura giusta
-            return;
+        if (wanted != usedScale && std::abs(ideal - usedScale) > 0.75 && GetTickCount64() >= m_ocrScaleLockedUntil) {
+            m_ocrScaleLockedUntil = GetTickCount64() + 60000;
+            std::string otherError;
+            const ScreenCapture::Image other = ScreenCapture::prepareForOcr(image, wanted, m_ocrMaxDimension);
+            std::vector<OcrEngineWrapper::Line> otherLines = OcrEngineWrapper::recognize("en", other, otherError);
+            const int now = readingQuality(ocrLines);
+            const int then = otherError.empty() ? readingQuality(otherLines) : now - 1;
+            const std::string why = " (testo alto " + std::to_string((int)textHeight) + " px, qualità " + std::to_string(then) + " contro " +
+                                    std::to_string(now) + ")";
+            if (then > now) {
+                Log::info("OCR: ingrandimento x" + std::to_string(wanted) + why);
+                m_ocrScale = wanted;
+                ocrLines = std::move(otherLines);
+            } else {
+                Log::info("OCR: resto a x" + std::to_string(usedScale) + ", x" + std::to_string(wanted) + " non legge meglio" + why);
+                m_ocrScale = usedScale;
+            }
         }
     }
 
@@ -714,6 +769,32 @@ void GameChat::screenStep(const AppSettings& s) {
         });
         if (!known) fresh.push_back(items.size() - 1);
     }
+    // Già tradotto negli ultimi minuti (anche se è uscito dal riquadro) e riletto peggio, con il
+    // nome storpiato o un pezzo in più: non è un messaggio nuovo, non si traduce di nuovo.
+    const unsigned long long nowTick = GetTickCount64();
+    while (!m_recent.empty() && nowTick - m_recent.front().tick > 5ULL * 60 * 1000) m_recent.pop_front();
+    auto repeated = [&](const Item& it) {
+        for (const auto& r : m_recent) {
+            if (ScreenMatch::likeness(r.key, it.key) < 0.75) continue;
+            // Nei messaggi corti i numeri contano ("need 2" non è "need 3"); nei lunghi una cifra
+            // diversa è quasi sempre una lettera letta male.
+            if (it.key.size() < 24 && !ScreenMatch::sameNumbers(r.key, it.key)) continue;
+            const bool samePlayer = r.player.empty() || it.player.empty() ||
+                                    ScreenMatch::likeness(TextUtils::normalizeForMatch(r.player), TextUtils::normalizeForMatch(it.player)) >= 0.6;
+            if (it.key.size() >= 16 || samePlayer) return true;
+        }
+        return false;
+    };
+    fresh.erase(std::remove_if(fresh.begin(), fresh.end(),
+                               [&](size_t i) {
+                                   if (!repeated(items[i])) return false;
+                                   if (items[i].key != m_lastRepeat) {
+                                       m_lastRepeat = items[i].key;
+                                       Log::info("Schermo: già tradotto poco fa, non lo ripeto: " + items[i].prefix + items[i].body);
+                                   }
+                                   return true;
+                               }),
+                fresh.end());
     // Più nuovi di quanti ne stanno nel riquadro: i più vecchi non si vedrebbero comunque.
     if (fresh.size() > maxShown) fresh.erase(fresh.begin(), fresh.end() - (std::ptrdiff_t)maxShown);
 
@@ -740,8 +821,9 @@ void GameChat::screenStep(const AppSettings& s) {
         }
         if (!before) continue; // letto una volta sola: si aspetta la prossima lettura
         if (ChatParser::garbledWords(before->body) < ChatParser::garbledWords(it.body)) it.source = before->body;
-        // Solo i messaggi in inglese: gli altri restano come sono.
-        if (sameLanguage || !LanguageGuess::isEnglish(it.source)) {
+        // Solo i messaggi in inglese: gli altri restano come sono. E quelli di due lettere ("o7",
+        // "W", "?"): il modello li restituirebbe uguali, dopo mezzo secondo di lavoro.
+        if (sameLanguage || ChatParser::tooShortToTranslate(it.source) || !LanguageGuess::isEnglish(it.source)) {
             it.translated = it.source;
             steps[k] = Step::Ready;
         } else {
@@ -763,6 +845,8 @@ void GameChat::screenStep(const AppSettings& s) {
     auto commit = [&](const Item& it) {
         m_memory.push_back({ it.key, it.prefix, it.body, it.translated });
         while (m_memory.size() > maxShown) m_memory.pop_front();
+        m_recent.push_back({ it.key, it.player, GetTickCount64() });
+        while (m_recent.size() > 60) m_recent.pop_front();
         if (it.filtered) {
             addFiltered(TextUtils::normalizeForMatch(it.player + " " + it.body),
                         "[" + s.chatFilterTag + "] " + (it.player.empty() ? "" : it.player + ": ") + it.translated);

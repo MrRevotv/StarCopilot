@@ -16,6 +16,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <vector>
 
@@ -166,24 +167,38 @@ bool parseRelease(const std::string& text, Release& out, std::string& error) {
     return true;
 }
 
-bool fetchLatest(Release& out, std::string& error, const std::atomic<bool>* cancel) {
+Failure describeFailure(int status, const std::string& networkError) {
+    if (!networkError.empty() || status <= 0) {
+        return { "niente connessione a GitHub" + (networkError.empty() ? std::string() : " (" + networkError + ")"), 30 };
+    }
+    if (status == 403 || status == 429) {
+        // Senza account GitHub concede 60 controlli l'ora per rete: lo si lascia in pace un'ora.
+        return { "GitHub ha limitato i controlli da questa rete (troppe richieste, errore " + std::to_string(status) + ")", 60 };
+    }
+    if (status == 404) return { "nessuna versione pubblicata", 240 };
+    if (status >= 500) return { "GitHub non risponde bene in questo momento (errore " + std::to_string(status) + ")", 30 };
+    return { "GitHub ha risposto con un errore inatteso (" + std::to_string(status) + ")", 120 };
+}
+
+int retryDelayMinutes(int baseMinutes, int failures) {
+    long long minutes = std::max(1, baseMinutes);
+    for (int i = 1; i < failures && minutes < 240; ++i) minutes *= 2;
+    return (int)std::min(240LL, minutes);
+}
+
+bool fetchLatest(Release& out, std::string& error, const std::atomic<bool>* cancel, int* retryMinutes) {
     Http::Options o;
     o.timeoutMs = 15000;
     o.cancel = cancel;
     o.headers = { L"Accept: application/vnd.github+json", L"X-GitHub-Api-Version: 2022-11-28" };
     const Http::Response r = Http::get(std::string("https://api.github.com/repos/") + kRepository + "/releases/latest", o);
-    if (!r.error.empty()) {
-        error = "niente connessione a GitHub (" + r.error + ")";
-        return false;
-    }
-    if (r.status == 404) {
-        error = "nessuna versione pubblicata";
-        return false;
-    }
     if (!r.ok()) {
-        error = "GitHub ha risposto " + std::to_string(r.status);
+        const Failure f = describeFailure(r.error.empty() ? r.status : 0, r.error);
+        error = f.text;
+        if (retryMinutes) *retryMinutes = f.retryMinutes;
         return false;
     }
+    if (retryMinutes) *retryMinutes = 240;
     return parseRelease(r.body, out, error);
 }
 
@@ -266,7 +281,7 @@ std::wstring pendingUpdate(std::string* version) {
     if (find == INVALID_HANDLE_VALUE) return {};
     do {
         const std::string v = versionFromFileName(fd.cFileName);
-        if (v.empty() || compareVersions(v, bestVersion) <= 0) continue;
+        if (v.empty() || compareVersions(v, bestVersion) <= 0 || isBroken(v)) continue;
         const std::wstring path = updatesDir() + L"\\" + fd.cFileName;
         std::string hash;
         // Solo un file controllato, e non toccato dopo il controllo.
@@ -285,18 +300,43 @@ bool install(const std::wstring& newExe, std::string& error) {
         error = "file dell'aggiornamento non trovato";
         return false;
     }
+    const std::string protectedFolder = "Windows non mi lascia sostituire il programma in " + TextUtils::wideToUtf8(folderOf(exe)) +
+                                        " (cartella protetta? spostalo per esempio sul Desktop)";
+    // 1. La versione nuova accanto a quella in uso (stesso disco: poi basta un cambio di nome, che non
+    //    si interrompe a metà), mandata davvero sul disco e controllata: uguale a quella scaricata.
+    const std::wstring staged = exe + L".new";
+    DeleteFileW(staged.c_str());
+    if (!CopyFileW(newExe.c_str(), staged.c_str(), FALSE)) {
+        error = protectedFolder;
+        return false;
+    }
+    {
+        HANDLE f = CreateFileW(staged.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(f);
+            CloseHandle(f);
+        }
+    }
+    std::string expected, copied;
+    if (!sha256File(newExe, expected) || !sha256File(staged, copied) || expected != copied || !looksLikeExe(staged)) {
+        DeleteFileW(staged.c_str());
+        error = "la copia della versione nuova non è uguale a quella scaricata (disco pieno?)";
+        return false;
+    }
+    // 2. Un programma in esecuzione non si può sovrascrivere, ma si può rinominare.
     std::wstring old = exe + L".old";
     DeleteFileW(old.c_str());
     if (fileExists(old)) old = exe + L"." + std::to_wstring(GetTickCount64()) + L".old"; // quello di prima è ancora in uso
-    // Un programma in esecuzione non si può sovrascrivere, ma si può rinominare.
     if (!MoveFileExW(exe.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        error = "Windows non mi lascia sostituire il programma in " + TextUtils::wideToUtf8(folderOf(exe)) +
-                " (cartella protetta? spostalo per esempio sul Desktop)";
+        DeleteFileW(staged.c_str());
+        error = protectedFolder;
         return false;
     }
-    if (!CopyFileW(newExe.c_str(), exe.c_str(), FALSE)) {
+    // 3. La nuova al suo posto: un cambio di nome, tutto o niente.
+    if (!MoveFileExW(staged.c_str(), exe.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         MoveFileExW(old.c_str(), exe.c_str(), MOVEFILE_REPLACE_EXISTING);
-        error = "impossibile copiare la versione nuova nella cartella del programma";
+        DeleteFileW(staged.c_str());
+        error = "impossibile mettere la versione nuova nella cartella del programma";
         return false;
     }
     std::wstring cmd = L"\"" + exe + L"\" --dopo-aggiornamento" + forwardedArguments();
@@ -331,6 +371,7 @@ void cleanup() {
             } while (FindNextFileW(find, &fd));
             FindClose(find);
         }
+        DeleteFileW((exe + L".new").c_str()); // una copia rimasta a metà (installazione interrotta)
     }
     // Gli scaricati di versioni già installate (o più vecchie).
     WIN32_FIND_DATAW fd;
@@ -349,6 +390,36 @@ void cleanup() {
     FindClose(find);
 }
 
+namespace {
+    std::wstring brokenListPath() { return updatesDir() + L"\\scartate.txt"; }
+}
+
+bool isBroken(const std::string& version) {
+    std::ifstream f(brokenListPath(), std::ios::binary);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (compareVersions(TextUtils::trim(line), version) == 0 && !TextUtils::trim(line).empty()) return true;
+    }
+    return false;
+}
+
+void markBroken(const std::string& version) {
+    if (version.empty() || isBroken(version)) return;
+    CreateDirectoryW(updatesDir().c_str(), nullptr);
+    std::ofstream(brokenListPath(), std::ios::binary | std::ios::app) << version << "\r\n";
+    const std::wstring path = downloadedPath(version);
+    DeleteFileW(path.c_str());
+    DeleteFileW((path + L".ok").c_str());
+}
+
+void confirmInstalled() {
+    std::string version;
+    if (pendingUpdate(&version).empty()) return; // installata quella giusta
+    Log::warn("Aggiornamento: dopo l'installazione questa è ancora la " + currentVersion() + ", non la " + version +
+              ": l'exe pubblicato non è quella versione. Non lo installo più (aspetto la prossima).");
+    markBroken(version);
+}
+
 } // namespace Updater
 
 // --- Controllo in sottofondo ---------------------------------------------------------
@@ -362,6 +433,16 @@ namespace {
         GetLocalTime(&t);
         char buf[8];
         std::snprintf(buf, sizeof(buf), "%02d:%02d", t.wHour, t.wMinute);
+        return buf;
+    }
+
+    // L'ora tra "minutes" minuti ("22:13").
+    std::string clockIn(int minutes) {
+        const time_t later = time(nullptr) + (time_t)minutes * 60;
+        tm local{};
+        localtime_s(&local, &later);
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d", local.tm_hour, local.tm_min);
         return buf;
     }
 }
@@ -429,34 +510,46 @@ void UpdateManager::loop() {
             manual = m_manual;
             m_wake = m_manual = false;
         }
-        runCheck(manual);
-        next = std::chrono::steady_clock::now() + kInterval;
+        // Dopo un errore si riprova prima di 4 ore, ma sempre più piano: niente raffiche su GitHub.
+        const int minutes = runCheck(manual);
+        next = std::chrono::steady_clock::now() + std::chrono::minutes(minutes);
     }
 }
 
-void UpdateManager::runCheck(bool manual) {
+int UpdateManager::runCheck(bool manual) {
+    constexpr int kNormal = (int)std::chrono::duration_cast<std::chrono::minutes>(kInterval).count();
     if (!manual && m_enabled && !m_enabled()) {
         set([](State& s) {
             if (s.phase != Phase::Ready) s.phase = Phase::Disabled;
         });
-        return;
+        return kNormal;
     }
     set([](State& s) {
         s.phase = Phase::Checking;
         s.error.clear();
+        s.retryAt.clear();
     });
-    Updater::Release release;
-    std::string error;
-    if (!Updater::fetchLatest(release, error, &m_stopping)) {
-        if (m_stopping) return;
-        Log::warn("Aggiornamento: controllo non riuscito: " + error);
+    // Un errore in più: il prossimo tentativo più in là (30 min, 1 ora, 2, poi ogni 4).
+    auto failed = [&](const std::string& error, int baseMinutes, bool keepReady) {
+        const int minutes = Updater::retryDelayMinutes(baseMinutes, ++m_failures);
+        const std::string retryAt = clockIn(minutes);
+        Log::warn("Aggiornamento: controllo non riuscito: " + error + " (riprovo alle " + retryAt + ")");
         set([&](State& s) {
-            s.phase = m_readyPath.empty() ? Phase::Error : Phase::Ready;
+            s.phase = keepReady && !m_readyPath.empty() ? Phase::Ready : Phase::Error;
             s.error = error;
+            s.retryAt = retryAt;
             s.checkedAt = nowHHMM();
         });
-        return;
+        return minutes;
+    };
+    Updater::Release release;
+    std::string error;
+    int retryMinutes = kNormal;
+    if (!Updater::fetchLatest(release, error, &m_stopping, &retryMinutes)) {
+        if (m_stopping) return kNormal;
+        return failed(error, retryMinutes, true);
     }
+    m_failures = 0;
     if (Updater::compareVersions(release.version, Updater::currentVersion()) <= 0) {
         set([&](State& s) {
             s.phase = Phase::UpToDate;
@@ -465,7 +558,19 @@ void UpdateManager::runCheck(bool manual) {
             s.pageUrl = release.pageUrl;
             s.checkedAt = nowHHMM();
         });
-        return;
+        return kNormal;
+    }
+    if (Updater::isBroken(release.version)) {
+        // Già scaricata e installata una volta: partiva come un'altra versione. Si aspetta la prossima.
+        set([&](State& s) {
+            s.phase = Phase::Error;
+            s.latest = release.version;
+            s.notes = release.notes;
+            s.pageUrl = release.pageUrl;
+            s.error = "la versione " + release.version + " pubblicata su GitHub non si installa bene: aspetto la prossima";
+            s.checkedAt = nowHHMM();
+        });
+        return kNormal;
     }
     Log::info("Aggiornamento: c'è la versione " + release.version + " (questa è " + Updater::currentVersion() + ")");
     set([&](State& s) {
@@ -486,15 +591,8 @@ void UpdateManager::runCheck(bool manual) {
             set([&](State& s) { s.progress = percent; });
         },
         &m_stopping, path, error);
-    if (m_stopping) return;
-    if (!ok) {
-        set([&](State& s) {
-            s.phase = Phase::Error;
-            s.error = "download non riuscito: " + error;
-            s.checkedAt = nowHHMM();
-        });
-        return;
-    }
+    if (m_stopping) return kNormal;
+    if (!ok) return failed("download non riuscito: " + error, 30, false);
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_readyPath = path;
@@ -504,6 +602,7 @@ void UpdateManager::runCheck(bool manual) {
         s.progress = 100;
         s.checkedAt = nowHHMM();
     });
+    return kNormal;
 }
 
 bool UpdateManager::installNow(std::string& error) {

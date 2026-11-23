@@ -71,4 +71,60 @@ namespace AppPaths {
         return TextUtils::wideToUtf8(widePath);
     }
 
+    namespace {
+        bool readWhole(const std::wstring& path, std::string& content) {
+            HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f == INVALID_HANDLE_VALUE) return false;
+            LARGE_INTEGER size{};
+            bool ok = GetFileSizeEx(f, &size) && size.QuadPart < (64LL << 20); // un file di impostazioni, non un film
+            if (ok) {
+                content.assign((size_t)size.QuadPart, '\0');
+                DWORD read = 0;
+                ok = content.empty() || (ReadFile(f, content.data(), (DWORD)content.size(), &read, nullptr) && read == content.size());
+            }
+            CloseHandle(f);
+            if (!ok) content.clear();
+            return ok;
+        }
+
+        long long sizeOf(const std::wstring& path) {
+            WIN32_FILE_ATTRIBUTE_DATA d{};
+            if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return -1;
+            return ((long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+        }
+    }
+
+    bool writeFileSafely(const std::wstring& path, const std::string& content) {
+        const std::wstring tmp = path + L".tmp", bak = path + L".bak";
+        HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        bool ok = content.empty() || (WriteFile(f, content.data(), (DWORD)content.size(), &written, nullptr) && written == content.size());
+        // Dalla cache di Windows al disco: senza, uno spegnimento lascerebbe il file nuovo vuoto.
+        ok = ok && FlushFileBuffers(f);
+        CloseHandle(f);
+        if (!ok) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        // Il file di prima diventa la copia di sicurezza (solo se era buono: un file vuoto non serve).
+        if (sizeOf(path) > 0 && ReplaceFileW(path.c_str(), tmp.c_str(), bak.c_str(), REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) return true;
+        if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+
+    bool readFileOrBackup(const std::wstring& path, std::string& content, bool* fromBackup) {
+        if (fromBackup) *fromBackup = false;
+        if (readWhole(path, content) && !content.empty()) return true;
+        std::string backup;
+        if (readWhole(path + L".bak", backup) && !backup.empty()) {
+            content = std::move(backup);
+            if (fromBackup) *fromBackup = true;
+            return true;
+        }
+        return readWhole(path, content); // vuoto ma c'è: va bene così
+    }
+
 } // namespace AppPaths

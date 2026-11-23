@@ -5,7 +5,10 @@ Iris annota ogni roccia letta dallo scanner. Alla chiusura chiede **luogo** e **
 salva sul desktop:
 
 - `Iris mining AAAA-MM-GG HH-MM.json`: il file per il sito (questo documento);
-- `Iris mining AAAA-MM-GG HH-MM.csv` (facoltativo): lo stesso registro per Excel (`;`, UTF-8).
+- `Iris mining AAAA-MM-GG HH-MM.csv` (facoltativo): lo stesso registro per Excel in italiano
+  (separatore `;`, UTF-8 con BOM, date e ore come `2026-11-01 21:40:17` che Excel riconosce;
+  un testo che comincia con `=`, `+`, `-` o `@` si scrive con un apostrofo davanti, così Excel
+  non lo prende per una formula).
 
 Se il nome esiste già si aggiunge ` (2)`, ` (3)`… Il JSON è UTF-8 senza BOM.
 
@@ -79,7 +82,19 @@ Ogni rilevamento:
 | `rarita` | se nota | `comune`, `non comune`, `raro`, `epico`, `leggendario` |
 | `alternative[]` | `ambiguo` | i materiali possibili, ognuno con `materiale`, `nome`, `quantita`, `tipo` |
 | `origine` | sempre | come è stata letta: `tasto`, `continua`, `voce`, `manuale` (tastierino), `ruota` (la ruota di Iris; `barra` nei registri delle versioni prima) |
-| `letture` | sempre | quante volte quella roccia è stata letta (rilette entro 45 secondi = stessa roccia) |
+| `letture` | sempre | quante volte quella roccia è stata letta (vedi sotto) |
+
+## Stessa roccia, letture diverse
+
+Una lettura entro 45 secondi dall'ultima lettura di una roccia già nel registro (anche con un'altra
+roccia letta in mezzo) è la stessa roccia se la signature è uguale o vicina (entro il 2%: una cifra
+letta male) **e** c'è almeno un materiale possibile in comune. Così Copper × 4 (16.960) e
+Iron × 4 (17.080), vicine ma di materiali diversi, restano due rilevamenti. Se la lettura nuova è più
+sicura (`certo` meglio di `probabile`, meglio di `ambiguo`, meglio di `sconosciuto`) il rilevamento
+prende quella; `ora` resta quella della prima lettura.
+
+Le `sconosciuto` sono solo letture pulite (numero nella forma del badge, `32,300`, o scritto e detto):
+un pezzo dell'HUD letto male (`021565`, la distanza `19.5kM`) non entra nel registro.
 
 ## Per il sito
 

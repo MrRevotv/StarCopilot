@@ -1,4 +1,5 @@
 #include "input_sender.h"
+#include "game_input.h"
 #include "text_utils.h"
 
 #include <chrono>
@@ -114,6 +115,7 @@ void pressKey(int virtualKey) {
     Stroke s;
     s.scan = scanOf((UINT)virtualKey, foregroundLayout(), s.extended);
     if (s.scan == 0) return;
+    GameInput::InjectionScope injecting; // i tasti globali non lo prendono per un tasto tuo
     sendStroke(s);
 }
 
@@ -123,6 +125,8 @@ void sendChatMessage(const std::string& utf8Text, const Options& o) {
     HKL layout = foregroundLayout();
     std::vector<Stroke> plan = planText(text, layout, o.unmappable);
     if (plan.empty()) return;
+    // Per tutto il messaggio: un "-" o un "+" scritto in chat non deve far partire un tasto di Iris.
+    GameInput::InjectionScope injecting;
 
     if (o.openChat) {
         pressKey(o.openKeyVk);

@@ -1,4 +1,5 @@
 #include "hotkey_listener.h"
+#include "game_input.h"
 #include "joystick_input.h"
 #include "text_utils.h"
 
@@ -67,11 +68,11 @@ namespace {
     bool isModifier(int vk) { return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU); }
 }
 
-bool HotkeyListener::anyDown(const std::vector<TalkTrigger>& triggers) {
+bool HotkeyListener::anyDown(const std::vector<TalkTrigger>& triggers, bool keyboard) {
     for (const auto& t : triggers) {
         if (t.type == TalkTrigger::Type::Keyboard) {
             // I modificatori richiesti devono esserci (altri in più non danno fastidio).
-            if (keyDown(t.vk) && (heldMods() & t.mods) == t.mods) return true;
+            if (keyboard && keyDown(t.vk) && (heldMods() & t.mods) == t.mods) return true;
         } else if (JoystickInput::isButtonDown(t.joystickId, t.buttonIndex)) {
             return true;
         }
@@ -224,8 +225,19 @@ void HotkeyListener::stop() {
 void HotkeyListener::loop() {
     while (m_running) {
         JoystickInput::poll();
-        bool down = !m_paused && isAnyTalkTriggerDown();
-        bool chatDown = !m_paused && isAnyChatTriggerDown();
+        // Iris sta mandando tasti finti al gioco (o alla chat): un tasto di tastiera che si abbassa
+        // adesso è suo, non tuo. Esempio vero: il "-" di "CRU-L1" sulla mappa si scrive col meno
+        // del tastierino, che è anche il tasto del mining a mano (che poi si mangiava Invio ed Esc).
+        // Un tasto già tenuto giù da prima si segue lo stesso, per vederlo rilasciare.
+        const bool injecting = GameInput::injectingInput();
+        std::vector<TalkTrigger> talk, chat;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            talk = m_triggers;
+            chat = m_chatTriggers;
+        }
+        bool down = !m_paused && anyDown(talk, !injecting || m_wasDown);
+        bool chatDown = !m_paused && anyDown(chat, !injecting || m_chatWasDown);
         if (m_waitRelease) {
             // Ancora premuti da prima della pausa: non contano.
             if (down || chatDown) down = chatDown = false;
@@ -249,13 +261,13 @@ void HotkeyListener::loop() {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto& t : m_toggles) {
                 bool tDown = (GetAsyncKeyState(t.vk) & 0x8000) != 0;
-                if (tDown && !t.wasDown && !m_paused) fire.push_back(t.callback);
+                if (tDown && !t.wasDown && !m_paused && !injecting) fire.push_back(t.callback);
                 t.wasDown = tDown;
             }
             // Le azioni: lo stato si segue anche in pausa, così il tasto appena scelto
             // (ancora premuto quando la pausa finisce) non parte da solo.
             for (size_t i = 0; i < m_actions.size() && i < m_actionWasDown.size(); ++i) {
-                const bool aDown = anyDown(m_actions[i].triggers);
+                const bool aDown = anyDown(m_actions[i].triggers, !injecting || m_actionWasDown[i]);
                 if (aDown && !m_actionWasDown[i] && !m_paused) fire.push_back(m_actions[i].callback);
                 m_actionWasDown[i] = aDown;
             }

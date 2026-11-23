@@ -28,6 +28,8 @@ struct AppSettings {
     std::string voiceEngine = "neurale"; // "neurale" (Qwen3-TTS, sulla scheda video) o "windows"
     std::string voiceName = "Elsa";       // parte del nome della voce di Windows
     std::string voiceEffect = "nessuno";  // effetto da macchina, apposta: "nessuno", "ia", "androide", "robot"
+    std::string neuralVoice = "aurora";   // la voce neurale: una predefinita (NeuralVoice::presets) o "file"
+    std::string neuralVoiceFile;          // il tuo WAV di riferimento, se neuralVoice = "file"
     std::string outputDeviceName;         // dove parla Iris (vuoto = uscita predefinita di Windows)
     double speechRate = 1.1;              // 0.5 - 2.0
 
@@ -35,6 +37,9 @@ struct AppSettings {
     std::string llmModelFile;             // vuoto = Qwen2.5-7B-Instruct-Q4_K_M.gguf
     int gpuMemoryLimitMb = -1;            // -1 = senza limite, 0 = tutto sul processore
     bool gameEnabled = true;              // comandi di Star Citizen quando il gioco è aperto
+    // Legge lo stato della nave dalla telemetria del gioco (solo lettura, 127.0.0.1): "accendi le armi"
+    // con le armi già accese non le spegne. Va accesa anche nel gioco (user.cfg): vedi sc_telemetry.h.
+    bool gameTelemetryEnabled = true;
 
     // --- Overlay e finestra -------------------------------------------------------------
     bool overlayEnabled = true;
@@ -43,6 +48,7 @@ struct AppSettings {
     int overlayX = -1, overlayY = -1;
     int windowX = -1, windowY = -1;
     int windowW = -1, windowH = -1;       // dimensione della finestra (a 96 DPI; -1 = quella di partenza)
+    bool windowMaximized = false;         // ingrandita l'ultima volta: si riapre ingrandita
 
     // --- Aggiornamenti ------------------------------------------------------------------
     bool autoUpdate = true;               // controlla e scarica da solo le versioni nuove (GitHub)
@@ -130,6 +136,10 @@ struct AppSettings {
 
     // Valori fuori misura (file modificato a mano o rovinato) tornano sensati.
     void sanitize();
+
+    // La voce neurale serve? Solo se Iris risponde a voce, con la voce neurale scelta e la scheda video
+    // permessa. Con le risposte a voce spente non si carica (e se c'è si scarica): 3 GB liberi per il gioco.
+    bool wantsNeuralVoice() const { return speechEnabled && voiceEngine == "neurale" && gpuMemoryLimitMb != 0; }
 
     // Prende le impostazioni della chat da quelle di Voice to Chat (il contenuto
     // del suo settings.cfg): lingue, tasti (i suoi "trigger" diventano chatTriggers),

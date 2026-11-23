@@ -275,23 +275,10 @@ LlmEngine::Result LlmEngine::generate(const std::string& prompt, const Sampling&
     }
 
     // 1) Quello che è già nella memoria del modello (stesso inizio) non si rifà.
-    size_t common = 0;
-    while (common < m_cached.size() && common < tokens.size() && m_cached[common] == tokens[common]) ++common;
-    if (common == tokens.size()) common--; // almeno un token da elaborare, per avere la prossima parola
-    if (common < m_cached.size() && !llama_memory_seq_rm(mem, 0, (llama_pos)common, -1)) {
-        llama_memory_clear(mem, true);
-        common = 0;
-    }
-    m_cached.resize(common);
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<int> fresh(tokens.begin() + common, tokens.end());
-    if (!evalTokens(fresh, cancel)) {
-        // Interrotto a metà: la memoria non corrisponde più a m_cached.
-        llama_memory_clear(mem, true);
-        m_cached.clear();
-        return cancel && cancel->load() ? Result::Cancelled : Result::Error;
-    }
-    m_cached.insert(m_cached.end(), fresh.begin(), fresh.end());
+    size_t freshCount = 0;
+    const Result synced = syncCache(tokens, cancel, freshCount);
+    if (synced != Result::Ok) return synced;
     const auto t1 = std::chrono::steady_clock::now();
 
     // 2) La risposta, una parola alla volta.
@@ -313,7 +300,13 @@ LlmEngine::Result LlmEngine::generate(const std::string& prompt, const Sampling&
     std::string pending; // byte di un carattere UTF-8 non ancora completo
     for (; generated < maxNew; ++generated) {
         if (cancel && cancel->load()) { result = Result::Cancelled; break; }
-        llama_token token = llama_sampler_sample(sampler, ctx, -1);
+        llama_token token;
+        if (generated == 0 && sampling.greedyFirstToken && m_greedy) {
+            token = llama_sampler_sample(static_cast<llama_sampler*>(m_greedy), ctx, -1);
+            llama_sampler_accept(sampler, token);
+        } else {
+            token = llama_sampler_sample(sampler, ctx, -1);
+        }
         if (llama_vocab_is_eog(vocab, token)) break;
 
         char piece[256];
@@ -354,9 +347,49 @@ LlmEngine::Result LlmEngine::generate(const std::string& prompt, const Sampling&
 
     const auto t2 = std::chrono::steady_clock::now();
     const auto ms = [](auto a, auto b) { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
-    Log::info("LLM: " + std::to_string(fresh.size()) + " token nuovi su " + std::to_string(tokens.size()) + " in " + std::to_string(ms(t0, t1)) +
+    Log::info("LLM: " + std::to_string(freshCount) + " token nuovi su " + std::to_string(tokens.size()) + " in " + std::to_string(ms(t0, t1)) +
               " ms, risposta " + std::to_string(generated) + " token in " + std::to_string(ms(t1, t2)) + " ms");
     return result;
+}
+
+LlmEngine::Result LlmEngine::syncCache(const std::vector<int>& tokens, const std::atomic<bool>* cancel, size_t& fresh) {
+    fresh = 0;
+    if (tokens.empty()) return Result::Error;
+    llama_memory_t mem = llama_get_memory(static_cast<llama_context*>(m_ctx));
+    size_t common = 0;
+    while (common < m_cached.size() && common < tokens.size() && m_cached[common] == tokens[common]) ++common;
+    if (common == tokens.size()) common--; // almeno un token da elaborare (per la prossima parola, o per svegliare la scheda)
+    if (common < m_cached.size() && !llama_memory_seq_rm(mem, 0, (llama_pos)common, -1)) {
+        llama_memory_clear(mem, true);
+        common = 0;
+    }
+    m_cached.resize(common);
+    std::vector<int> part(tokens.begin() + common, tokens.end());
+    if (!evalTokens(part, cancel)) {
+        // Interrotto a metà: la memoria non corrisponde più a m_cached.
+        llama_memory_clear(mem, true);
+        m_cached.clear();
+        return cancel && cancel->load() ? Result::Cancelled : Result::Error;
+    }
+    m_cached.insert(m_cached.end(), part.begin(), part.end());
+    fresh = part.size();
+    return Result::Ok;
+}
+
+bool LlmEngine::prefill(const std::string& promptPrefix, const std::atomic<bool>* cancel) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_ready) return false;
+    const std::vector<int> tokens = tokenize(llama_model_get_vocab(static_cast<llama_model*>(m_model)), promptPrefix, true);
+    if (tokens.empty() || (int)tokens.size() + 64 >= m_nCtx) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t fresh = 0;
+    const Result r = syncCache(tokens, cancel, fresh);
+    const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    // Solo quando c'era davvero da fare (o la scheda era lenta): niente righe a ogni frase sentita.
+    if (fresh > 1 || ms > 150) {
+        Log::info("LLM pronto alla domanda: " + std::to_string(fresh) + " token su " + std::to_string(tokens.size()) + " in " + std::to_string(ms) + " ms");
+    }
+    return r == Result::Ok;
 }
 
 // --- Traduzioni (chat di gioco, da Voice to Chat) ---------------------------------------

@@ -25,4 +25,15 @@ namespace SpeechText {
     // indirizzi web ed emoji; "°C" diventa "gradi", "km/h" "chilometri orari".
     std::string speakable(const std::string& text);
 
+    // L'ultimo passo prima della voce (lo fa TtsEngine, per ogni motore): numeri in
+    // lettere ("16.960" -> "sedicimila novecentosessanta", "2,5" -> "due virgola
+    // cinque", "15%" -> "quindici per cento", "-12"), unità ("km", "m/s") e le sigle
+    // che la voce neurale legge male ("SCU", "QT", "ATC", "x4"). I codici come "F7C",
+    // "Area18", "UEC" li legge bene da sé e restano. La conversazione scritta (e il
+    // controllo dell'eco) restano con le cifre.
+    std::string forVoice(const std::string& text);
+
+    // Un intero in lettere, in italiano ("ventitré", "duemila trecento", "un milione").
+    std::string numberToWords(long long n);
+
 } // namespace SpeechText

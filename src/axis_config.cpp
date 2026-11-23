@@ -328,22 +328,20 @@ bool exists() { return GetFileAttributesW(path().c_str()) != INVALID_FILE_ATTRIB
 
 Settings load() {
     std::string text;
-    if (readFile(path(), text)) return parse(text);
+    bool fromBackup = false;
+    if (AppPaths::readFileOrBackup(path(), text, &fromBackup) && !text.empty()) {
+        if (fromBackup) Log::warn("Axis: axis.json vuoto o illeggibile, uso la copia di sicurezza (axis.json.bak)");
+        return parse(text);
+    }
     Settings s;
     s.sanitize();
     return s;
 }
 
 bool save(const Settings& settings) {
-    // Prima in un file a parte, poi al posto di quello vero: un'interruzione non lo lascia a metà.
-    const std::wstring target = path(), temp = target + L".tmp";
-    {
-        std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        f << serialize(settings);
-        if (!f) return false;
-    }
-    return MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    // Prima in un file a parte mandato sul disco, poi al posto di quello vero (il vecchio resta come
+    // axis.json.bak): uno spegnimento a metà non lo lascia vuoto.
+    return AppPaths::writeFileSafely(path(), serialize(settings));
 }
 
 bool importFromAxisVisualizer(Settings& out, std::string& message) {
