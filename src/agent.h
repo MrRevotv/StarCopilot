@@ -40,6 +40,9 @@ public:
     Result ask(const std::string& userText, const Callbacks& callbacks, const std::atomic<bool>* cancel, std::string& answer);
     void reset();
     size_t exchanges() const { return m_history.size(); }
+    // L'ultima ask() chiedeva un'azione e il modello ha detto "fatto" senza farla (due volte): la risposta
+    // è stata sostituita con "Non l'ho fatto...". Per il suono d'errore a voce spenta.
+    bool lastUnfulfilled() const { return m_unfulfilled; }
 
     // Prepara il modello alla prossima domanda: istruzioni, strumenti e conversazione già
     // elaborati (e il modello davvero pronto sulla scheda video), così la risposta parte
@@ -65,5 +68,6 @@ private:
     Persona m_persona;
     // Uno scambio = domanda, eventuali strumenti, risposta.
     std::vector<std::vector<ChatFormat::Message>> m_history;
+    bool m_unfulfilled = false;
     std::vector<std::string> m_actions; // vedi noteAction
 };

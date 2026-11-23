@@ -2,6 +2,7 @@
 
 #include "command_matcher.h"
 #include "game_profile.h"
+#include "sc_telemetry.h"
 
 #include <windows.h>
 
@@ -11,6 +12,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,9 +24,14 @@
 //  - rotta: aspetta che la mappa sia aperta, verifica con l'OCR che il nome
 //    sia stato scritto (se no riclicca e riscrive), aspetta i risultati;
 //  - se il gioco è avviato come amministratore e Iris no, lo dice (Windows
-//    scarterebbe i tasti senza errori).
+//    scarterebbe i tasti senza errori);
+//  - con la telemetria del gioco (setShipStateProvider) i tasti "interruttore" guardano prima
+//    com'è la nave: "accendi le armi" con le armi già accese non preme niente (vedi ship_toggle.h).
 class GameController {
 public:
+    // Lo stato della nave adesso; nullopt = non si sa (si preme come sempre).
+    using ShipStateProvider = std::function<std::optional<ScTelemetry::ShipState>()>;
+
     struct Result {
         bool ok = false;
         std::string spoken; // da dire a voce (vuoto = basta un suono)
@@ -61,11 +68,15 @@ public:
     // say: per le frasi da dire SUBITO (es. "Calcolo la rotta..." prima di cominciare).
     Result execute(const Cmd::Match& match, const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel);
     // Dallo strumento del modello: "press:landing_gear", "set_route" + destinazione.
+    // state: il verso che il modello ha capito ("on", "off"; per il carrello "down", "up"), vuoto = non detto;
+    // heard: la richiesta dell'utente, per ricavare il verso se il modello non lo dice.
     Result executeById(const std::string& id, const std::string& destination, const std::function<void(const std::string&)>& say,
-                       const std::atomic<bool>* cancel);
+                       const std::atomic<bool>* cancel, const std::string& state = {}, const std::string& heard = {});
     std::string toolDefinition(); // JSON dello strumento game_command
 
     void setDryRun(bool on);
+    // La telemetria del gioco (Assistant: ScTelemetry::Client::current()). Vuoto = senza.
+    void setShipStateProvider(ShipStateProvider provider);
 
     // Porta il gioco in primo piano (calibrazione, lettura); altrimenti il motivo.
     bool bringToFront(std::string& error);
@@ -82,8 +93,11 @@ public:
     void noteUnrecognized(const std::string& text, const Cmd::Match& nearMiss);
 
 private:
-    Result run(const GameCommand& command, const std::map<std::string, std::string>& slots, const std::function<void(const std::string&)>& say,
+    Result executeWith(const Cmd::Match& match, const std::string& state, const std::function<void(const std::string&)>& say,
+                       const std::atomic<bool>* cancel);
+    Result run(const Cmd::Match& match, const std::string& state, const std::function<void(const std::string&)>& say,
                const std::atomic<bool>* cancel);
+    std::optional<ScTelemetry::ShipState> shipState();
     // Il gioco in primo piano, pronto a ricevere i tasti; altrimenti il motivo.
     bool prepareGame(const GameProfile& p, HWND& window, std::string& why, std::string& brief);
     void pressLogical(const GameProfile& p, const std::string& logical, std::string& note);
@@ -101,6 +115,9 @@ private:
     HWND m_window = nullptr;
     bool m_hasLast = false;
     Cmd::Match m_last; // per "ancora"
+    std::string m_lastState; // il verso dato dal modello all'ultimo comando
+    std::chrono::steady_clock::time_point m_lastTime{}; // per "spegnile" (vale per qualche minuto)
+    ShipStateProvider m_shipState;
     std::deque<std::string> m_actions;
     std::deque<std::string> m_unrecognized;
 };

@@ -20,6 +20,7 @@ namespace Cmd {
         double score = 0.0;
         std::map<std::string, std::string> slots; // es. destination = "Stazione Orbitale Seraphim"
         std::string phrase;                        // la frase del dizionario che ha vinto
+        std::string heard;                         // la frase detta, normalizzata e corretta (il pezzo che ha vinto)
     };
 
     // Minuscolo, senza accenti né punteggiatura, spazi singoli ("Modalità VTOL!" -> "modalita vtol").
@@ -53,5 +54,8 @@ namespace Cmd {
     // disattivare/abbassare/annullare, 0 nessuno o tutti e due. Due frasi di verso opposto non si
     // confondono mai ("disattiva gli scudi" non diventa "alza gli scudi").
     int polarity(const std::string& normalized);
+    // C'è un verbo col pronome attaccato ("spegnile", "riaccendilo", "alzali"): la frase parla di
+    // qualcosa detto prima, non lo nomina.
+    bool hasPronounVerb(const std::string& normalized);
 
 } // namespace Cmd

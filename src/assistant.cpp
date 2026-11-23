@@ -88,6 +88,11 @@ namespace {
         return s;
     }
 
+    // I due file della voce neurale ci sono (scaricati per intero).
+    bool neuralVoiceFilesPresent() {
+        return fileExists(AppPaths::neuralVoiceModelPath()) && fileExists(AppPaths::neuralVoiceMmprojPath());
+    }
+
     bool isNewConversationCommand(const std::string& command) {
         const std::string n = WakeWord::normalize(command);
         return n == "nuova conversazione" || n == "ricominciamo" || n == "ricominciamo da capo" || n == "dimentica tutto" ||
@@ -129,6 +134,7 @@ Assistant::Assistant() {
 
 Assistant::~Assistant() {
     shutdown();
+    if (m_voiceThread.joinable()) m_voiceThread.join(); // partito proprio mentre si chiudeva
 }
 
 void Assistant::setListener(Listener listener) {
@@ -147,6 +153,13 @@ void Assistant::start() {
     if (m_worker.joinable()) return;
     m_game.load();
     AppSettings s = settings();
+    // La telemetria del gioco: i tasti "interruttore" (armi, scudi, carrello...) guardano com'è la nave
+    // prima di premere. nullopt = non si sa (telemetria spenta, gioco chiuso, a piedi): si preme come sempre.
+    m_game.setShipStateProvider([this]() -> std::optional<ScTelemetry::ShipState> {
+        if (!settings().gameTelemetryEnabled) return std::nullopt;
+        return m_telemetry.current();
+    });
+    applyTelemetry(s);
     m_audio.setGain(s.micGain);
     m_hotkeys.setTalkTriggers(s.triggers);
     m_hotkeys.setChatTriggers(s.chatEnabled ? s.chatTriggers : std::vector<TalkTrigger>{});
@@ -274,9 +287,10 @@ void Assistant::startupThread() {
     }
     // Finché la voce neurale si carica, le frasi la aspettano (niente frasi con la voce di Windows
     // in mezzo); loadModels lo spegne se poi non c'è.
-    m_tts.setUseNeural(settings().voiceEngine == "neurale" && Gpu::bestDevice());
+    m_tts.setUseNeural(settings().wantsNeuralVoice() && Gpu::bestDevice());
     // La voce neurale: se il download non riesce, parla la voce di Windows (Iris parte lo stesso).
-    if (settings().voiceEngine == "neurale" && !m_neural.isReady() && Gpu::bestDevice()) {
+    // Con le risposte a voce spente non si scarica e non si carica: se le riaccendi e manca, al prossimo avvio.
+    if (settings().wantsNeuralVoice() && !m_neural.isReady() && Gpu::bestDevice()) {
         if (!ensureModel(kVoiceUrl, AppPaths::neuralVoiceModelPath(), true, kVoiceMinBytes, "modello della voce", 4, 5) ||
             !ensureModel(kVoiceMmprojUrl, AppPaths::neuralVoiceMmprojPath(), true, kVoiceMmprojMinBytes, "decodificatore della voce", 5, 5)) {
             Log::warn("Voce neurale non scaricata: uso la voce di Windows");
@@ -284,7 +298,7 @@ void Assistant::startupThread() {
         if (m_stopping) return;
     }
     if (!loadModels()) {
-        m_tts.setUseNeural(m_neural.isReady() && settings().voiceEngine == "neurale"); // niente attese per una voce che non arriva
+        m_tts.setUseNeural(m_neural.isReady() && settings().wantsNeuralVoice()); // niente attese per una voce che non arriva
         return;
     }
     if (!m_vad.usesModel()) m_vad.init(AppPaths::toLibraryPath(AppPaths::vadModelPath()), 1);
@@ -327,8 +341,12 @@ bool Assistant::loadModels() {
         if ((m_whisper.isReady() || m_llm.isReady()) && (limitMb != m_loadedGpuLimitMb || s.llmModelFile != m_loadedModelFile)) {
             m_whisper.unload();
             m_llm.unload();
+            std::lock_guard<std::mutex> lock(m_neuralMutex);
+            m_tts.setUseNeural(false);
             m_neural.unload();
         }
+        // La voce neurale arriva o se ne va con un limite di memoria: il cervello si rifà della misura giusta.
+        if (m_rebalanceLlm.exchange(false) && m_llm.isReady()) m_llm.unload();
         m_loadedGpuLimitMb = limitMb;
         m_loadedModelFile = s.llmModelFile;
 
@@ -342,32 +360,16 @@ bool Assistant::loadModels() {
         }
         if (m_stopping) return false;
 
-        // La voce neurale: solo sulla scheda video (sul processore sarebbe più lenta del parlato).
-        const bool wantNeural = s.voiceEngine == "neurale" && limitMb != 0 && Gpu::bestDevice() &&
-                                fileExists(AppPaths::neuralVoiceModelPath()) && fileExists(AppPaths::neuralVoiceMmprojPath());
-        if (!wantNeural && m_neural.isReady()) {
-            m_tts.setUseNeural(false);
-            m_neural.unload();
-        }
-        if (wantNeural && !m_neural.isReady()) {
-            setStatus(State::Starting, "Carico la voce neurale...");
-            if (m_neural.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()),
-                              inferenceThreads())) {
-                // La voce scelta (la prima volta il modello genera la predefinita: qualche secondo)
-                // e una frase a vuoto con lei: la prima sulla scheda video è lenta.
-                setStatus(State::Starting, "Preparo la voce neurale...");
-                m_neural.setVoice(s.neuralVoice, s.neuralVoiceFile);
-                m_neural.prepare();
-            } else {
-                Log::warn("Voce neurale non caricata: uso la voce di Windows");
-            }
-        }
-        m_tts.setUseNeural(m_neural.isReady() && s.voiceEngine == "neurale");
+        // La voce neurale: solo sulla scheda video, e solo se Iris risponde a voce (vedi applyNeuralVoice).
+        applyNeuralVoice(true);
         if (m_stopping) return false;
 
         if (!m_llm.isReady()) {
             setStatus(State::Starting, "Carico il cervello di Iris...");
             const long long voiceBytes = !m_whisper.onGpu() ? 0 : m_whisper.gpuBytes() > 0 ? m_whisper.gpuBytes() : kWhisperGpuBytes;
+            // Solo la voce neurale caricata conta. Con le risposte a voce spente il suo posto va al cervello:
+            // tenerlo da parte, con un limite di 4 GB, mandava il cervello tutto sul processore (lentissimo).
+            // Se le riaccendi con un limite, il cervello si ricarica più piccolo (vedi applyChanges).
             const long long neuralBytes = !m_neural.isReady() ? 0 : m_neural.gpuBytes() > 0 ? m_neural.gpuBytes() : kVoiceGpuBytes;
             const long long budget = limitMb < 0 ? -1 : std::max(0LL, ((long long)limitMb << 20) - voiceBytes - neuralBytes);
             if (!m_llm.init(AppPaths::toLibraryPath(AppPaths::llmModelPath(s.llmModelFile)), inferenceThreads(), budget)) {
@@ -377,37 +379,105 @@ bool Assistant::loadModels() {
         }
         if (m_stopping) return false;
 
-        std::string summary;
-        if (!Gpu::bestDevice()) {
-            summary = "Nessuna scheda video compatibile: tutto sul processore.";
-        } else {
-            const std::string voice = m_whisper.onGpu() ? "modello vocale" + gigabytes(m_whisper.gpuBytes()) : "";
-            const int layers = m_llm.gpuLayers(), total = m_llm.totalLayers();
-            const std::string brain = layers <= 0 ? ""
-                                      : layers >= total ? "cervello intero" + gigabytes(m_llm.gpuBytes())
-                                                        : "cervello, " + std::to_string(layers) + " parti su " + std::to_string(total) + gigabytes(m_llm.gpuBytes());
-            const std::string speech = m_neural.isReady() ? "voce neurale" + gigabytes(m_neural.gpuBytes()) : "";
-            std::vector<std::string> parts;
-            for (const std::string& p : { voice, speech, brain }) {
-                if (!p.empty()) parts.push_back(p);
-            }
-            if (parts.empty()) summary = "Niente sulla scheda video, tutto sul processore.";
-            else {
-                summary = "Sulla scheda video: ";
-                for (size_t i = 0; i < parts.size(); ++i) summary += (i == 0 ? "" : i + 1 == parts.size() ? " e " : ", ") + parts[i];
-                summary += std::string(".") + (layers < total ? " Il resto del cervello sul processore." : "");
-            }
-        }
-        summary += " Modello: " + m_llm.modelName() + ".";
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_gpuSummary = summary;
-        }
-        Log::info("Memoria video: " + summary);
+        updateGpuSummary();
 
         const AppSettings now = settings();
         if (now.gpuMemoryLimitMb == limitMb && now.llmModelFile == s.llmModelFile && now.voiceEngine == s.voiceEngine) return true;
     }
+}
+
+bool Assistant::applyNeuralVoice(bool starting) {
+    std::lock_guard<std::mutex> lock(m_neuralMutex);
+    // Le impostazioni di adesso: si possono cambiare mentre un'altra parte carica la voce.
+    const AppSettings s = settings();
+    const bool files = neuralVoiceFilesPresent();
+    // Solo sulla scheda video (sul processore sarebbe più lenta del parlato), e solo con le risposte a voce
+    // accese: spente, i suoi 3 GB restano liberi per il gioco (il suono di conferma non ne ha bisogno).
+    const bool want = s.wantsNeuralVoice() && Gpu::bestDevice() && files;
+    bool changed = false;
+    if (!want && m_neural.isReady()) {
+        m_tts.setUseNeural(false);
+        const long long bytes = m_neural.gpuBytes() > 0 ? m_neural.gpuBytes() : kVoiceGpuBytes;
+        m_neural.unload();
+        Log::info(std::string("Voce neurale scaricata (") + (!s.speechEnabled ? "risposte a voce spente" : "voce di Windows") + "): liberati circa " +
+                  std::to_string(bytes >> 20) + " MB della scheda video");
+        changed = true;
+    } else if (want && !m_neural.isReady()) {
+        m_tts.setUseNeural(true); // le frasi aspettano lei: la voce di Windows non parla nel frattempo
+        if (starting) setStatus(State::Starting, "Carico la voce neurale...");
+        else Log::info("Carico la voce neurale");
+        if (m_neural.load(AppPaths::toLibraryPath(AppPaths::neuralVoiceModelPath()), AppPaths::toLibraryPath(AppPaths::neuralVoiceMmprojPath()),
+                          inferenceThreads())) {
+            // La voce scelta (la prima volta il modello genera la predefinita: qualche secondo)
+            // e una frase a vuoto con lei: la prima sulla scheda video è lenta.
+            if (starting) setStatus(State::Starting, "Preparo la voce neurale...");
+            m_neural.setVoice(s.neuralVoice, s.neuralVoiceFile);
+            m_neural.prepare();
+        } else {
+            Log::warn("Voce neurale non caricata: uso la voce di Windows");
+        }
+        changed = true;
+    } else if (!want && !s.speechEnabled && s.voiceEngine == "neurale" && starting) {
+        Log::info("Voce neurale non caricata: le risposte a voce sono spente (si carica quando le riaccendi)");
+    } else if (!want && s.wantsNeuralVoice() && Gpu::bestDevice() && !files && !starting) {
+        Log::info("La voce neurale non è ancora scaricata: si scarica al prossimo avvio (intanto parla la voce di Windows)");
+    }
+    m_tts.setUseNeural(m_neural.isReady() && s.wantsNeuralVoice());
+    return changed;
+}
+
+void Assistant::syncNeuralVoice() {
+    if (m_stopping) return;
+    m_voiceSyncPending = true;
+    if (m_voiceSyncRunning.exchange(true)) return; // quello in corso ricontrolla prima di finire
+    if (m_voiceThread.joinable()) m_voiceThread.join(); // è finito (o sta uscendo)
+    m_voiceThread = std::thread([this]() {
+        // Prima finisce l'avvio (o la ricarica dei modelli): un modello alla volta sulla scheda video. Anche
+        // l'avvio guarda le impostazioni di adesso, quindi spesso qui poi non resta niente da fare.
+        while (m_startupRunning && !m_stopping) Sleep(100);
+        do {
+            while (m_voiceSyncPending.exchange(false) && !m_stopping) {
+                try {
+                    if (applyNeuralVoice(false)) updateGpuSummary();
+                } catch (const std::exception& e) {
+                    Log::error(std::string("Voce neurale: errore interno (") + e.what() + ")");
+                }
+            }
+            m_voiceSyncRunning = false;
+            // Una richiesta arrivata proprio adesso (chi l'ha fatta ha visto questo thread ancora acceso): la si fa qui.
+        } while (m_voiceSyncPending && !m_stopping && !m_voiceSyncRunning.exchange(true));
+    });
+}
+
+void Assistant::updateGpuSummary() {
+    std::string summary;
+    if (!Gpu::bestDevice()) {
+        summary = "Nessuna scheda video compatibile: tutto sul processore.";
+    } else {
+        const std::string voice = m_whisper.onGpu() ? "modello vocale" + gigabytes(m_whisper.gpuBytes()) : "";
+        const int layers = m_llm.gpuLayers(), total = m_llm.totalLayers();
+        const std::string brain = layers <= 0 ? ""
+                                  : layers >= total ? "cervello intero" + gigabytes(m_llm.gpuBytes())
+                                                    : "cervello, " + std::to_string(layers) + " parti su " + std::to_string(total) + gigabytes(m_llm.gpuBytes());
+        const std::string speech = m_neural.isReady() ? "voce neurale" + gigabytes(m_neural.gpuBytes()) : "";
+        std::vector<std::string> parts;
+        for (const std::string& p : { voice, speech, brain }) {
+            if (!p.empty()) parts.push_back(p);
+        }
+        if (parts.empty()) summary = "Niente sulla scheda video, tutto sul processore.";
+        else {
+            summary = "Sulla scheda video: ";
+            for (size_t i = 0; i < parts.size(); ++i) summary += (i == 0 ? "" : i + 1 == parts.size() ? " e " : ", ") + parts[i];
+            summary += std::string(".") + (layers < total ? " Il resto del cervello sul processore." : "");
+        }
+    }
+    summary += " Modello: " + m_llm.modelName() + ".";
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_gpuSummary = summary;
+    }
+    Log::info("Memoria video: " + summary);
+    notify(Event::Status);
 }
 
 void Assistant::reloadModels() {
@@ -512,6 +582,7 @@ void Assistant::shutdown() {
     Log::info("Chiusura");
     m_cancel = true;
     m_hotkeys.stop();
+    m_telemetry.stop();
     m_gameLog.stop();
     m_mining.shutdown();
     m_chat.shutdown();
@@ -524,6 +595,7 @@ void Assistant::shutdown() {
     if (m_listenThread.joinable()) m_listenThread.join();
     if (m_speechThread.joinable()) m_speechThread.join();
     if (m_worker.joinable()) m_worker.join();
+    if (m_voiceThread.joinable()) m_voiceThread.join();
     m_tts.shutdown();
     std::lock_guard<std::mutex> lock(m_audioMutex);
     m_audio.close();
@@ -606,11 +678,22 @@ void Assistant::applyChanges(const AppSettings& before, const AppSettings& after
     if (before.neuralVoice != after.neuralVoice || before.neuralVoiceFile != after.neuralVoiceFile) {
         m_neural.setVoice(after.neuralVoice, after.neuralVoiceFile); // si prepara alla prossima frase
     }
-    if (before.voiceEngine != after.voiceEngine) {
-        // Verso Windows: subito. Verso la voce neurale: la si carica (qualche secondo; se manca, la si scarica al prossimo avvio).
-        m_tts.setUseNeural(after.voiceEngine == "neurale" && m_neural.isReady());
-        if (after.voiceEngine == "windows" || !m_neural.isReady()) reloadModels();
+    if (before.voiceEngine != after.voiceEngine || before.speechEnabled != after.speechEnabled) {
+        // Verso Windows o risposte a voce spente: la voce neurale si scarica (memoria della scheda video libera).
+        // Verso la voce neurale o riaccese: la si carica (qualche secondo; se manca, la si scarica al prossimo
+        // avvio). Whisper e il modello di linguaggio restano dove sono, Iris non si ferma. Il "si aspetta la
+        // neurale" va deciso subito: una frase detta adesso la aspetta invece di uscire con la voce di Windows.
+        m_tts.setUseNeural(after.wantsNeuralVoice() && Gpu::bestDevice() && neuralVoiceFilesPresent());
+        if (after.gpuMemoryLimitMb > 0 && m_ready && !m_startupRunning) {
+            // Con un limite di memoria video il cervello va rifatto della misura giusta: più grande senza la
+            // voce neurale, più piccolo con lei. Qualche secondo di pausa, solo a questo cambio.
+            m_rebalanceLlm = true;
+            reloadModels();
+        } else {
+            syncNeuralVoice();
+        }
     }
+    if (before.gameTelemetryEnabled != after.gameTelemetryEnabled) applyTelemetry(after);
     if (before.deviceNames != after.deviceNames && m_ready) {
         openAudio(after.deviceNames);
         m_audio.setStreaming(after.wakeWordEnabled);
@@ -1375,6 +1458,9 @@ void Assistant::processCommand(const std::string& text) {
     };
 
     std::string answer;
+    m_requestText = text;
+    m_requestGameCommands = 0;
+    m_requestGameFailed = false;
     Agent::Result r = m_agent.ask(text, cb, &m_cancel, answer);
     m_busy = false;
     switch (r) {
@@ -1392,6 +1478,11 @@ void Assistant::processCommand(const std::string& text) {
         if (s.speechEnabled) say(sorry);
         break;
     }
+    }
+    // Risposte a voce spente: l'unica conferma è il suono, come per i comandi istantanei (il testo resta scritto).
+    if (!s.speechEnabled) {
+        if (r == Agent::Result::Error || m_agent.lastUnfulfilled()) m_tts.chime(TtsEngine::Chime::Error);
+        else if (m_requestGameCommands > 0) m_tts.chime(m_requestGameFailed ? TtsEngine::Chime::Error : TtsEngine::Chime::Confirm);
     }
     Log::info("Risposta: \"" + answer + "\"");
 
@@ -1488,6 +1579,21 @@ void Assistant::testGameCommand(const std::string& text) {
     dispatchCommand(t);
 }
 
+std::string Assistant::telemetryStatus() const {
+    if (!settings().gameTelemetryEnabled) return "Spenta: Iris preme i tasti senza guardare com'è la nave.";
+    return m_telemetry.statusText();
+}
+
+void Assistant::applyTelemetry(const AppSettings& s) {
+    if (s.gameTelemetryEnabled && !m_telemetry.running()) {
+        m_telemetry.start();
+        Log::info("Telemetria di Star Citizen: accesa (solo lettura, 127.0.0.1:2942)");
+    } else if (!s.gameTelemetryEnabled && m_telemetry.running()) {
+        m_telemetry.stop();
+        Log::info("Telemetria di Star Citizen: spenta");
+    }
+}
+
 std::vector<std::string> Assistant::extraToolDefinitions() {
     std::vector<std::string> tools;
     if (gameActive()) tools.push_back(m_game.toolDefinition());
@@ -1530,17 +1636,27 @@ bool Assistant::runExtraTool(const std::string& name, const std::string& argumen
         return true;
     }
     if (name != "game_command") return false;
+    m_requestGameCommands++;
     if (!gameActive()) {
+        m_requestGameFailed = true;
         result = "Errore: il gioco non è aperto (o i comandi di gioco sono spenti).";
         return true;
     }
     nlohmann::json a = nlohmann::json::parse(argumentsJson, nullptr, false);
-    const std::string command = a.is_object() && a.contains("command") && a["command"].is_string() ? a["command"].get<std::string>() : "";
-    const std::string destination = a.is_object() && a.contains("destination") && a["destination"].is_string() ? a["destination"].get<std::string>() : "";
+    auto field = [&](const char* k) { return a.is_object() && a.contains(k) && a[k].is_string() ? TextUtils::trim(a[k].get<std::string>()) : std::string(); };
+    const std::string command = field("command");
+    std::string destination = field("destination"), state = field("state");
+    // game_command("press:weapons", "on"): il verso finito al posto della destinazione.
+    if (state.empty() && !destination.empty() && !TextUtils::startsWith(command, "set_route")) {
+        state = destination;
+        destination.clear();
+    }
     const bool speech = settings().speechEnabled && !briefReplies(); // brevi: niente annuncio, parla solo la risposta finale
+    // Come i comandi istantanei: il verso (state, o la richiesta dell'utente) e la telemetria decidono se premere.
     const GameController::Result r = m_game.executeById(command, destination, [&](const std::string& t) {
         if (speech && !t.empty()) say(t);
-    }, cancel);
+    }, cancel, state, m_requestText);
+    if (!r.ok) m_requestGameFailed = true;
     addEntry(Entry::Kind::Tool, "Comando di gioco: " + r.shown);
     result = gameToolResult(r);
     return true;

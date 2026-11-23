@@ -131,6 +131,7 @@ AppSettings AppSettings::parse(const std::string& content) {
         else if (key == "llmModelFile") s.llmModelFile = v;
         else if (key == "gpuMemoryLimitMb") s.gpuMemoryLimitMb = toInt(v, -1);
         else if (key == "gameEnabled") s.gameEnabled = toBool(v);
+        else if (key == "gameTelemetryEnabled") s.gameTelemetryEnabled = toBool(v);
         else if (key == "overlayEnabled") s.overlayEnabled = toBool(v);
         else if (key == "overlayOpacity") s.overlayOpacity = toInt(v, 230);
         else if (key == "overlaySize") s.overlaySize = toInt(v, 160);
@@ -293,6 +294,7 @@ std::string AppSettings::serialize() const {
     o << "llmModelFile=" << oneLine(llmModelFile) << "\n";
     o << "gpuMemoryLimitMb=" << gpuMemoryLimitMb << "\n";
     o << "gameEnabled=" << (gameEnabled ? 1 : 0) << "\n";
+    o << "gameTelemetryEnabled=" << (gameTelemetryEnabled ? 1 : 0) << "\n";
     o << "overlayEnabled=" << (overlayEnabled ? 1 : 0) << "\n";
     o << "overlayOpacity=" << overlayOpacity << "\n";
     o << "overlaySize=" << overlaySize << "\n";

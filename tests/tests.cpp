@@ -44,9 +44,11 @@
 #include "screen_capture.h"
 #include "screen_match.h"
 #include "screen_ocr.h"
+#include "sc_telemetry.h"
 #include "speech_utils.h"
 #include "translation_prompt.h"
 #include "speech_text.h"
+#include "ship_toggle.h"
 #include "text_utils.h"
 #include "tools.h"
 #include "tts_engine.h"
@@ -2738,6 +2740,490 @@ static void testCommandEditor() {
     CHECK(back.commands.back().phrases == std::vector<std::string>({ "Apri le porte", "porte" }));
 }
 
+// --- Interruttori della nave con la telemetria (ship_toggle) ------------------------------------------------
+namespace ship_toggle_tests {
+    namespace ST = ShipToggle;
+    using ST::Field;
+    using ST::Value;
+
+    // Una nave seduta al posto di pilotaggio, tutto acceso (alimentazione, motori, scudi, armi), carrello giù.
+    ScTelemetry::ShipState seatedShip() {
+        ScTelemetry::ShipState s;
+        s.hasVehicle = s.hasPower = s.hasFlightState = s.hasFlightSettings = true;
+        s.className = "AEGS_Gladius";
+        s.lightsOn = false;
+        s.powerPlants = s.engines = s.shieldGenerators = s.weapons = true;
+        s.gear = ScTelemetry::Deploy::Deployed;
+        s.coupled = { true, true };
+        s.cruise = { true, false };
+        return s;
+    }
+
+    // Il gioco finto: lo stato, un orologio che va avanti solo con le attese, i tasti premuti e cosa fanno.
+    struct FakeGame {
+        ScTelemetry::ShipState s = seatedShip();
+        int clock = 0, pauses = 0;
+        bool lost = false;
+        std::vector<std::string> pressed;
+        std::vector<std::pair<int, std::function<void(ScTelemetry::ShipState&)>>> later; // tra quanti ms, cosa cambia
+        std::function<void(const std::string&)> onPress;                                 // cosa fa un tasto
+        std::map<std::string, std::string> keys = GameProfile::defaults().keys;
+
+        void at(int delayMs, std::function<void(ScTelemetry::ShipState&)> change) { later.push_back({ clock + delayMs, std::move(change) }); }
+        std::optional<ScTelemetry::ShipState> state() {
+            for (auto it = later.begin(); it != later.end();) {
+                if (it->first <= clock) {
+                    it->second(s);
+                    it = later.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (lost) return std::nullopt;
+            return s;
+        }
+        ST::Env env() {
+            ST::Env e;
+            e.state = [this]() { return state(); };
+            e.press = [this](const std::string& logical, bool& ok) {
+                pressed.push_back(logical);
+                auto it = keys.find(logical);
+                ok = it != keys.end() && !it->second.empty();
+                if (ok && onPress) onPress(logical);
+                return ok ? it->second : "nessun tasto per \"" + logical + "\" nel profilo";
+            };
+            e.wait = [this](int ms) {
+                clock += ms;
+                return true;
+            };
+            e.pause = [this]() {
+                clock += 1000;
+                pauses++;
+                return true;
+            };
+            e.cancelled = []() { return false; };
+            return e;
+        }
+    };
+
+    void run() {
+        std::printf("\n[interruttori della nave con la telemetria]\n");
+        const GameProfile p = GameProfile::defaults();
+
+        section("tasto -> campo della telemetria (tasti veri del profilo predefinito)");
+        const std::vector<std::pair<std::string, Field>> fields = { { "lights", Field::Lights },       { "weapons", Field::Weapons },
+                                                                    { "shields", Field::Shields },     { "engines", Field::Engines },
+                                                                    { "power", Field::Power },         { "landing_gear", Field::Gear },
+                                                                    { "decoupled", Field::Decoupled }, { "cruise", Field::Cruise } };
+        for (const auto& [key, field] : fields) {
+            CHECK(ST::fieldFor(key) == field);
+            CHECK(p.keys.count(key) == 1 && !p.keys.at(key).empty()); // il tasto c'è nel profilo
+            bool command = false;
+            for (const auto& c : p.commands) command = command || c.id() == "press:" + key;
+            CHECK(command); // e c'è il comando
+        }
+        CHECK_STR(p.keys.at("weapons"), "P");
+        CHECK_STR(p.keys.at("landing_gear"), "N");
+        CHECK_STR(p.keys.at("decoupled"), "LAlt+C");
+        CHECK(ST::fieldFor("vtol") == Field::None); // la telemetria lo dà sbagliato: non si controlla
+        CHECK(ST::fieldFor("missiles") == Field::None && ST::fieldFor("quantum_spool") == Field::None && ST::fieldFor("") == Field::None);
+
+        section("lettura dello stato");
+        ScTelemetry::ShipState s = seatedShip();
+        CHECK(ST::read(Field::Weapons, s) == Value::On);
+        CHECK(ST::read(Field::Lights, s) == Value::Off);
+        CHECK(ST::read(Field::Gear, s) == Value::On);
+        CHECK(ST::read(Field::Decoupled, s) == Value::Off); // coupled attivo = non disaccoppiato
+        CHECK(ST::read(Field::Cruise, s) == Value::Off);
+        s.gear = ScTelemetry::Deploy::Deploying;
+        CHECK(ST::read(Field::Gear, s) == Value::TurningOn);
+        s.gear = ScTelemetry::Deploy::Retracting;
+        CHECK(ST::read(Field::Gear, s) == Value::TurningOff);
+        s.gear = ScTelemetry::Deploy::Unknown;
+        CHECK(ST::read(Field::Gear, s) == Value::Unknown);
+        s.coupled.active = false;
+        CHECK(ST::read(Field::Decoupled, s) == Value::On);
+        s.cruise.enabled = false; // la nave non ce l'ha: il valore non vuol dire niente
+        CHECK(ST::read(Field::Cruise, s) == Value::Unknown);
+        // A piedi arriva solo l'attore: tutto sconosciuto.
+        ScTelemetry::ShipState onFoot;
+        onFoot.hasActor = true;
+        for (const auto& [key, field] : fields) CHECK(ST::read(field, onFoot) == Value::Unknown);
+
+        section("verso delle frasi del profilo predefinito");
+        const std::map<std::string, int> expected = {
+            // carrello: abbassare = fuori, alzare / tirare su = dentro (al contrario degli scudi)
+            { "carrello", 0 }, { "carrello di atterraggio", 0 }, { "abbassa il carrello", 1 }, { "alza il carrello", -1 },
+            { "tira su il carrello", -1 }, { "gear", 0 },
+            { "luci", 0 }, { "accendi le luci", 1 }, { "spegni le luci", -1 }, { "fari", 0 }, { "attiva le luci", 1 }, { "disattiva le luci", -1 },
+            { "alimentazione", 0 }, { "accendi la nave", 1 }, { "spegni la nave", -1 },
+            { "scudi", 0 }, { "alza gli scudi", 1 }, { "abbassa gli scudi", -1 }, { "attiva gli scudi", 1 }, { "disattiva gli scudi", -1 },
+            { "accendi gli scudi", 1 }, { "spegni gli scudi", -1 },
+            { "motori", 0 }, { "accendi i motori", 1 }, { "spegni i motori", -1 }, { "attiva i motori", 1 }, { "disattiva i motori", -1 },
+            { "armi", 0 }, { "armi in linea", 1 }, { "arma i cannoni", 1 }, { "disarma", -1 }, { "attiva le armi", 1 }, { "disattiva le armi", -1 },
+            { "accendi le armi", 1 }, { "spegni le armi", -1 },
+            // disaccoppiato = +1 (On), coupled / accoppiato = -1
+            { "modalita disaccoppiata", 1 }, { "disaccoppiato", 1 }, { "decoupled", 1 }, { "modalita coupled", -1 },
+            { "attiva la modalita coupled", -1 }, { "disattiva la modalita coupled", 1 }, { "modalita accoppiata", -1 }, { "accoppiato", -1 },
+            { "cruise control", 0 }, { "velocita di crociera", 0 }, { "crociera", 0 },
+        };
+        int phrases = 0;
+        for (const auto& c : p.commands) {
+            if (c.intent != "press") continue;
+            const Field f = ST::fieldFor(c.args.count("key") ? c.args.at("key") : "");
+            if (f == Field::None) continue;
+            for (const auto& ph : c.phrases) {
+                auto it = expected.find(ph);
+                CHECK(it != expected.end()); // una frase nuova nel profilo: aggiungila qui col suo verso
+                if (it == expected.end()) {
+                    std::printf("    frase senza verso atteso: \"%s\"\n", ph.c_str());
+                    continue;
+                }
+                if (ST::wanted(f, "", ph) != it->second) std::printf("    verso sbagliato: \"%s\"\n", ph.c_str());
+                CHECK_EQ(ST::wanted(f, "", ph), it->second);
+                phrases++;
+            }
+        }
+        CHECK_EQ(phrases, (int)expected.size());
+
+        // Dalla frase detta (Cmd::Match::heard), prima di quella del dizionario.
+        auto said = [&](const std::string& text, Field f) {
+            const Cmd::Match m = Cmd::match(p, text);
+            return m.found ? ST::wanted(f, m.heard, m.phrase) : 99;
+        };
+        CHECK_EQ(said("Tira su il carrello.", Field::Gear), -1);
+        CHECK_EQ(said("Abbassa il carrello", Field::Gear), 1);
+        CHECK_EQ(said("giù il carrello", Field::Gear), 1);
+        CHECK_EQ(said("Carrello.", Field::Gear), 0);
+        CHECK_EQ(said("Accendi le armi.", Field::Weapons), 1);
+        CHECK_EQ(said("Spegni le armi", Field::Weapons), -1);
+        CHECK_EQ(said("Armi.", Field::Weapons), 0);
+        CHECK_EQ(said("Alza gli scudi!", Field::Shields), 1);
+        CHECK_EQ(said("Disattiva la modalità Capoled.", Field::Decoupled), 1); // corretta in "coupled"
+        CHECK_EQ(said("Modalità coupled", Field::Decoupled), -1);
+        CHECK_EQ(said("cruise control", Field::Cruise), 0);
+        CHECK_EQ(ST::wanted(Field::Lights, "luci spente", "luci"), -1);
+        CHECK_EQ(ST::wanted(Field::Shields, "scudi su", "scudi"), 1);
+        // Richieste al modello con più azioni: il verso solo se tutte le parole sono d'accordo.
+        CHECK_EQ(ST::wanted(Field::Gear, "alza il carrello e accendi le luci", ""), -1);
+        CHECK_EQ(ST::wanted(Field::Lights, "alza il carrello e accendi le luci", ""), 1);
+        CHECK_EQ(ST::wanted(Field::Lights, "spegni le luci e alza gli scudi", ""), 0);
+        // La richiesta seguita dal modello, a pezzi: il verso solo dal pezzo che parla di quell'interruttore.
+        const std::vector<std::string> parts = ST::clauses("Alza gli scudi, poi carrello. Accendi le luci e spegni i motori");
+        CHECK(parts == std::vector<std::string>({ "alza gli scudi", "carrello", "accendi le luci", "spegni i motori" }));
+        CHECK_STR(ST::clauseAbout(Field::Gear, parts), "carrello");
+        CHECK_EQ(ST::wanted(Field::Gear, ST::clauseAbout(Field::Gear, parts), ""), 0); // "alza" era per gli scudi
+        CHECK_EQ(ST::wanted(Field::Shields, ST::clauseAbout(Field::Shields, parts), ""), 1);
+        CHECK_EQ(ST::wanted(Field::Lights, ST::clauseAbout(Field::Lights, parts), ""), 1);
+        CHECK_EQ(ST::wanted(Field::Engines, ST::clauseAbout(Field::Engines, parts), ""), -1);
+        CHECK_STR(ST::clauseAbout(Field::Weapons, parts), "");
+        CHECK_STR(ST::clauseAbout(Field::Decoupled, ST::clauses("passa in modalità disaccoppiata")), "passa in modalita disaccoppiata");
+        // Dallo strumento del modello.
+        CHECK_EQ(ST::wantedFromState(Field::Weapons, "on"), 1);
+        CHECK_EQ(ST::wantedFromState(Field::Weapons, "OFF"), -1);
+        CHECK_EQ(ST::wantedFromState(Field::Shields, "up"), 1);
+        CHECK_EQ(ST::wantedFromState(Field::Shields, "down"), -1);
+        CHECK_EQ(ST::wantedFromState(Field::Gear, "down"), 1);
+        CHECK_EQ(ST::wantedFromState(Field::Gear, "up"), -1);
+        CHECK_EQ(ST::wantedFromState(Field::Gear, "on"), 0); // non si indovina
+        CHECK_EQ(ST::wantedFromState(Field::Decoupled, "on"), 1);
+        CHECK_EQ(ST::wantedFromState(Field::Decoupled, "off"), -1);
+        CHECK_EQ(ST::wantedFromState(Field::Lights, ""), 0);
+        // Le sequenze: il verso delle frasi del comando ("accendi tutto").
+        for (const auto& c : p.commands) {
+            if (c.intent != "sequence") continue;
+            CHECK_EQ(ST::commandDirection(Field::Weapons, c.phrases), 1);
+            CHECK_EQ(ST::commandDirection(Field::Power, c.phrases), 1);
+            CHECK_EQ(ST::commandDirection(Field::Gear, c.phrases), 0);
+        }
+
+        section("già a posto: niente tasto, testi in italiano");
+        auto already = [](Field f, int want, Value now, const char* spoken, const char* brief) {
+            const ST::Plan pl = ST::plan(f, want, now);
+            CHECK(!pl.press);
+            CHECK_STR(pl.spoken, spoken);
+            CHECK_STR(pl.brief, brief);
+        };
+        already(Field::Weapons, 1, Value::On, "Le armi sono già accese.", "Già accese.");
+        already(Field::Weapons, -1, Value::Off, "Le armi sono già spente.", "Già spente.");
+        already(Field::Shields, 1, Value::On, "Gli scudi sono già alzati.", "Già alzati.");
+        already(Field::Shields, -1, Value::Off, "Gli scudi sono già abbassati.", "Già abbassati.");
+        already(Field::Lights, -1, Value::Off, "Le luci sono già spente.", "Già spente.");
+        already(Field::Engines, 1, Value::On, "I motori sono già accesi.", "Già accesi.");
+        already(Field::Power, 1, Value::On, "L'alimentazione è già accesa.", "Già accesa.");
+        already(Field::Gear, 1, Value::On, "Il carrello è già abbassato.", "Già abbassato.");
+        already(Field::Gear, -1, Value::Off, "Il carrello è già alzato.", "Già alzato.");
+        already(Field::Decoupled, 1, Value::On, "Sei già in modalità disaccoppiata.", "Già disaccoppiato.");
+        already(Field::Decoupled, -1, Value::Off, "Sei già in modalità accoppiata.", "Già accoppiato.");
+        already(Field::Cruise, -1, Value::Off, "Il cruise control è già spento.", "Già spento.");
+        // Stati di passaggio del carrello.
+        already(Field::Gear, 1, Value::TurningOn, "Il carrello sta già scendendo.", "Sta già scendendo.");
+        already(Field::Gear, -1, Value::TurningOff, "Il carrello sta già salendo.", "Sta già salendo.");
+        ST::Plan pl = ST::plan(Field::Gear, -1, Value::TurningOn); // scende e lo vuoi su: si preme
+        CHECK(pl.press && pl.target == Value::Off);
+        pl = ST::plan(Field::Weapons, -1, Value::On);
+        CHECK(pl.press && pl.target == Value::Off);
+        pl = ST::plan(Field::Weapons, 0, Value::On); // senza verso: si preme, e deve cambiare
+        CHECK(pl.press && pl.target == Value::Off);
+        pl = ST::plan(Field::Gear, 0, Value::Off);
+        CHECK(pl.press && pl.target == Value::On);
+        pl = ST::plan(Field::Weapons, 1, Value::Unknown); // stato sconosciuto: si preme come prima
+        CHECK(pl.press && pl.target == Value::Unknown);
+        pl = ST::plan(Field::None, 1, Value::On);
+        CHECK(pl.press && pl.target == Value::Unknown);
+
+        section("dopo il tasto: è cambiato?");
+        {
+            FakeGame g;
+            g.onPress = [&](const std::string&) { g.at(300, [](ScTelemetry::ShipState& x) { x.weapons = false; }); };
+            ST::Env e = g.env();
+            bool ok = false;
+            const std::string combo = e.press("weapons", ok);
+            const ST::Outcome o = ST::afterPress(Field::Weapons, Value::Off, combo, e);
+            CHECK(o.used && o.ok);
+            CHECK_STR(o.spoken, "Armi spente.");
+            CHECK_STR(o.brief, "Armi spente.");
+            CHECK(o.shown.find("telemetria") != std::string::npos);
+            CHECK(g.clock >= 300 && g.clock < 500);
+        }
+        {
+            FakeGame g; // il tasto non fa niente (gioco in pausa, tasto sbagliato...)
+            ST::Env e = g.env();
+            const ST::Outcome o = ST::afterPress(Field::Weapons, Value::Off, "P", e);
+            CHECK(o.used && !o.ok);
+            CHECK_STR(o.spoken, "Ho premuto P, ma le armi risultano ancora accese.");
+            CHECK_STR(o.brief, "Non è cambiato.");
+            CHECK(g.clock >= 2500 && g.clock <= 2600); // circa 2,5 s, non di più
+        }
+        {
+            FakeGame g; // carrello su, lo abbassi: dopo il tasto scende
+            g.s.gear = ScTelemetry::Deploy::Retracted;
+            g.onPress = [&](const std::string&) { g.at(200, [](ScTelemetry::ShipState& x) { x.gear = ScTelemetry::Deploy::Deploying; }); };
+            ST::Env e = g.env();
+            bool ok = false;
+            const ST::Outcome o = ST::afterPress(Field::Gear, Value::On, e.press("landing_gear", ok), e);
+            CHECK(o.used && o.ok);
+            CHECK_STR(o.spoken, "Carrello in discesa.");
+            CHECK_STR(o.brief, "Carrello giù.");
+        }
+        {
+            FakeGame g; // la telemetria si perde: si fa come sempre (nessun verdetto)
+            g.lost = true;
+            ST::Env e = g.env();
+            CHECK(!ST::afterPress(Field::Weapons, Value::Off, "P", e).used);
+            FakeGame d; // in prova non si aspetta niente
+            ST::Env de = d.env();
+            de.dryRun = true;
+            CHECK(!ST::afterPress(Field::Weapons, Value::Off, "P", de).used && d.clock == 0);
+        }
+        CHECK_STR(ST::notChangedText(Field::Decoupled, Value::Off, "LAlt+C"), "Ho premuto LAlt+C, ma risulti ancora in modalità accoppiata.");
+        CHECK_STR(ST::notChangedText(Field::Gear, Value::TurningOn, "N"), "Ho premuto N, ma il carrello sta ancora scendendo.");
+        CHECK_STR(ST::doneText(Field::Shields, Value::On), "Scudi alzati.");
+        CHECK_STR(ST::doneText(Field::Cruise, Value::On), "Cruise control acceso.");
+        CHECK_STR(ST::doneBrief(Field::Cruise, Value::On), "Cruise acceso.");
+
+        section("sequenze: passi saltati, alimentazione che si assesta");
+        auto allOn = [](Field) { return 1; };
+        const std::vector<std::string> steps = ST::splitSteps("power, engines,shields , weapons");
+        CHECK(steps == std::vector<std::string>({ "power", "engines", "shields", "weapons" }));
+        {
+            // Nave spenta: motori e scudi tornano da soli quando torna l'alimentazione, le armi no.
+            FakeGame g;
+            g.s.powerPlants = g.s.engines = g.s.shieldGenerators = g.s.weapons = false;
+            g.onPress = [&](const std::string& k) {
+                if (k == "power") {
+                    g.at(250, [](ScTelemetry::ShipState& x) { x.powerPlants = true; });
+                    g.at(600, [](ScTelemetry::ShipState& x) { x.engines = true; });
+                    g.at(900, [](ScTelemetry::ShipState& x) { x.shieldGenerators = true; });
+                }
+                if (k == "weapons") g.at(300, [](ScTelemetry::ShipState& x) { x.weapons = true; });
+            };
+            ST::Env e = g.env();
+            CHECK(!ST::nothingToPress(steps, allOn, *g.state()));
+            const ST::Outcome o = ST::sequence(steps, allOn, "Accendo tutto.", e);
+            CHECK(o.used && o.ok && !o.interrupted);
+            CHECK(g.pressed == std::vector<std::string>({ "power", "weapons" }));
+            CHECK_STR(o.spoken, "Accendo tutto. Già a posto: motori e scudi.");
+            CHECK_STR(o.brief, "Fatto.");
+            CHECK(o.shown.find("power (U), weapons (P)") != std::string::npos);
+            CHECK(o.shown.find("già a posto (telemetria): engines, shields") != std::string::npos);
+            CHECK(g.clock >= 900 + 1000); // ha aspettato che la nave si assestasse
+        }
+        {
+            // Tutto già acceso: niente tasti.
+            FakeGame g;
+            ST::Env e = g.env();
+            CHECK(ST::nothingToPress(steps, allOn, *g.state()));
+            const ST::Outcome o = ST::sequence(steps, allOn, "Accendo tutto.", e);
+            CHECK(o.ok && g.pressed.empty());
+            CHECK_STR(o.spoken, "È già tutto a posto: alimentazione, motori, scudi e armi.");
+            CHECK_STR(o.brief, "Già a posto.");
+        }
+        {
+            // Le armi non si accendono: lo dice.
+            FakeGame g;
+            g.s.weapons = false;
+            g.s.shieldGenerators = false;
+            g.onPress = [&](const std::string& k) {
+                if (k == "shields") g.at(200, [](ScTelemetry::ShipState& x) { x.shieldGenerators = true; });
+            };
+            ST::Env e = g.env();
+            const ST::Outcome o = ST::sequence(steps, allOn, "Accendo tutto.", e);
+            CHECK(!o.ok);
+            CHECK(g.pressed == std::vector<std::string>({ "shields", "weapons" }));
+            CHECK_EQ(g.pauses, 1); // la pausa di sempre tra due tasti
+            CHECK_STR(o.spoken, "Ho premuto O e P, ma le armi risultano ancora spente.");
+            CHECK_STR(o.brief, "Non è cambiato.");
+        }
+        {
+            // Senza verso (una tua sequenza "parcheggia"): si preme tutto, come prima.
+            FakeGame g;
+            auto none = [](Field) { return 0; };
+            ST::Env e = g.env();
+            g.onPress = [&](const std::string& k) {
+                if (k == "landing_gear") g.at(100, [](ScTelemetry::ShipState& x) { x.gear = ScTelemetry::Deploy::Retracting; });
+                if (k == "engines") g.at(100, [](ScTelemetry::ShipState& x) { x.engines = false; });
+            };
+            const ST::Outcome o = ST::sequence({ "landing_gear", "engines" }, none, "Parcheggio.", e);
+            CHECK(o.ok && g.pressed.size() == 2);
+            CHECK_STR(o.spoken, "Parcheggio.");
+        }
+
+        section("verbi col pronome e \"accendi tutti i sistemi\"");
+        CHECK_EQ(Cmd::polarity("allora spegnile"), -1);
+        CHECK_EQ(Cmd::polarity("riaccendile"), 1);
+        CHECK_EQ(Cmd::polarity("alzali"), 1);
+        CHECK_EQ(Cmd::polarity("abbassalo"), -1);
+        CHECK_EQ(Cmd::polarity("riaccendi anche le armi va"), 1);
+        CHECK_EQ(Cmd::polarity("passami le palle"), 0); // "palle" non è un verbo
+        CHECK(Cmd::hasPronounVerb("allora spegnile"));
+        CHECK(Cmd::hasPronounVerb("eh pero riaccendile"));
+        CHECK(!Cmd::hasPronounVerb("spegni le armi"));
+        CHECK(!Cmd::hasPronounVerb("alla fine"));
+        {
+            const GameProfile d = GameProfile::defaults();
+            for (const char* said : { "accendi tutti i sistemi", "Iris accendi tutte le cose della nave", "attiva tutti i sistemi",
+                                      "accendi tutto quanto" }) {
+                const Cmd::Match m = Cmd::match(d, said);
+                CHECK(m.found && m.command.intent == "sequence");
+            }
+            const Cmd::Match power = Cmd::match(d, "accendi la nave");
+            CHECK(power.found && power.command.intent == "press" && power.command.args.at("key") == "power");
+            // I profili di prima ricevono le frasi nuove.
+            GameProfile old = d;
+            for (auto& c : old.commands) {
+                if (c.intent == "sequence") c.phrases = { "prepara la nave", "accendi tutto" };
+            }
+            old.defaultsVersion = 2;
+            CHECK(old.addMissingDefaults() > 0);
+            CHECK(Cmd::match(old, "accendi tutti i sistemi").command.intent == "sequence");
+        }
+
+        section("comandi veri (Esplora risorse al posto del gioco, modalità prova)");
+        if (GameInput::findGameWindow("explorer", "")) {
+            GameController game;
+            game.load();
+            GameProfile fake = game.profile();
+            fake.processName = "explorer";
+            fake.windowTitle.clear();
+            fake.dryRun = true;
+            CHECK(game.saveProfile(fake));
+            auto sayFn = [](const std::string&) {};
+            // Senza telemetria: esattamente come prima.
+            GameController::Result r = game.execute(game.match("accendi le armi"), sayFn, nullptr);
+            CHECK(r.ok && r.shown.find("(P)") != std::string::npos && r.spoken == "Armi.");
+            CHECK(r.shown.find("telemetria") == std::string::npos);
+            game.setShipStateProvider([]() -> std::optional<ScTelemetry::ShipState> { return std::nullopt; });
+            r = game.execute(game.match("accendi le armi"), sayFn, nullptr);
+            CHECK(r.ok && r.shown.find("(P)") != std::string::npos && r.spoken == "Armi.");
+
+            ScTelemetry::ShipState ship = seatedShip();
+            game.setShipStateProvider([&]() -> std::optional<ScTelemetry::ShipState> { return ship; });
+            r = game.execute(game.match("accendi le armi"), sayFn, nullptr);
+            CHECK(r.ok && r.shown.find("(P)") == std::string::npos); // niente tasto
+            CHECK_STR(r.spoken, "Le armi sono già accese.");
+            CHECK_STR(r.brief, "Già accese.");
+            CHECK(r.shown.find("telemetria") != std::string::npos);
+            {
+                // "Allora spegnile!" dopo "le armi sono già accese": le armi, non un altro interruttore.
+                const Cmd::Match follow = game.match("Allora spegnile!");
+                CHECK(follow.found && follow.command.args.count("key") && follow.command.args.at("key") == "weapons");
+                r = game.execute(follow, sayFn, nullptr);
+                CHECK(r.ok && r.shown.find("(P)") != std::string::npos); // spegnere le armi accese: si preme
+                r = game.execute(game.match("Eh, però riaccendile"), sayFn, nullptr);
+                CHECK_STR(r.spoken, "Le armi sono già accese."); // (in prova lo stato non cambia)
+                CHECK(!game.match("e quindi?").found); // niente verbo col pronome: non è un comando
+            }
+            r = game.execute(game.match("spegni le armi"), sayFn, nullptr); // in prova: si guarda lo stato, non si preme
+            CHECK(r.ok && r.shown.find("[prova]") != std::string::npos && r.shown.find("(P)") != std::string::npos);
+            CHECK(r.shown.find("telemetria: armi accese") != std::string::npos);
+            r = game.execute(game.match("alza gli scudi"), sayFn, nullptr);
+            CHECK_STR(r.spoken, "Gli scudi sono già alzati.");
+            r = game.execute(game.match("abbassa il carrello"), sayFn, nullptr);
+            CHECK_STR(r.spoken, "Il carrello è già abbassato.");
+            ship.gear = ScTelemetry::Deploy::Deploying;
+            r = game.execute(game.match("abbassa il carrello"), sayFn, nullptr);
+            CHECK_STR(r.spoken, "Il carrello sta già scendendo.");
+            ship.gear = ScTelemetry::Deploy::Retracted;
+            r = game.execute(game.match("tira su il carrello"), sayFn, nullptr);
+            CHECK_STR(r.spoken, "Il carrello è già alzato.");
+            r = game.execute(game.match("carrello"), sayFn, nullptr); // senza verso: si preme
+            CHECK(r.ok && r.shown.find("(N)") != std::string::npos);
+            r = game.execute(game.match("accoppiato"), sayFn, nullptr);
+            CHECK_STR(r.spoken, "Sei già in modalità accoppiata.");
+            r = game.execute(game.match("accendi tutto"), sayFn, nullptr);
+            CHECK(r.ok && r.shown.find("niente da premere") != std::string::npos);
+            CHECK_STR(r.spoken, "È già tutto a posto: alimentazione, motori, scudi e armi.");
+            ship.weapons = false;
+            r = game.execute(game.match("prepara la nave"), sayFn, nullptr); // le armi sì, il resto no
+            CHECK(r.ok && r.shown.find("weapons (P)") != std::string::npos && r.shown.find("power (U)") == std::string::npos);
+            CHECK_STR(r.spoken, "Accendo tutto. Già a posto: alimentazione, motori e scudi.");
+            ship.weapons = true;
+            // Dal modello (strumento game_command): lo stesso, col verso dato dal modello o preso dalla richiesta.
+            r = game.executeById("press:weapons", "", sayFn, nullptr, "on");
+            CHECK_STR(r.spoken, "Le armi sono già accese.");
+            r = game.executeById("press:landing_gear", "", sayFn, nullptr, "up");
+            CHECK_STR(r.spoken, "Il carrello è già alzato.");
+            r = game.executeById("press:landing_gear", "", sayFn, nullptr, "on", "Iris, alza il carrello per favore");
+            CHECK_STR(r.spoken, "Il carrello è già alzato."); // "on" sul carrello non si capisce: vale la richiesta
+            r = game.executeById("press:shields", "", sayFn, nullptr, "", "potresti alzare gli scudi?");
+            CHECK_STR(r.spoken, "Gli scudi sono già alzati.");
+            r = game.executeById("press:weapons", "", sayFn, nullptr);
+            CHECK(r.ok && r.shown.find("(P)") != std::string::npos); // senza verso: si preme
+            r = game.executeById("press:landing_gear", "", sayFn, nullptr, "", "alza gli scudi, poi carrello");
+            CHECK(r.ok && r.shown.find("(N)") != std::string::npos); // "alza" era per gli scudi: il carrello si preme
+            r = game.executeById("press:decoupled", "", sayFn, nullptr, "", "Disattiva la modalità Capoled");
+            CHECK(r.ok && r.shown.find("(LAlt+C)") != std::string::npos); // accoppiato, lo vuoi disaccoppiato: si preme
+            r = game.executeById("press:decoupled", "", sayFn, nullptr, "off");
+            CHECK_STR(r.spoken, "Sei già in modalità accoppiata.");
+            CHECK(game.toolDefinition().find("\"state\"") != std::string::npos);
+            game.setShipStateProvider({});
+        }
+
+        section("impostazioni: telemetria e voce neurale");
+        AppSettings fresh = AppSettings::parse("");
+        CHECK(fresh.gameTelemetryEnabled); // predefinita: accesa
+        fresh.gameTelemetryEnabled = false;
+        AppSettings back = AppSettings::parse(fresh.serialize());
+        CHECK(!back.gameTelemetryEnabled);
+        CHECK(AppSettings::parse("gameTelemetryEnabled=1\n").gameTelemetryEnabled);
+        CHECK(!AppSettings::parse("gameTelemetryEnabled=0\n").gameTelemetryEnabled);
+        AppSettings v;
+        CHECK(v.wantsNeuralVoice());
+        v.speechEnabled = false; // risposte a voce spente: la voce neurale non si carica
+        CHECK(!v.wantsNeuralVoice());
+        v.speechEnabled = true;
+        v.voiceEngine = "windows";
+        CHECK(!v.wantsNeuralVoice());
+        v.voiceEngine = "neurale";
+        v.gpuMemoryLimitMb = 0; // tutto sul processore
+        CHECK(!v.wantsNeuralVoice());
+        CHECK(!AppSettings::parse("speechEnabled=0\n").wantsNeuralVoice());
+    }
+} // namespace ship_toggle_tests
+
+static void testShipToggle() { ship_toggle_tests::run(); }
+
 // --- Registro delle scansioni del mining ------------------------------------------------------------------
 static void testMiningLog() {
     std::printf("\n[registro del mining]\n");
@@ -3380,6 +3866,726 @@ namespace voice_coherence {
     }
 } // namespace voice_coherence
 
+// --- Telemetria di Star Citizen (sc_telemetry) --------------------------------------------------
+namespace telemetry_test {
+    // Un piccolo codificatore protobuf per costruire i frame. Come il gioco (proto3) non scrive i valori
+    // predefiniti (false, 0, ""); i sotto-messaggi invece ci sono anche vuoti.
+    struct Pb {
+        std::string b;
+
+        static void putVarint(std::string& s, uint64_t v) {
+            while (v >= 0x80) {
+                s += (char)((v & 0x7F) | 0x80);
+                v >>= 7;
+            }
+            s += (char)v;
+        }
+        static std::string le32(uint32_t v) {
+            std::string s;
+            for (int i = 0; i < 4; ++i) s += (char)((v >> (8 * i)) & 0xFF);
+            return s;
+        }
+        static uint32_t bits(float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            return u;
+        }
+        Pb& key(uint32_t field, int wire) {
+            putVarint(b, ((uint64_t)field << 3) | (uint64_t)wire);
+            return *this;
+        }
+        Pb& always(uint32_t field, uint64_t v) { // anche 0 (i campi "optional")
+            key(field, 0);
+            putVarint(b, v);
+            return *this;
+        }
+        Pb& varint(uint32_t field, uint64_t v) { return v ? always(field, v) : *this; }
+        Pb& flag(uint32_t field, bool v) { return varint(field, v ? 1 : 0); }
+        Pb& f32(uint32_t field, float v) {
+            if (v != 0.0f) {
+                key(field, 5);
+                b += le32(bits(v));
+            }
+            return *this;
+        }
+        Pb& f64(uint32_t field, uint64_t v) {
+            key(field, 1);
+            b += le32((uint32_t)v) + le32((uint32_t)(v >> 32));
+            return *this;
+        }
+        Pb& bytes(uint32_t field, const std::string& v) {
+            key(field, 2);
+            putVarint(b, v.size());
+            b += v;
+            return *this;
+        }
+        Pb& str(uint32_t field, const std::string& v) { return v.empty() ? *this : bytes(field, v); }
+        Pb& msg(uint32_t field, const Pb& m) { return bytes(field, m.b); }
+        Pb& packed(uint32_t field, const std::vector<float>& v) {
+            std::string p;
+            for (float f : v) p += le32(bits(f));
+            return bytes(field, p);
+        }
+        Pb& raw(const std::string& s) {
+            b += s;
+            return *this;
+        }
+    };
+
+    static Pb avail(bool enabled, bool active) { return Pb().flag(1, enabled).flag(2, active); }
+    static Pb gauge(float current, float max) { return Pb().f32(1, current).f32(2, max); }
+
+    // La Gladius di captures\session_20261121_120702.jsonl (Arena Commander, t = 1795259513.737): i valori
+    // veri, campo per campo, anche quelli che Iris non legge (spie, impostazioni, ambiente...).
+    static Pb gladiusVehicle() {
+        Pb annunciators; // pwr NOMINAL, wpn MINOR_ON, thr/shld NOMINAL, cool/qdrv OFF, il resto NOMINAL
+        annunciators.varint(1, 1).varint(2, 4).varint(3, 1).varint(4, 1).varint(5, 2).varint(6, 2).varint(7, 1).varint(8, 1).varint(9, 1).varint(10, 1);
+        Pb flightState; // gear e vtol RETRACTED ("optional": scritti sempre), is_landed false
+        flightState.always(2, 1).always(3, 1);
+        Pb settings;
+        settings.msg(1, avail(true, true)).msg(2, avail(true, true)).msg(3, avail(true, true)).msg(4, avail(true, true))
+            .msg(5, avail(false, false)).flag(6, true).msg(7, avail(true, true)).msg(8, avail(true, false)).msg(9, avail(true, false))
+            .msg(10, avail(true, true)).msg(11, avail(true, true)).flag(15, true).msg(16, avail(true, true)).flag(17, true)
+            .msg(18, avail(true, true)).flag(19, false);
+        Pb instruments; // speed 0, quantum 0; altitudine FLT_MAX = "non disponibile"
+        instruments.f32(2, 1.0f).msg(4, gauge(0, 0)).msg(5, Pb().f32(3, 1.0f)).f32(6, 3.4028235e+38f).f32(7, 3.4028235e+38f).f32(9, 0.0026071696f);
+        Pb power;
+        power.flag(1, true).flag(2, true).flag(3, true).flag(4, true).flag(5, true).flag(6, false).flag(7, true).flag(8, true).flag(9, true);
+        Pb shields;
+        shields.f32(1, 0.42200407f).packed(2, { 0.42200407f });
+        Pb state;
+        state.str(1, "AEGS_Gladius_200000010670").str(2, "AEGS_Gladius").str(3, "").varint(4, 1).flag(5, false).msg(7, annunciators)
+            .msg(8, Pb().msg(1, flightState).msg(2, settings).msg(3, instruments)).msg(9, power).msg(10, shields).f32(11, 1.0f)
+            .msg(12, Pb().varint(1, 2).flag(2, true));
+        return Pb().msg(2, state); // VehicleFrame
+    }
+
+    static Pb gladiusWeapons() {
+        Pb w;
+        w.msg(1, Pb().flag(8, true)); // gimbals_locked
+        for (const char* name : { "GATS_BallisticGatling_S3_200000010719", "KLWE_LaserRepeater_S3_200000010721", "KLWE_LaserRepeater_S3_200000010723" })
+            w.msg(4, Pb().str(1, name).flag(2, true).flag(3, true).flag(4, true));
+        w.msg(5, Pb().varint(1, 1).varint(2, 48)).msg(5, Pb().varint(1, 2).varint(2, 5)); // 48 decoy, 5 noise
+        return w;
+    }
+
+    static Pb gladiusActor() {
+        Pb vitals;
+        vitals.msg(1, gauge(100, 100)).msg(2, gauge(1, 1)).msg(3, gauge(0, 0)).msg(4, gauge(0, 0)).msg(5, gauge(0, 0))
+            .f32(7, 60.797455f).f32(8, 1.0003417f).f32(9, 1.0f);
+        Pb st;
+        st.varint(1, 3).varint(2, 1).str(3, "AEGS_Gladius_SCItem_Seat_Pilot_200000010672").varint(4, 14984695);
+        Pb env;
+        env.f32(1, 20.999994f).flag(3, true);
+        return Pb().msg(1, vitals).msg(2, st).msg(3, env);
+    }
+
+    // Il frame intero, nell'ordine del gioco: vehicle (3), weapons (4), actor (6). In ends le fine dei campi.
+    static std::string gladiusFrame(std::vector<size_t>* ends = nullptr) {
+        Pb frame;
+        frame.msg(3, gladiusVehicle());
+        if (ends) ends->push_back(frame.b.size());
+        frame.msg(4, gladiusWeapons());
+        if (ends) ends->push_back(frame.b.size());
+        frame.msg(6, gladiusActor());
+        if (ends) ends->push_back(frame.b.size());
+        return frame.b;
+    }
+
+    // Lo stesso frame serializzato dal protobuf vero (Python, json_format.ParseDict della riga della cattura
+    // e SerializeToString): 495 byte. Il codificatore delle prove deve dare gli stessi byte.
+    static std::string gladiusCaptured() {
+        static const char* hex =
+            "1ae00112dd010a19414547535f476c61646975735f323030303030303130363730120c414547535f476c616469757320013a140801100418"
+            "01200128023002380140014801500142700a041001180112490a04080110011204080110011a04080110012204080110012a0030013a0408"
+            "011001420208014a0208015204080110015a0408011001780182010408011001880101920104080110011a1d150000803f22002a051d0000"
+            "803f35ffff7f7f3dffff7f7f4d0cdd2a3b4a1008011001180120012801380140014801520b0deb10d83e1204eb10d83e5d0000803f620408"
+            "0210012297010a024001222d0a25474154535f42616c6c69737469634761746c696e675f53335f3230303030303031303731391001180120"
+            "01222a0a224b4c57455f4c6173657252657065617465725f53335f323030303030303130373231100118012001222a0a224b4c57455f4c61"
+            "73657252657065617465725f53335f3230303030303031303732331001180120012a04080110302a040802100532700a2d0a0a0d0000c842"
+            "150000c842120a0d0000803f150000803f1a0022002a003d9830734245320b803f4d0000803f1236080310011a2b414547535f476c616469"
+            "75735f53434974656d5f536561745f50696c6f745f32303030303030313036373220f7cb92071a070dfdffa7411801";
+        std::string out;
+        for (size_t i = 0; hex[i] && hex[i + 1]; i += 2) out += (char)std::stoi(std::string(hex + i, 2), nullptr, 16);
+        return out;
+    }
+
+    static bool decode(const std::string& bytes, ScTelemetry::ShipState& s) {
+        return ScTelemetry::decodeFrame((const uint8_t*)bytes.data(), bytes.size(), s);
+    }
+
+    static const char* deployName(ScTelemetry::Deploy d) {
+        using ScTelemetry::Deploy;
+        return d == Deploy::Retracted ? "chiuso" : d == Deploy::Deploying ? "in apertura" : d == Deploy::Deployed ? "aperto" : d == Deploy::Retracting ? "in chiusura" : "?";
+    }
+
+    // Tutto lo stato in testo: per confrontare due decodifiche e per --telemetria.
+    static std::string describe(const ScTelemetry::ShipState& s) {
+        using namespace ScTelemetry;
+        char buf[2048];
+        std::string out;
+        auto on = [](bool b) { return b ? "si" : "no"; };
+        auto av = [](const Availability& a) { return std::string(a.enabled ? "c'e'" : "manca") + "/" + (a.active ? "acceso" : "spento"); };
+        if (s.hasVehicle) {
+            std::snprintf(buf, sizeof(buf), "  nave: %s (%s), luci %s, salute %.3f\n", s.className.c_str(), s.vehicleName.c_str(), on(s.lightsOn), s.health);
+            out += buf;
+        } else {
+            out += "  nave: nessuna\n";
+        }
+        if (s.hasPower) {
+            std::snprintf(buf, sizeof(buf), "  potenza: centrale %s, motori %s, armi %s, raffr. %s, vita %s, gravita' %s, sensori %s, scudi gen %s / emett %s\n",
+                          on(s.powerPlants), on(s.engines), on(s.weapons), on(s.coolers), on(s.lifeSupport), on(s.gravityGenerators), on(s.sensors),
+                          on(s.shieldGenerators), on(s.shieldEmitters));
+            out += buf;
+        }
+        if (s.hasFlightState) {
+            std::snprintf(buf, sizeof(buf), "  volo: atterrata %s, carrello %s, vtol %s\n", on(s.isLanded), deployName(s.gear), deployName(s.vtol));
+            out += buf;
+        }
+        if (s.hasFlightSettings) {
+            std::snprintf(buf, sizeof(buf), "  impostazioni: coupled %s, esp %s, g-safe %s, cruise %s, limitatore %s, prossimita' %s, visione notturna %s\n",
+                          av(s.coupled).c_str(), av(s.esp).c_str(), av(s.gSafe).c_str(), av(s.cruise).c_str(), av(s.speedLimiter).c_str(),
+                          av(s.proximityAssist).c_str(), on(s.lightAmplification));
+            out += buf;
+        }
+        if (s.hasInstruments) {
+            std::snprintf(buf, sizeof(buf), "  strumenti: velocita' %.1f m/s, idrogeno %.3f, quantico %.3f, boost %s\n", s.speed, s.hydrogenFuel, s.quantumFuel, on(s.boostEngaged));
+            out += buf;
+        }
+        if (s.hasShields) {
+            std::snprintf(buf, sizeof(buf), "  scudi: %.3f\n", s.shieldLevel);
+            out += buf;
+        }
+        if (s.hasMasterMode) {
+            const char* mode = s.masterMode == MasterMode::Navigation ? "NAV" : s.masterMode == MasterMode::Scm ? "SCM" : s.masterMode == MasterMode::Stealth ? "STEALTH" : "?";
+            std::snprintf(buf, sizeof(buf), "  master mode: %s, pronta %s\n", mode, on(s.spooled));
+            out += buf;
+        }
+        if (s.hasWeapons) {
+            std::snprintf(buf, sizeof(buf), "  armi: %d/%d alimentate, gimbal bloccati %s, decoy %d, noise %d\n", s.weaponsPowered, s.weaponCount, on(s.gimbalsLocked), s.decoys, s.noise);
+            out += buf;
+        }
+        if (s.hasActor) {
+            const char* loc = s.locomotion == Locomotion::OnFoot ? "a piedi" : s.locomotion == Locomotion::Eva ? "EVA" : s.locomotion == Locomotion::Seated ? "seduto" : "?";
+            const char* role = s.crewRole == CrewRole::Pilot ? "pilota" : s.crewRole == CrewRole::Gunner ? "artigliere" : s.crewRole == CrewRole::Crew ? "equipaggio" : "-";
+            std::snprintf(buf, sizeof(buf), "  attore: %s, ruolo %s, posto \"%s\", salute %.1f/%.1f, ossigeno %.2f, aUEC %lld\n", loc, role, s.seatName.c_str(),
+                          s.actorHealth, s.actorHealthMax, s.oxygen, s.uec);
+            out += buf;
+        }
+        return out;
+    }
+
+    // HTTP/2 nelle prove: un frame, e i frame dentro un pezzo di byte.
+    struct H2Frame {
+        uint8_t type = 0, flags = 0;
+        uint32_t stream = 0;
+        std::string payload;
+    };
+
+    static std::string h2(uint8_t type, uint8_t flags, uint32_t stream, const std::string& payload) {
+        std::string f;
+        const size_t n = payload.size();
+        f += (char)((n >> 16) & 0xFF);
+        f += (char)((n >> 8) & 0xFF);
+        f += (char)(n & 0xFF);
+        f += (char)type;
+        f += (char)flags;
+        for (int i = 3; i >= 0; --i) f += (char)((stream >> (8 * i)) & 0xFF);
+        return f + payload;
+    }
+
+    static uint32_t be32(const std::string& s, size_t at) {
+        return ((uint32_t)(uint8_t)s[at] << 24) | ((uint32_t)(uint8_t)s[at + 1] << 16) | ((uint32_t)(uint8_t)s[at + 2] << 8) | (uint8_t)s[at + 3];
+    }
+
+    static std::vector<H2Frame> h2Frames(const std::string& bytes, size_t from = 0) {
+        std::vector<H2Frame> out;
+        while (bytes.size() - from >= 9) {
+            const size_t n = ((size_t)(uint8_t)bytes[from] << 16) | ((size_t)(uint8_t)bytes[from + 1] << 8) | (uint8_t)bytes[from + 2];
+            if (bytes.size() - from < 9 + n) break;
+            H2Frame f;
+            f.type = (uint8_t)bytes[from + 3];
+            f.flags = (uint8_t)bytes[from + 4];
+            f.stream = be32(bytes, from + 5) & 0x7FFFFFFF;
+            f.payload = bytes.substr(from + 9, n);
+            out.push_back(f);
+            from += 9 + n;
+        }
+        return out;
+    }
+
+    // La somma degli incrementi dei WINDOW_UPDATE per uno stream.
+    static uint64_t windowCredit(const std::string& reply, uint32_t stream) {
+        uint64_t sum = 0;
+        for (const H2Frame& f : h2Frames(reply))
+            if (f.type == 8 && f.stream == stream && f.payload.size() == 4) sum += be32(f.payload, 0);
+        return sum;
+    }
+
+    // Un messaggio gRPC: compressione (1 byte), lunghezza (4, big-endian), il messaggio.
+    static std::string grpcMessage(const std::string& body, uint8_t compressed = 0) {
+        std::string m(1, (char)compressed);
+        for (int i = 3; i >= 0; --i) m += (char)((body.size() >> (8 * i)) & 0xFF);
+        return m + body;
+    }
+
+    static bool feed(ScTelemetry::detail::Http2Receiver& rx, const std::string& bytes) {
+        return rx.feed((const uint8_t*)bytes.data(), bytes.size());
+    }
+} // namespace telemetry_test
+
+// Decodifica del protobuf, HTTP/2 e gRPC, flusso "congelato" al menu. Senza rete.
+static void testTelemetry() {
+    using namespace ScTelemetry;
+    using namespace telemetry_test;
+    using namespace std::string_literals; // "..."s: stringhe con dentro degli zeri
+    std::printf("\n[telemetria di Star Citizen]\n");
+
+    section("frame vero: la Gladius di una cattura");
+    {
+        ShipState s;
+        const std::string frame = gladiusCaptured();
+        CHECK_EQ(frame.size(), (size_t)495);
+        CHECK(gladiusFrame() == frame); // il codificatore delle prove scrive come il protobuf vero
+        CHECK(decode(frame, s));
+        CHECK(s.hasVehicle);
+        CHECK_STR(s.vehicleName, "AEGS_Gladius_200000010670");
+        CHECK_STR(s.className, "AEGS_Gladius");
+        CHECK(!s.lightsOn);
+        CHECK(s.health == 1.0f);
+        CHECK(s.hasPower);
+        CHECK(s.powerPlants && s.engines && s.weapons && s.coolers && s.lifeSupport && s.sensors && s.shieldGenerators && s.shieldEmitters);
+        CHECK(!s.gravityGenerators);
+        CHECK(s.hasFlightState);
+        CHECK(!s.isLanded);
+        CHECK(s.gear == Deploy::Retracted);
+        CHECK(s.vtol == Deploy::Retracted);
+        CHECK(s.hasFlightSettings);
+        CHECK(s.coupled.enabled && s.coupled.active);
+        CHECK(s.esp.enabled && s.esp.active);
+        CHECK(s.gSafe.enabled && s.gSafe.active);
+        CHECK(!s.cruise.enabled && !s.cruise.active);
+        CHECK(s.speedLimiter.enabled && s.speedLimiter.active);
+        CHECK(s.proximityAssist.enabled && !s.proximityAssist.active);
+        CHECK(!s.lightAmplification);
+        CHECK(s.hasInstruments);
+        CHECK(s.speed == 0.0f);
+        CHECK(s.hydrogenFuel == 1.0f);
+        CHECK(s.quantumFuel == 0.0f);
+        CHECK(!s.boostEngaged);
+        CHECK(s.hasShields);
+        CHECK(s.shieldLevel == 0.42200407f);
+        CHECK(s.hasMasterMode);
+        CHECK(s.masterMode == MasterMode::Scm);
+        CHECK(s.spooled);
+        CHECK(s.hasWeapons);
+        CHECK(s.gimbalsLocked);
+        CHECK_EQ(s.weaponCount, 3);
+        CHECK_EQ(s.weaponsPowered, 3);
+        CHECK_EQ(s.decoys, 48);
+        CHECK_EQ(s.noise, 5);
+        CHECK(s.hasActor);
+        CHECK(s.locomotion == Locomotion::Seated);
+        CHECK(s.crewRole == CrewRole::Pilot);
+        CHECK_STR(s.seatName, "AEGS_Gladius_SCItem_Seat_Pilot_200000010672");
+        CHECK(s.actorHealth == 100.0f && s.actorHealthMax == 100.0f);
+        CHECK(s.oxygen == 1.0f);
+        CHECK_EQ(s.uec, 14984695LL);
+    }
+
+    section("a piedi, frame vuoto, sezioni che mancano");
+    {
+        // A piedi arriva solo actor (come all'inizio della cattura: attore segnaposto, uec "0").
+        ShipState s;
+        Pb actor;
+        actor.msg(1, Pb().msg(1, gauge(100, 100)).msg(2, gauge(1, 1)).f32(7, 60.0f)).msg(2, Pb().varint(1, 1)).msg(3, Pb().f32(1, 21.0f));
+        CHECK(decode(Pb().msg(6, actor).b, s));
+        CHECK(s.hasActor && !s.hasVehicle && !s.hasWeapons && !s.hasPower && !s.hasFlightState && !s.hasFlightSettings);
+        CHECK(!s.hasInstruments && !s.hasShields && !s.hasMasterMode);
+        CHECK(s.locomotion == Locomotion::OnFoot);
+        CHECK(s.crewRole == CrewRole::Unknown);
+        CHECK_STR(s.seatName, "");
+        CHECK_EQ(s.uec, 0LL);
+        CHECK_EQ(s.decoys, -1);
+        CHECK_EQ(s.noise, -1);
+
+        ShipState e;
+        e.hasActor = true; // deve tornare tutto ai valori iniziali
+        CHECK(ScTelemetry::decodeFrame(nullptr, 0, e));
+        CHECK(!e.hasActor && !e.hasVehicle);
+
+        // vehicle senza power/flight/shields: la nave c'è, le sezioni no.
+        ShipState v;
+        CHECK(decode(Pb().msg(3, Pb().msg(2, Pb().str(2, "RSI_Aurora_MR"))).b, v));
+        CHECK(v.hasVehicle && !v.hasPower && !v.hasFlightState && !v.hasShields && !v.hasMasterMode);
+        CHECK_STR(v.className, "RSI_Aurora_MR");
+        // Un sotto-messaggio presente ma vuoto accende comunque la sua sezione.
+        CHECK(decode(Pb().msg(3, Pb().msg(2, Pb().msg(9, Pb()).msg(8, Pb().msg(1, Pb())))).b, v));
+        CHECK(v.hasPower && v.hasFlightState && !v.hasFlightSettings && !v.powerPlants);
+    }
+
+    section("campi sconosciuti saltati");
+    {
+        ShipState clean, noisy;
+        CHECK(decode(gladiusFrame(), clean));
+        // Tutti i tipi di campo, in cima e dentro i messaggi: varint, fixed64, length-delimited, fixed32, gruppo.
+        Pb group;
+        group.key(103, 3).varint(1, 7).f32(2, 1.5f).key(5, 3).varint(1, 1).key(5, 4).key(103, 4);
+        Pb unknown;
+        unknown.always(99, 123456789).f64(100, 0x1122334455667788ull).bytes(101, "patch futura").f32(102, 2.5f).raw(group.b);
+        Pb vehicle = gladiusVehicle(); // e un altro vehicle.state (si unisce al primo) con solo campi nuovi, anche nelle impostazioni di volo
+        vehicle.raw(unknown.b).msg(2, Pb().raw(unknown.b).msg(8, Pb().raw(unknown.b).msg(2, Pb().raw(unknown.b))));
+        Pb weapons = gladiusWeapons();
+        weapons.msg(4, Pb().str(1, "arma_futura").flag(2, true).always(9, 1).f32(10, 1.0f)); // una quarta arma, con campi nuovi
+        Pb actor = gladiusActor();
+        actor.raw(unknown.b).msg(2, Pb().raw(unknown.b)).msg(1, Pb().msg(1, Pb().raw(unknown.b)));
+        Pb frame;
+        frame.raw(unknown.b).msg(3, vehicle).msg(4, weapons).msg(5, Pb().msg(1, Pb().varint(1, 4))).raw(unknown.b).msg(6, actor)
+            .msg(7, Pb().f32(4, 0.5f)).msg(8, Pb().flag(1, true)).always(1, 5).bytes(2, "x").raw(unknown.b);
+        CHECK(decode(frame.b, noisy));
+        CHECK_EQ(noisy.weaponCount, 4);
+        CHECK_EQ(noisy.weaponsPowered, 4);
+        noisy.weaponCount = noisy.weaponsPowered = 3;
+        CHECK_STR(describe(noisy), describe(clean));
+
+        // Un campo noto col tipo sbagliato (una patch che lo cambia) si salta come uno sconosciuto.
+        ShipState w;
+        CHECK(decode(Pb().msg(3, Pb().msg(2, Pb().always(2, 5).f32(5, 1.0f).str(1, "AEGS_Gladius_1").always(11, 7))).b, w));
+        CHECK_STR(w.className, "");
+        CHECK_STR(w.vehicleName, "AEGS_Gladius_1");
+        CHECK(!w.lightsOn);
+        CHECK(w.health == 0.0f);
+
+        // Messaggi ripetuti: si uniscono, e per i valori semplici vince l'ultimo.
+        ShipState r;
+        CHECK(decode(Pb().msg(3, Pb().msg(2, Pb().str(2, "A").flag(5, true))).msg(3, Pb().msg(2, Pb().str(2, "B").msg(9, Pb().flag(2, true)))).b, r));
+        CHECK_STR(r.className, "B");
+        CHECK(r.lightsOn && r.hasPower && r.engines);
+    }
+
+    section("frame troncato o rotto");
+    {
+        // Tagliato in qualunque punto: è valido solo dove finisce un campo intero del messaggio esterno.
+        std::vector<size_t> ends;
+        const std::string frame = gladiusFrame(&ends);
+        int wrong = 0;
+        for (size_t n = 0; n < frame.size(); ++n) {
+            ShipState s;
+            const bool boundary = n == 0 || std::find(ends.begin(), ends.end(), n) != ends.end();
+            if (decode(frame.substr(0, n), s) != boundary) wrong++;
+        }
+        CHECK_EQ(wrong, 0);
+        CHECK(frame == gladiusCaptured());
+
+        ShipState s;
+        CHECK(!decode(std::string("\x08") + std::string(10, '\xFF') + "\x01", s)); // varint di 11 byte
+        CHECK(decode(std::string("\x08") + std::string(9, '\xFF') + "\x01", s));   // 10 byte: va bene
+        CHECK(!decode("\x0E\x01", s));                     // tipo 6: non esiste
+        CHECK(!decode("\x0F\x01", s));                     // tipo 7: non esiste
+        CHECK(!decode(std::string("\x00\x01", 2), s));     // campo 0
+        CHECK(!decode("\x1A\x05\x01", s));                 // lunghezza oltre la fine
+        CHECK(!decode("\x1A\xFF\xFF\xFF\xFF\x0F", s));     // lunghezza enorme
+        CHECK(!decode("\x1C", s));                         // fine di un gruppo mai aperto
+        CHECK(!decode("\x1B\x08\x01", s));                 // gruppo senza fine
+        CHECK(!decode("\x1B\x24", s));                     // gruppo 3 chiuso come 4
+        CHECK(!decode("\x15\x01\x02", s));                 // fixed32 a metà
+        CHECK(!decode("\x11\x01\x02\x03\x04\x05\x06\x07", s)); // fixed64 a metà
+        // Dentro un sotto-messaggio: la lunghezza esterna torna ma quella interna no.
+        CHECK(!decode(Pb().bytes(3, std::string("\x12\x09", 2) + "AEGS").b, s));
+        CHECK(!decode(Pb().msg(6, Pb().bytes(2, "\x08")).b, s)); // varint a metà nello stato dell'attore
+        CHECK(!decode(Pb().msg(4, Pb().bytes(5, "\x10")).b, s));  // contromisura a metà
+    }
+
+    section("enum");
+    {
+        auto gearOf = [](uint64_t v) {
+            ShipState s;
+            decode(Pb().msg(3, Pb().msg(2, Pb().msg(8, Pb().msg(1, Pb().always(2, v).always(3, v))))).b, s);
+            return s.gear;
+        };
+        CHECK(gearOf(0) == Deploy::Unknown);
+        CHECK(gearOf(1) == Deploy::Retracted);
+        CHECK(gearOf(2) == Deploy::Deploying);
+        CHECK(gearOf(3) == Deploy::Deployed);
+        CHECK(gearOf(4) == Deploy::Retracting);
+        CHECK(gearOf(5) == Deploy::Unknown);
+        CHECK(gearOf((uint64_t)-1) == Deploy::Unknown); // un enum negativo: varint da 10 byte
+        auto modeOf = [](uint64_t v) {
+            ShipState s;
+            decode(Pb().msg(3, Pb().msg(2, Pb().msg(12, Pb().always(1, v)))).b, s);
+            return s.masterMode;
+        };
+        CHECK(modeOf(0) == MasterMode::Unknown);
+        CHECK(modeOf(1) == MasterMode::Navigation);
+        CHECK(modeOf(2) == MasterMode::Scm);
+        CHECK(modeOf(3) == MasterMode::Stealth);
+        CHECK(modeOf(4) == MasterMode::Unknown);
+        auto actorOf = [](uint64_t loc, uint64_t role) {
+            ShipState s;
+            decode(Pb().msg(6, Pb().msg(2, Pb().always(1, loc).always(2, role))).b, s);
+            return s;
+        };
+        CHECK(actorOf(0, 0).locomotion == Locomotion::Unknown && actorOf(0, 0).crewRole == CrewRole::Unknown);
+        CHECK(actorOf(1, 1).locomotion == Locomotion::OnFoot && actorOf(1, 1).crewRole == CrewRole::Pilot);
+        CHECK(actorOf(2, 2).locomotion == Locomotion::Eva && actorOf(2, 2).crewRole == CrewRole::Gunner);
+        CHECK(actorOf(3, 3).locomotion == Locomotion::Seated && actorOf(3, 3).crewRole == CrewRole::Crew);
+        CHECK(actorOf(9, 9).locomotion == Locomotion::Unknown && actorOf(9, 9).crewRole == CrewRole::Unknown);
+    }
+
+    section("armi, contromisure, aUEC");
+    {
+        ShipState s;
+        // Armi senza contromisure: -1 (non arrivate). Due armi su quattro alimentate.
+        Pb w;
+        w.msg(4, Pb().flag(2, true)).msg(4, Pb()).msg(4, Pb().flag(2, true)).msg(4, Pb().flag(3, true));
+        CHECK(decode(Pb().msg(4, w).b, s));
+        CHECK(s.hasWeapons && !s.gimbalsLocked);
+        CHECK_EQ(s.weaponCount, 4);
+        CHECK_EQ(s.weaponsPowered, 2);
+        CHECK_EQ(s.decoys, -1);
+        CHECK_EQ(s.noise, -1);
+        // Il primo frame in nave: DECOY con quantità 0 (non scritta) -> 0; NOISE non c'è -> -1.
+        CHECK(decode(Pb().msg(4, Pb().msg(5, Pb().varint(1, 1))).b, s));
+        CHECK_EQ(s.decoys, 0);
+        CHECK_EQ(s.noise, -1);
+        // Due lanciatori dello stesso tipo si sommano; un tipo sconosciuto (o UNSPECIFIED) si ignora.
+        CHECK(decode(Pb().msg(4, Pb().msg(5, Pb().varint(1, 2).varint(2, 3)).msg(5, Pb().varint(1, 2).varint(2, 4)).msg(5, Pb().varint(2, 9)).msg(5, Pb().varint(1, 7).varint(2, 9))).b, s));
+        CHECK_EQ(s.decoys, -1);
+        CHECK_EQ(s.noise, 7);
+        // Armi presenti ma vuote: zero armi.
+        CHECK(decode(Pb().msg(4, Pb()).b, s));
+        CHECK(s.hasWeapons);
+        CHECK_EQ(s.weaponCount, 0);
+        // uec_balance è int64: anche oltre i 4 miliardi, e negativo (varint da 10 byte).
+        CHECK(decode(Pb().msg(6, Pb().msg(2, Pb().varint(4, 5000000000ull))).b, s));
+        CHECK_EQ(s.uec, 5000000000LL);
+        CHECK(decode(Pb().msg(6, Pb().msg(2, Pb().varint(4, (uint64_t)-25))).b, s));
+        CHECK_EQ(s.uec, -25LL);
+    }
+
+    section("HPACK della richiesta");
+    {
+        // Letterale senza indicizzazione, nome nuovo: 0x00, lunghezza del nome, nome, lunghezza del valore, valore.
+        auto lit = [](const std::string& name, const std::string& value) {
+            return std::string(1, '\0') + (char)name.size() + name + (char)value.size() + value;
+        };
+        const std::string want = lit(":method", "POST") + lit(":scheme", "http") + lit(":path", "/sc.game.telemetry.v1.GameTelemetryService/TelemetryStream") +
+                                 lit(":authority", "127.0.0.1:2942") + lit("content-type", "application/grpc") + lit("te", "trailers");
+        CHECK(detail::requestHeaderBlock(2942) == want);
+        CHECK(detail::requestHeaderBlock(29420).find(lit(":authority", "127.0.0.1:29420")) != std::string::npos);
+        for (unsigned char c : detail::requestHeaderBlock(2942))
+            if (c >= 0x80) { // niente Huffman (bit alto delle lunghezze) e niente byte strani
+                CHECK(false);
+                break;
+            }
+    }
+
+    section("apertura HTTP/2");
+    {
+        const std::string open = detail::clientOpening(2942);
+        const std::string preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        CHECK(open.compare(0, preface.size(), preface) == 0);
+        const auto frames = h2Frames(open, preface.size());
+        CHECK_EQ(frames.size(), (size_t)4);
+        if (frames.size() == 4) {
+            // SETTINGS: ENABLE_PUSH = 0 e INITIAL_WINDOW_SIZE grande.
+            CHECK(frames[0].type == 4 && frames[0].stream == 0 && frames[0].flags == 0 && frames[0].payload.size() % 6 == 0);
+            uint32_t push = 99, window = 0;
+            for (size_t i = 0; i + 6 <= frames[0].payload.size(); i += 6) {
+                const int id = ((uint8_t)frames[0].payload[i] << 8) | (uint8_t)frames[0].payload[i + 1];
+                if (id == 2) push = be32(frames[0].payload, i + 2);
+                if (id == 4) window = be32(frames[0].payload, i + 2);
+            }
+            CHECK_EQ(push, 0u);
+            CHECK(window >= (1u << 20));
+            // WINDOW_UPDATE della connessione: porta anche lei la finestra a quella degli stream.
+            CHECK(frames[1].type == 8 && frames[1].stream == 0 && frames[1].payload.size() == 4);
+            CHECK_EQ(be32(frames[1].payload, 0) + 65535u, window);
+            // HEADERS sullo stream 1, intero (END_HEADERS), senza END_STREAM.
+            CHECK(frames[2].type == 1 && frames[2].stream == 1 && frames[2].flags == 0x4);
+            CHECK(frames[2].payload == detail::requestHeaderBlock(2942));
+            // DATA: il messaggio gRPC vuoto, e la richiesta finisce (END_STREAM).
+            CHECK(frames[3].type == 0 && frames[3].stream == 1 && frames[3].flags == 0x1);
+            CHECK(frames[3].payload == std::string(5, '\0'));
+        }
+    }
+
+    section("riassemblaggio gRPC");
+    {
+        const std::string frame = gladiusFrame();
+        const std::string stream = grpcMessage(frame) + grpcMessage("") + grpcMessage("zzz", 1) + grpcMessage(std::string(50, 'x')) + grpcMessage("ab");
+        // A pezzi di tutte le misure, anche un byte alla volta: sempre gli stessi messaggi.
+        int wrong = 0;
+        for (size_t piece : { (size_t)1, (size_t)2, (size_t)3, (size_t)5, (size_t)7, (size_t)64, (size_t)1000, stream.size() }) {
+            detail::GrpcReassembler g;
+            g.maxMessage = 40; // la Gladius e il messaggio da 50 sono "troppo grandi": saltati
+            std::vector<std::string> got;
+            for (size_t i = 0; i < stream.size(); i += piece)
+                g.feed((const uint8_t*)stream.data() + i, std::min(piece, stream.size() - i), got);
+            if (!(got.size() == 2 && got[0].empty() && got[1] == "ab" && g.skipped() == 3 && !g.midMessage())) wrong++;
+        }
+        CHECK_EQ(wrong, 0);
+        detail::GrpcReassembler g;
+        std::vector<std::string> got;
+        for (size_t i = 0; i < stream.size(); i += 3) g.feed((const uint8_t*)stream.data() + i, std::min<size_t>(3, stream.size() - i), got);
+        CHECK_EQ(got.size(), (size_t)4);
+        CHECK_EQ(g.skipped(), 1); // solo il compresso
+        if (got.size() == 4) {
+            CHECK(got[0] == frame);
+            CHECK(got[1].empty());
+            CHECK(got[2] == std::string(50, 'x'));
+            CHECK(got[3] == "ab");
+        }
+        // A metà di un messaggio lo sa.
+        detail::GrpcReassembler half;
+        std::vector<std::string> none;
+        half.feed((const uint8_t*)stream.data(), 7, none);
+        CHECK(none.empty() && half.midMessage());
+    }
+
+    section("HTTP/2 in arrivo: SETTINGS, PING, DATA a pezzi");
+    {
+        using detail::Http2Receiver;
+        Http2Receiver rx;
+        // SETTINGS del server -> ACK; il suo ACK ai nostri -> niente.
+        CHECK(feed(rx, h2(4, 0, 0, std::string("\x00\x03\x00\x00\x00\x64\x00\x05\x00\x00\x40\x00", 12)) + h2(4, 1, 0, "")));
+        auto out = h2Frames(rx.reply);
+        CHECK(out.size() == 1 && out[0].type == 4 && out[0].flags == 1 && out[0].payload.empty() && out[0].stream == 0);
+        rx.reply.clear();
+        // PING -> PING con ACK e gli stessi 8 byte; un PING che è già un ACK -> niente.
+        CHECK(feed(rx, h2(6, 0, 0, "12345678") + h2(6, 1, 0, "abcdefgh")));
+        out = h2Frames(rx.reply);
+        CHECK(out.size() == 1 && out[0].type == 6 && out[0].flags == 1 && out[0].payload == "12345678");
+        rx.reply.clear();
+        // Le intestazioni della risposta (PADDED + PRIORITY, divise in HEADERS + CONTINUATION): ignorate.
+        CHECK(feed(rx, h2(1, 0x8 | 0x20, 1, "\x02\x00\x00\x00\x00\x10\x88\x5f\x00\x00"s) + h2(9, 0x4, 1, "\x40\x01")));
+        CHECK(rx.reply.empty() && rx.messages.empty());
+        // Un messaggio (la Gladius) spezzato su tre DATA, il secondo con riempimento, dati un byte alla volta.
+        const std::string message = grpcMessage(gladiusFrame());
+        const size_t a = 100, b = 400;
+        const std::string padded = std::string(1, (char)10) + message.substr(a, b - a) + std::string(10, '\0');
+        const std::string wire = h2(0, 0, 1, message.substr(0, a)) + h2(0, 0x8, 1, padded) + h2(0, 0, 1, message.substr(b));
+        bool open = true;
+        for (char c : wire) open = open && rx.feed((const uint8_t*)&c, 1);
+        CHECK(open);
+        CHECK_EQ(rx.messages.size(), (size_t)1);
+        if (rx.messages.size() == 1) {
+            ShipState s;
+            CHECK(decode(rx.messages[0], s));
+            CHECK_STR(s.className, "AEGS_Gladius");
+        }
+        // La finestra: tornano indietro tutti i byte dei DATA, riempimento compreso, per stream e connessione.
+        const uint64_t dataBytes = message.size() + 1 + 10;
+        CHECK_EQ(windowCredit(rx.reply, 0), dataBytes);
+        CHECK_EQ(windowCredit(rx.reply, 1), dataBytes);
+        rx.messages.clear();
+        rx.reply.clear();
+        // Due messaggi nello stesso DATA, e uno compresso (saltato) in mezzo.
+        CHECK(feed(rx, h2(0, 0, 1, grpcMessage("uno") + grpcMessage("x", 1) + grpcMessage("due"))));
+        CHECK(rx.messages.size() == 2 && rx.messages[0] == "uno" && rx.messages[1] == "due");
+        CHECK_EQ(rx.skippedMessages(), 1);
+        // Tipi sconosciuti, PRIORITY e WINDOW_UPDATE: ignorati.
+        CHECK(feed(rx, h2(0xFA, 0xFF, 7, "boh") + h2(2, 0, 1, "\x80\x00\x00\x00\x10"s) + h2(8, 0, 0, "\x00\x00\x10\x00"s)));
+        // DATA vuoto: nessun WINDOW_UPDATE (un incremento 0 sarebbe un errore).
+        rx.reply.clear();
+        CHECK(feed(rx, h2(0, 0, 1, "")));
+        CHECK(rx.reply.empty());
+    }
+
+    section("HTTP/2 in arrivo: fine del flusso ed errori");
+    {
+        using detail::Http2Receiver;
+        const std::string msg = grpcMessage("ciao");
+        auto closes = [](const std::string& bytes, size_t wantMessages = 0) {
+            Http2Receiver rx;
+            const bool open = feed(rx, bytes);
+            const bool ok = !open && !rx.closeReason.empty() && rx.messages.size() == wantMessages && !feed(rx, std::string(9, '\0'));
+            return ok;
+        };
+        CHECK(closes(h2(0, 0x1, 1, msg), 1));                                  // DATA con END_STREAM: il messaggio arriva lo stesso
+        CHECK(closes(h2(0, 0, 1, msg) + h2(1, 0x5, 1, "\x00\x01\x41\x01\x42"s), 1)); // trailer (grpc-status) con END_STREAM
+        CHECK(closes(h2(1, 0x1, 1, "\x88") + h2(9, 0x4, 1, "\x40")));           // trailer diviso: si chiude a END_HEADERS
+        CHECK(closes(h2(3, 0, 1, std::string("\x00\x00\x00\x08", 4))));           // RST_STREAM (CANCEL)
+        CHECK(closes(h2(7, 0, 0, std::string("\x00\x00\x00\x01\x00\x00\x00\x00", 8)))); // GOAWAY
+        CHECK(closes(h2(0, 0, 1, std::string(16385, 'x'))));                    // oltre la dimensione massima del frame
+        CHECK(closes(std::string("\x00\x40\x01\x00\x00\x00\x00\x00\x01", 9)));  // ...anche solo dall'intestazione
+        CHECK(closes(h2(0, 0x8, 1, std::string("\x05") + "abcd")));              // riempimento più lungo del frame
+        CHECK(closes(h2(1, 0x8 | 0x4, 1, std::string("\x09") + "abc")));         // idem in HEADERS
+        CHECK(closes(h2(1, 0x20 | 0x4, 1, "abc")));                             // PRIORITY più corta di 5 byte
+        CHECK(closes(h2(0, 0, 0, msg)));                                        // DATA sullo stream 0
+        CHECK(closes(h2(5, 0x4, 1, std::string("\x00\x00\x00\x02", 4))));        // PUSH_PROMISE col push spento
+        CHECK(closes(h2(1, 0, 1, "\x88") + h2(0, 0, 1, msg)));                   // HEADERS senza CONTINUATION
+        CHECK(closes(h2(9, 0x4, 1, "\x88")));                                   // CONTINUATION senza HEADERS
+        CHECK(closes(h2(6, 0, 0, "1234")));                                     // PING corto
+        CHECK(closes(h2(4, 0, 0, "12345")));                                    // SETTINGS non multiplo di 6
+        CHECK(closes(std::string("HTTP/1.1 400 Bad Request\r\n\r\n")));         // non è HTTP/2
+        // Le intestazioni normali (senza END_STREAM) e un RST_STREAM di un altro stream non chiudono.
+        Http2Receiver rx;
+        CHECK(feed(rx, h2(1, 0x4, 1, "\x88") + h2(3, 0, 3, std::string("\x00\x00\x00\x08", 4)) + h2(0, 0, 1, msg)));
+        CHECK_EQ(rx.messages.size(), (size_t)1);
+    }
+
+    section("frame congelati (menu)");
+    {
+        detail::FreezeWatch w(2000);
+        CHECK(!w.frozen());
+        // In volo i frame cambiano sempre: mai congelato.
+        for (int i = 0; i < 100; ++i) w.add("frame " + std::to_string(i), i * 50);
+        CHECK(!w.frozen());
+        // Al menu lo stesso frame, byte per byte: dopo 2 s non vale più.
+        for (int t = 5000; t < 7000; t += 50) w.add("menu", t);
+        CHECK(!w.frozen()); // 1,95 s
+        w.add("menu", 7000);
+        CHECK(w.frozen());
+        w.add("menu", 9000);
+        CHECK(w.frozen());
+        // Il primo frame diverso (la partita dopo) sblocca subito.
+        w.add("in gioco", 9050);
+        CHECK(!w.frozen());
+        // Identici per 1 s (in gioco capita): ancora buono.
+        for (int t = 9100; t <= 10050; t += 50) w.add("in gioco", t);
+        CHECK(!w.frozen());
+        w.reset();
+        CHECK(!w.frozen());
+        w.add("x", 0);
+        w.add("x", 1999);
+        CHECK(!w.frozen());
+    }
+
+    section("client fermo");
+    {
+        Client c; // senza start(): niente rete, niente thread
+        CHECK(!c.running());
+        CHECK(!c.connected());
+        CHECK(!c.current().has_value());
+        CHECK_EQ(c.frameCount(), (uint64_t)0);
+        CHECK_STR(c.statusText(), "Non attiva");
+        c.stop(); // fermare un client mai partito non fa niente
+        CHECK(!c.running());
+    }
+}
+
+// iris_tests --telemetria [porta] [secondi]: si collega al gioco (o a un server finto) e stampa lo
+// stato letto, secondo per secondo. Solo lettura.
+static int telemetryMode(int argc, char** argv) {
+    const int port = argc > 2 ? std::atoi(argv[2]) : 2942;
+    const int seconds = argc > 3 ? std::atoi(argv[3]) : 10;
+    std::printf("Telemetria di Star Citizen da 127.0.0.1:%d per %d s (solo lettura)\n", port, seconds);
+    ScTelemetry::Client client;
+    client.start(port);
+    for (int i = 1; i <= seconds; ++i) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::printf("[%3d s] %s | frame %llu%s\n", i, client.statusText().c_str(), (unsigned long long)client.frameCount(),
+                    client.connected() ? "" : " | non collegata");
+        if (const auto s = client.current()) std::printf("%s", telemetry_test::describe(*s).c_str());
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    client.stop();
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("stop() in %lld ms\n", ms);
+    return client.frameCount() > 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0); // se una prova si schianta, quello che è già scritto resta
@@ -3395,6 +4601,7 @@ int main(int argc, char** argv) {
     FakeHost host;
     Tools tools(host);
 
+    if (mode == "--telemetria") return telemetryMode(argc, argv);
     if (mode == "--mining" && !arg.empty()) {
         // iris_tests --mining "2 16,960" : cosa capisce la decodifica da un testo dell'OCR (o un numero).
         const auto d = Mining::decodeText(arg, Mining::defaultMaterials());
@@ -4130,8 +5337,11 @@ int main(int argc, char** argv) {
             std::printf("Modelli non caricati\n");
             return 1;
         }
+        bool blocksOk = true;
         {
-            // Diagnosi: le probabilità a blocchi da 512 (come nel programma) e tutte insieme.
+            // Diagnosi: le probabilità a blocchi da 512 (come nel programma, subito dopo il
+            // caricamento, senza reset) e tutte insieme. Se a blocchi non sente niente
+            // mentre tutto insieme sì, Iris non si sveglia col nome: la prova fallisce.
             std::vector<float> one, all;
             float maxOne = 0.0f, maxAll = 0.0f;
             int overOne = 0, overAll = 0;
@@ -4150,6 +5360,8 @@ int main(int argc, char** argv) {
             }
             std::printf("Silero a blocchi: max %.2f, %d blocchi sopra 0,5. Tutto insieme: max %.2f, %d blocchi sopra 0,5 (su %zu)\n", maxOne,
                         overOne, maxAll, overAll, all.size());
+            blocksOk = overOne * 2 >= overAll; // a blocchi deve sentire più o meno la stessa voce
+            if (!blocksOk) std::printf("SBAGLIA a blocchi Silero non sente la voce (stato dell'LSTM non azzerato?)\n");
             vad.reset();
             float peak = 0.0f;
             double sum = 0.0;
@@ -4182,7 +5394,7 @@ int main(int argc, char** argv) {
             index++;
         }
         std::printf("\n%zu frasi trovate su %zu, %d giuste\n", index, phrases.size(), ok);
-        return index == phrases.size() && ok == (int)phrases.size() ? 0 : 1;
+        return blocksOk && index == phrases.size() && ok == (int)phrases.size() ? 0 : 1;
     }
     if (mode == "--voce") {
         for (const auto& v : TtsEngine::voices()) std::printf("Voce installata: %s\n", v.c_str());
@@ -4222,9 +5434,11 @@ int main(int argc, char** argv) {
     testAxis();
     testGameLog();
     testCommandEditor();
+    testShipToggle();
     testWheel();
     testMiningLog();
     testInterfaceAndWindows();
+    testTelemetry();
     if (mode == "--completi") testFull();
 
     std::printf("\n%d controlli, %d falliti\n", g_checks, g_failures);

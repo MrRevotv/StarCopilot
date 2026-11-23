@@ -3,6 +3,7 @@
 #include "game_input.h"
 #include "log.h"
 #include "screen_ocr.h"
+#include "ship_toggle.h"
 #include "text_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -172,6 +173,13 @@ namespace {
         return out;
     }
 
+    // "Le armi sono già accese." -> "le armi sono già accese" (dentro una frase più lunga).
+    std::string sentenceInside(std::string s) {
+        while (!s.empty() && (s.back() == '.' || s.back() == ' ')) s.pop_back();
+        if (!s.empty() && s[0] >= 'A' && s[0] <= 'Z') s[0] = (char)(s[0] - 'A' + 'a');
+        return s;
+    }
+
     const std::vector<std::string> kRouteKeywords = { "rotta", "percorso", "route", "destinazione", "destination" };
     const std::vector<std::string> kCancelKeywords = { "annulla", "cancel", "clear" };
 }
@@ -302,32 +310,78 @@ bool GameController::gameInForeground() {
 }
 
 Cmd::Match GameController::match(const std::string& text) {
-    return Cmd::match(profile(), text);
+    const GameProfile p = profile();
+    Cmd::Match m = Cmd::match(p, text);
+    if (m.found) return m;
+    // "Allora spegnile!", "riaccendile", "alzali": l'ultimo interruttore usato (da poco), col verso detto
+    // adesso. Prima la frase finiva al modello, che a volte sceglieva un altro interruttore (gli scudi
+    // invece delle armi appena nominate).
+    const std::string heard = Cmd::applyCorrections(Cmd::normalize(text), p.corrections);
+    if (Cmd::polarity(heard) == 0 || !Cmd::hasPronounVerb(heard)) return m;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_hasLast || m_last.command.intent != "press" || Clock::now() - m_lastTime > std::chrono::minutes(3)) return m;
+    const auto key = m_last.command.args.find("key");
+    if (key == m_last.command.args.end() || ShipToggle::fieldFor(key->second) == ShipToggle::Field::None) return m;
+    Cmd::Match follow = m_last;
+    follow.found = true;
+    follow.score = 0.9;
+    follow.heard = heard; // il verso viene da qui ("spegnile" = spegni)
+    follow.slots.clear();
+    return follow;
 }
 
 GameController::Result GameController::execute(const Cmd::Match& match, const std::function<void(const std::string&)>& say,
                                                const std::atomic<bool>* cancel) {
+    return executeWith(match, {}, say, cancel);
+}
+
+GameController::Result GameController::executeWith(const Cmd::Match& match, const std::string& state,
+                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
     if (!match.found) return { false, "", "Non è un comando di gioco.", "" };
     if (match.command.intent == "repeat") {
         Cmd::Match last;
+        std::string lastState;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_hasLast) return { false, "Non ho niente da ripetere.", "Niente da ripetere.", "Niente da ripetere." };
             last = m_last;
+            lastState = m_lastState;
         }
-        return run(last.command, last.slots, say, cancel);
+        return run(last, lastState, say, cancel);
     }
-    Result r = run(match.command, match.slots, say, cancel);
+    Result r = run(match, state, say, cancel);
     if (r.ok && match.command.intent != "status" && match.command.intent != "toggle_dry_run") {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_last = match;
+        m_lastState = state;
+        m_lastTime = Clock::now();
         m_hasLast = true;
     }
     return r;
 }
 
+void GameController::setShipStateProvider(ShipStateProvider provider) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_shipState = std::move(provider);
+}
+
+std::optional<ScTelemetry::ShipState> GameController::shipState() {
+    ShipStateProvider provider;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        provider = m_shipState;
+    }
+    if (!provider) return std::nullopt;
+    try {
+        return provider();
+    } catch (...) {
+        return std::nullopt; // la telemetria non deve mai fermare un comando
+    }
+}
+
 GameController::Result GameController::executeById(const std::string& id, const std::string& destination,
-                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
+                                                   const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel,
+                                                   const std::string& state, const std::string& heard) {
     const GameProfile p = profile();
     Cmd::Match m;
     for (const auto& c : p.commands) {
@@ -349,7 +403,16 @@ GameController::Result GameController::executeById(const std::string& id, const 
         m.slots["destination"] = canonical.empty() ? TextUtils::trim(destination) : canonical;
     }
     m.score = 1.0;
-    return execute(m, say, cancel);
+    // Il verso: quello dato dal modello (state); se non c'è, dalla richiesta dell'utente, ma solo dal pezzo
+    // che parla di questo interruttore ("alza gli scudi, poi carrello": per il carrello niente verso).
+    auto key = m.command.args.find("key");
+    const ShipToggle::Field field = key == m.command.args.end() ? ShipToggle::Field::None : ShipToggle::fieldFor(key->second);
+    if (field != ShipToggle::Field::None) {
+        std::vector<std::string> parts = ShipToggle::clauses(heard);
+        for (auto& part : parts) part = Cmd::applyCorrections(part, p.corrections);
+        m.heard = ShipToggle::clauseAbout(field, parts);
+    }
+    return executeWith(m, state, say, cancel);
 }
 
 bool GameController::prepareGame(const GameProfile& p, HWND& window, std::string& why, std::string& brief) {
@@ -387,12 +450,13 @@ void GameController::pressLogical(const GameProfile& p, const std::string& logic
     note = combo;
 }
 
-GameController::Result GameController::run(const GameCommand& command, const std::map<std::string, std::string>& slots,
+GameController::Result GameController::run(const Cmd::Match& match, const std::string& state,
                                            const std::function<void(const std::string&)>& say, const std::atomic<bool>* cancel) {
+    const GameCommand& command = match.command;
     GameProfile p = profile();
     auto slotValue = [&](const char* name) {
-        auto it = slots.find(name);
-        return it == slots.end() ? std::string() : it->second;
+        auto it = match.slots.find(name);
+        return it == match.slots.end() ? std::string() : it->second;
     };
     const std::string destination = slotValue("destination");
     const std::string sayText = replaceAll(command.say, "{destination}", destination);
@@ -414,8 +478,77 @@ GameController::Result GameController::run(const GameCommand& command, const std
         return { true, st.text, st.text, !st.running ? "Gioco chiuso." : st.elevationProblem ? "Serve amministratore." : "Tutto pronto." };
     }
 
+    const std::string prefix = p.dryRun ? "[prova] " : "";
+
+    // La telemetria: com'è la nave prima di premere un tasto "interruttore" (vedi ship_toggle.h).
+    // Senza (nullopt) tutto resta come sempre.
+    using ShipToggle::Field;
+    using ShipToggle::Value;
+    auto wantFor = [&](Field f) {
+        int want = state.empty() ? 0 : ShipToggle::wantedFromState(f, state);
+        if (want == 0) want = ShipToggle::wanted(f, match.heard, match.phrase);
+        if (want == 0 && intent == "sequence") want = ShipToggle::commandDirection(f, command.phrases);
+        return want;
+    };
+    ShipToggle::Env env;
+    env.state = [this]() { return shipState(); };
+    env.press = [&](const std::string& logical, bool& ok) {
+        std::string n;
+        pressLogical(p, logical, n);
+        ok = n.find("nessun tasto") == std::string::npos;
+        return n;
+    };
+    env.wait = [&](int ms) {
+        if (cancelled(cancel)) return false;
+        Sleep(ms);
+        return !cancelled(cancel);
+    };
+    env.pause = [&]() { return stepPause(p, cancel); };
+    env.cancelled = [&]() { return cancelled(cancel); };
+    env.dryRun = p.dryRun;
+
+    Field toggleField = Field::None;
+    Value toggleNow = Value::Unknown;
+    ShipToggle::Plan togglePlan;
+    std::vector<std::string> steps;
+    bool sequenceWithState = false;
+    if (intent == "press") {
+        toggleField = ShipToggle::fieldFor(arg("key"));
+        if (toggleField != Field::None) {
+            if (const auto st = shipState()) toggleNow = ShipToggle::read(toggleField, *st);
+        }
+        if (toggleNow != Value::Unknown) {
+            togglePlan = ShipToggle::plan(toggleField, wantFor(toggleField), toggleNow);
+            if (!togglePlan.press) {
+                // Già come lo vuoi: niente tasto, e il gioco non serve davanti.
+                auto it = p.keys.find(arg("key"));
+                const std::string combo = it != p.keys.end() ? it->second : arg("key");
+                Log::info("Telemetria: " + togglePlan.spoken + " Non premo " + combo + " (" + arg("key") + ")");
+                Result r{ true, togglePlan.spoken, prefix + arg("key") + ": niente da premere, " + sentenceInside(togglePlan.spoken) + " (lo dice la telemetria)",
+                          togglePlan.brief };
+                addAction(r.shown);
+                return r;
+            }
+        }
+    } else if (intent == "sequence") {
+        steps = ShipToggle::splitSteps(arg("keys"));
+        if (const auto st = shipState()) {
+            for (const auto& step : steps) {
+                if (ShipToggle::read(ShipToggle::fieldFor(step), *st) != Value::Unknown) sequenceWithState = true;
+            }
+            if (sequenceWithState && ShipToggle::nothingToPress(steps, wantFor, *st)) {
+                // Tutto già a posto: niente tasti (la sequenza non ne preme nessuno).
+                const ShipToggle::Outcome o = ShipToggle::sequence(steps, wantFor, sayText, env);
+                Log::info("Telemetria: " + o.shown);
+                Result r{ o.ok, o.spoken, prefix + o.shown, o.brief };
+                addAction(r.shown);
+                return r;
+            }
+        }
+    }
+
     // Un messaggio in chat in corso finisce prima: i tasti non si mescolano.
-    std::lock_guard<std::recursive_mutex> keys(GameInput::inputLock());
+    std::unique_lock<std::recursive_mutex> keys(GameInput::inputLock());
     HWND window = nullptr;
     std::string why, whyBrief;
     if (!prepareGame(p, window, why, whyBrief)) {
@@ -423,7 +556,6 @@ GameController::Result GameController::run(const GameCommand& command, const std
         return { false, why, why, whyBrief };
     }
 
-    const std::string prefix = p.dryRun ? "[prova] " : "";
     std::string note;
     Result r;
     if (intent == "press") {
@@ -432,6 +564,25 @@ GameController::Result GameController::run(const GameCommand& command, const std
         r.shown = prefix + (r.ok ? arg("key") + " (" + note + ")" : note);
         r.spoken = r.ok ? sayText : "Non ho un tasto per " + arg("key") + " nel profilo.";
         if (!r.ok) r.brief = "Tasto mancante.";
+        if (r.ok && toggleNow != Value::Unknown) {
+            if (p.dryRun) {
+                // In prova non si preme niente: lo stato resta quello di prima.
+                r.shown += ", telemetria: " + ShipToggle::name(toggleField) + " " + ShipToggle::valueText(toggleField, toggleNow);
+            } else {
+                // Dopo il tasto: è cambiato davvero? Si risponde con lo stato nuovo. Intanto la tastiera è libera
+                // (un messaggio in chat non aspetta la verifica).
+                keys.unlock();
+                const ShipToggle::Outcome o = ShipToggle::afterPress(toggleField, togglePlan.target, note, env);
+                if (o.used) {
+                    r.ok = o.ok;
+                    r.spoken = o.spoken;
+                    r.brief = o.brief;
+                    r.shown += ", " + o.shown;
+                    if (o.ok) Log::info("Premuto " + note + " (" + arg("key") + "), " + o.shown);
+                    else Log::warn("Telemetria: " + o.spoken);
+                }
+            }
+        }
     } else if (intent == "hold") {
         const std::string logical = arg("key");
         auto it = p.keys.find(logical);
@@ -443,6 +594,16 @@ GameController::Result GameController::run(const GameCommand& command, const std
         r.shown = prefix + logical + " tenuto " + std::to_string(ms) + " ms (" + combo + ")";
         r.spoken = r.ok ? sayText : "Non ho un tasto per " + logical + ".";
         if (!r.ok) r.brief = "Tasto mancante.";
+    } else if (intent == "sequence" && sequenceWithState) {
+        // Con la telemetria: i passi già a posto si saltano, dopo l'alimentazione si aspetta la nave.
+        const ShipToggle::Outcome o = ShipToggle::sequence(steps, wantFor, sayText, env);
+        if (o.interrupted) return { false, "", "Sequenza interrotta." };
+        r.ok = o.ok;
+        r.spoken = o.spoken;
+        r.brief = o.brief;
+        r.shown = prefix + o.shown;
+        if (o.ok) Log::info("Telemetria, " + o.shown);
+        else Log::warn("Telemetria, " + o.shown);
     } else if (intent == "sequence") {
         std::string keys = arg("keys"), done;
         r.ok = true;
@@ -852,12 +1013,19 @@ std::string GameController::toolDefinition() {
                { "function",
                  { { "name", "game_command" },
                    { "description", "Run a command in " + p.name + " (the game is open): ship keys, set or cancel the route on the star map. "
-                                    "Call it once per action. Commands: " + list },
+                                    "Call it once per action. Switches (lights, weapons, shields, engines, power, landing_gear, decoupled, "
+                                    "cruise): Iris reads the ship state and does not press if it is already as wanted, so pass state when "
+                                    "the user says it. Commands: " + list },
                    { "parameters",
                      { { "type", "object" },
                        { "properties",
                          { { "command", { { "type", "string" }, { "enum", ids } } },
-                           { "destination", { { "type", "string" }, { "description", "only for set_route: the place, as said by the user" } } } } },
+                           { "destination", { { "type", "string" }, { "description", "only for set_route: the place, as said by the user" } } },
+                           { "state", { { "type", "string" },
+                                        { "enum", { "on", "off", "up", "down" } },
+                                        { "description", "only for switches, if the user said it: on/off (turn on/off, activate/deactivate); "
+                                                         "shields: up or down; landing_gear: down = lower/deploy it, up = raise/retract it; "
+                                                         "decoupled: on = decoupled mode, off = coupled mode. Omit it to just toggle." } } } } },
                        { "required", { "command" } } } } } } };
     return f.dump();
 }

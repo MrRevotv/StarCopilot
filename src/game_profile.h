@@ -71,7 +71,7 @@ struct GameProfile {
     // La versione dei predefiniti con cui il profilo è stato scritto: quando Iris aggiunge comandi,
     // frasi, tasti, luoghi o correzioni, i profili di prima li ricevono una volta (i tuoi restano).
     int defaultsVersion = 0;
-    static constexpr int kDefaultsVersion = 2;
+    static constexpr int kDefaultsVersion = 3; // 3: "accendi tutti i sistemi" e simili per "accendi tutto"
 
     // Il profilo predefinito di Star Citizen (tasti predefiniti del gioco, comandi in italiano).
     static GameProfile defaults();

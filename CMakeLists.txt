@@ -95,10 +95,12 @@ add_library(iris_core STATIC
     src/model_downloader.cpp
     src/ppocr.cpp
     src/refinery.cpp
+    src/sc_telemetry.cpp
     src/ocr_engine.cpp
     src/screen_capture.cpp
     src/screen_match.cpp
     src/screen_ocr.cpp
+    src/ship_toggle.cpp
     src/translation_prompt.cpp
     src/neural_voice.cpp
     src/speech_text.cpp

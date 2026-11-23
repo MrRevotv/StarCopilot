@@ -489,6 +489,11 @@ function renderGame(g) {
   $("#led-game").classList.toggle("on", !!g.running);
   $("#dry-run").checked = !!g.dryRun;
   $("#profile-error").textContent = g.profileError ? `Profilo non valido: ${g.profileError} (resta in uso quello di prima)` : "";
+  const tel = g.telemetry || {};
+  const telState = $("#telemetry-state");
+  telState.textContent = tel.text || "—";
+  telState.className = "telemetry-state " + (!tel.on ? "off" : tel.connected ? "ok" : "warn");
+  $(".telemetry-help").classList.toggle("hidden", !!tel.connected); // collegata: le righe per user.cfg non servono più
   const lines = [...g.actions];
   if (g.unrecognized.length) {
     lines.push(h("div", { class: "sep" }, "Frasi non capite dal profilo (passate al modello)"));
@@ -688,6 +693,7 @@ function wire() {
   form("#filter-form", (text) => { post({ a: "filterSave", tag: text }); return false; });
   form("#name-form", (text) => { post({ a: "set", k: "userName", v: text }); toast("Salvato."); return false; });
   $("#dry-run").addEventListener("change", (e) => post({ a: "dryRun", on: e.target.checked }));
+  $("#telemetry-copy").addEventListener("click", () => post({ a: "copy", text: $("#telemetry-cfg").textContent.trim().replace(/\n/g, "\r\n") }));
 
   // Mappa stellare
   const zones = ["Casella di ricerca (un punto)", "Zona dei risultati", "Pulsante Imposta rotta", "Pulsante Annulla (rotta attiva)"];

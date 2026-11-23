@@ -36,8 +36,8 @@ std::string Tools::describe(const std::string& name, const std::string& argument
     if (!a.is_object()) a = json::object();
     if (name == "remember") return "Me lo segno";
     if (name == "game_command") {
-        std::string what = argString(a, "command"), where = argString(a, "destination");
-        return "Star Citizen: " + what + (where.empty() ? "" : " " + where);
+        std::string what = argString(a, "command"), where = argString(a, "destination"), state = argString(a, "state");
+        return "Star Citizen: " + what + (where.empty() ? "" : " " + where) + (state.empty() ? "" : " (" + state + ")");
     }
     return "Uso lo strumento " + name;
 }

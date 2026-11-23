@@ -37,6 +37,9 @@ struct AppSettings {
     std::string llmModelFile;             // vuoto = Qwen2.5-7B-Instruct-Q4_K_M.gguf
     int gpuMemoryLimitMb = -1;            // -1 = senza limite, 0 = tutto sul processore
     bool gameEnabled = true;              // comandi di Star Citizen quando il gioco è aperto
+    // Legge lo stato della nave dalla telemetria del gioco (solo lettura, 127.0.0.1): "accendi le armi"
+    // con le armi già accese non le spegne. Va accesa anche nel gioco (user.cfg): vedi sc_telemetry.h.
+    bool gameTelemetryEnabled = true;
 
     // --- Overlay e finestra -------------------------------------------------------------
     bool overlayEnabled = true;
@@ -133,6 +136,10 @@ struct AppSettings {
 
     // Valori fuori misura (file modificato a mano o rovinato) tornano sensati.
     void sanitize();
+
+    // La voce neurale serve? Solo se Iris risponde a voce, con la voce neurale scelta e la scheda video
+    // permessa. Con le risposte a voce spente non si carica (e se c'è si scarica): 3 GB liberi per il gioco.
+    bool wantsNeuralVoice() const { return speechEnabled && voiceEngine == "neurale" && gpuMemoryLimitMb != 0; }
 
     // Prende le impostazioni della chat da quelle di Voice to Chat (il contenuto
     // del suo settings.cfg): lingue, tasti (i suoi "trigger" diventano chatTriggers),

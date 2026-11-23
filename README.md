@@ -43,6 +43,11 @@ parte come quella versione, viene scartata e non si reinstalla in cerchio.
 stessa libreria del modello di linguaggio. Circa 4 volte più veloce del parlato; il primo audio
 arriva quando la frase è pronta (le frasi lunghe a blocchi di 5,8 s). Usa 3 GB di memoria video
 (in tutto Iris ne usa circa 9). Si sceglie nella pagina *Ascolto e voce*, insieme all'uscita audio.
+Con *Iris risponde a voce* spento la voce neurale non si carica, e se c'è si scarica: i suoi 3 GB
+restano liberi per il gioco (whisper e il modello di linguaggio non si ricaricano). Riaccesa, si
+ricarica da sola e le frasi la aspettano. A voce spenta i comandi confermano solo con un suono (un
+*tic* se è andato tutto bene, una nota bassa se no), anche quelli decisi dal modello; il testo resta
+scritto nella conversazione.
 
 La voce è **sempre la stessa**: il modello "Base" imita una voce di riferimento (il codificatore di
 parlante del mmproj ne ricava il timbro, un x-vector) e i semi sono fissi (stesso testo = stesso
@@ -131,6 +136,19 @@ Il copilota della vecchia Iris (C#), rifatto dentro Iris e migliorato:
   scudi"; "chiudi" mai "apri", "annulla la rotta per X" mai "rotta per X".
 - **Amministratore**: se il gioco è avviato come amministratore e Iris no, Windows scarta i tasti
   senza errori: Iris lo controlla e lo dice.
+- **Stato della nave (telemetria del gioco)**: dalla 4.10.2 / 5.0 Star Citizen può mandare lo stato
+  della nave ai programmi dello stesso PC (127.0.0.1:2942, circa 20 volte al secondo). Iris lo legge
+  soltanto: prima di premere un tasto che fa avanti e indietro (luci, armi, scudi, motori,
+  alimentazione, carrello, disaccoppiato, cruise control) guarda com'è la nave. "Accendi le armi" con
+  le armi già accese non preme niente ("Le armi sono già accese."), "abbassa il carrello" mentre
+  scende non lo fa risalire. Dopo il tasto controlla che sia cambiato ("Armi spente.", oppure "Ho
+  premuto P, ma le armi risultano ancora accese."). "Prepara la nave" salta i passi già a posto e,
+  riaccesa l'alimentazione, aspetta che la nave si assesti. Va accesa nel gioco, in `user.cfg`
+  (cartella LIVE o PTU): `grpc.client.server.enabled = 1` e `server.game.telemetry.enabled = 1`;
+  Iris non modifica mai i file del gioco. Senza telemetria (gioco al menu, a piedi, spenta) i tasti si
+  premono come sempre. Interruttore *Leggi lo stato dal gioco* nella pagina Star Citizen, con lo
+  stato del collegamento. Il VTOL non si controlla (la telemetria lo dà sbagliato). Attenzione: con
+  la telemetria accesa il gioco accetta comandi anche da altri programmi del PC (Iris non li usa).
 - **Pagina Star Citizen**: stato, modalità prova (scrive cosa farebbe senza premere), prova di un
   comando scritto, calibrazione della mappa (Iris porta il gioco davanti, mouse sul punto + F8, un
   suono a ogni F8, poi torna lei davanti col risultato), "Leggi" per vedere cosa legge l'OCR in ogni
@@ -420,6 +438,7 @@ build\iris_tests.exe --ppocr                 PP-OCR contro l'OCR di Windows sui 
 | `game_input.*` | scancode, combinazioni, digitazione, mouse, primo piano, controllo amministratore |
 | `screen_ocr.*` | cattura + OCR di Windows con la posizione delle parole, immagini di controllo |
 | `game_controller.*` | esecuzione dei comandi, rotta sulla mappa con verifiche e nuovi tentativi, calibrazione |
+| `ship_toggle.*` | i tasti "interruttore" con la telemetria: verso della frase, già a posto o no, verifica dopo il tasto, sequenze (puro) |
 | `game_chat.*` | la chat di gioco (il motore di Voice to Chat): detta, traduzione, scrittura, lettura della chat degli altri |
 | `mining_decoder.*` | mining: tabella dei materiali, numeri dal testo dell'OCR (pulizia e correzioni), voce, numeri in lettere (puro) |
 | `mining_image.*` | mining: il preprocessore di `mining_ocr` in C++ (badge, icona, CLAHE, Otsu), BMP/PNG |

@@ -26,6 +26,11 @@ bool VoiceDetector::init(const std::string& modelPath, int threads) {
         Log::warn("Rilevatore di voce non caricato: uso il volume del microfono");
         return false;
     }
+    // La memoria dell'LSTM (h e c) whisper.cpp la alloca senza azzerarla: con lo sporco di
+    // prima Silero resta saturo e dà 0,35 a tutto (voce, silenzio), quindi nessuna frase
+    // parte e "Iris" non si sente più. whisper_vad_detect_speech la azzera a ogni chiamata;
+    // qui si usa la versione _no_reset (a blocchi), quindi la si azzera una volta adesso.
+    whisper_vad_reset_state(static_cast<whisper_vad_context*>(m_ctx));
     Log::info("Rilevatore di voce pronto (Silero, processore)");
     return true;
 }

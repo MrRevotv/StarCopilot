@@ -70,6 +70,30 @@ namespace {
                                                  "cancella", "cancellare", "elimina", "eliminare", "rimuovi", "off" };
         return w;
     }
+    // "spegnile", "riaccendilo", "alzali": il verbo senza il pronome attaccato e senza il "ri" davanti
+    // ("spegni", "accendi", "alza"). Vuoto se non è un verso conosciuto.
+    bool knownVerb(const std::string& x) { return onWords().count(x) > 0 || offWords().count(x) > 0; }
+
+    std::string verbWithoutRi(const std::string& x) {
+        if (knownVerb(x)) return x;
+        if (x.size() > 4 && x.compare(0, 2, "ri") == 0 && knownVerb(x.substr(2))) return x.substr(2); // "riaccendi"
+        return std::string();
+    }
+
+    bool endsWithClitic(const std::string& w) {
+        if (w.size() <= 5) return false; // "alla", "palle": troppo corte per essere verbo + pronome
+        for (const char* clitic : { "lo", "la", "li", "le", "ne" }) {
+            if (w.compare(w.size() - 2, 2, clitic) == 0) return true;
+        }
+        return false;
+    }
+
+    std::string verbOf(const std::string& w) {
+        const std::string v = verbWithoutRi(w);
+        if (!v.empty()) return v;
+        return endsWithClitic(w) ? verbWithoutRi(w.substr(0, w.size() - 2)) : std::string();
+    }
+
     const std::set<std::string>& articles() {
         static const std::set<std::string> w = { "il", "lo", "la", "i", "gli", "le", "l", "un", "uno", "una", "del", "dello", "della",
                                                  "dei", "degli", "delle", "al", "allo", "alla", "ai", "agli", "alle", "the", "a" };
@@ -80,7 +104,7 @@ namespace {
     std::string objectOf(const std::vector<std::string>& w) {
         std::string out;
         for (const auto& x : w) {
-            if (onWords().count(x) || offWords().count(x) || articles().count(x)) continue;
+            if (!verbOf(x).empty() || articles().count(x)) continue; // anche "spegnile", "riaccendi"
             out += (out.empty() ? "" : " ") + x;
         }
         return out;
@@ -89,7 +113,7 @@ namespace {
     // Prima di una parte fissa saltata non ci devono essere "non" o un verso contrario:
     // "annulla la rotta per Crusader" non è "rotta per Crusader".
     bool blocksSkip(const std::string& word) {
-        return word == "non" || word == "no" || offWords().count(word) > 0;
+        return word == "non" || word == "no" || offWords().count(verbOf(word)) > 0;
     }
 
     // Le cifre di un nome di luogo, anche dette a parole: "cru l uno" -> "1", "area diciotto" -> "18".
@@ -215,10 +239,18 @@ std::string resolveAlias(const GameProfile& profile, const std::string& slot, co
 int polarity(const std::string& normalized) {
     bool on = false, off = false;
     for (const auto& w : words(normalized)) {
-        on = on || onWords().count(w) > 0;
-        off = off || offWords().count(w) > 0;
+        const std::string v = verbOf(w); // anche "spegnile", "riaccendi", "alzali"
+        on = on || onWords().count(v) > 0;
+        off = off || offWords().count(v) > 0;
     }
     return on == off ? 0 : on ? 1 : -1;
+}
+
+bool hasPronounVerb(const std::string& normalized) {
+    for (const auto& w : words(normalized)) {
+        if (!knownVerb(w) && endsWithClitic(w) && !verbOf(w).empty()) return true;
+    }
+    return false;
 }
 
 namespace {
@@ -311,6 +343,7 @@ namespace {
         }
         if (bestCommand) best.command = *bestCommand;
         best.found = bestCommand && best.score >= profile.matchThreshold;
+        best.heard = norm;
         return best;
     }
 }

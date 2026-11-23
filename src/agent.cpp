@@ -194,6 +194,7 @@ void Agent::noteAction(const std::string& userText, const std::string& result) {
 
 Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const std::atomic<bool>* cancel, std::string& answer) {
     answer.clear();
+    m_unfulfilled = false;
     // Le azioni fatte senza il modello da quando gli si è parlato l'ultima volta, prima della domanda.
     std::string actions;
     for (const auto& a : m_actions) actions += (actions.empty() ? "" : "; ") + a;
@@ -237,11 +238,15 @@ Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const
         std::string output;
         size_t fed = 0; // caratteri di "output" già passati al divisore di frasi
         bool falseClaim = false;
+        // Anche dopo il richiamo dice "fatto" senza aver usato lo strumento ("Alimentazione, scudi, motori
+        // accesi." e la nave restava spenta): quella frase non si dice.
+        bool stillClaiming = false;
         auto feed = [&](size_t upTo) {
-            if (upTo <= fed || falseClaim) return;
+            if (upTo <= fed || falseClaim || stillClaiming) return;
             for (const auto& sentence : splitter.push(output.substr(fed, upTo - fed))) {
-                if (checkClaims && !toolOk && !retried && spokenSoFar.empty() && looksLikeActionClaim(sentence)) {
-                    falseClaim = true;
+                if (checkClaims && !toolOk && spokenSoFar.empty() && looksLikeActionClaim(sentence)) {
+                    if (retried) stillClaiming = true;
+                    else falseClaim = true;
                     break;
                 }
                 if (cb.onSentence) cb.onSentence(sentence);
@@ -291,7 +296,7 @@ Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const
                     (output.find("</tool_call>") != std::string::npos || ChatFormat::plainToolCallComplete(output, toolNames))) {
                     return false;
                 }
-                if (falseClaim) return false;
+                if (falseClaim || stillClaiming) return false;
                 // Il modello comincia a inventarsi il turno dopo ("<|im_start|>user..."): basta.
                 if (output.find("<|im_start|>") != std::string::npos) return false;
                 return !(cancel && cancel->load());
@@ -303,9 +308,25 @@ Agent::Result Agent::ask(const std::string& userText, const Callbacks& cb, const
             return Result::Cancelled;
         }
         if (r != LlmEngine::Result::Ok) return Result::Error;
-        if (!falseClaim && checkClaims && !toolOk && !retried && mode == Mode::Speak && spokenSoFar.empty()) {
+        if (!falseClaim && !stillClaiming && checkClaims && !toolOk && mode == Mode::Speak && spokenSoFar.empty() &&
+            looksLikeActionClaim(ChatFormat::cleanAnswer(output))) {
             // Risposta di una frase sola, senza punto: si controlla anche quella.
-            falseClaim = looksLikeActionClaim(ChatFormat::cleanAnswer(output));
+            if (retried) stillClaiming = true;
+            else falseClaim = true;
+        }
+        if (stillClaiming) {
+            Log::warn("Di nuovo \"fatto\" senza strumento, non lo dico: " + raw.substr(0, 200));
+            m_unfulfilled = true;
+            answer = usedTool ? "Non è andato: il comando non ha funzionato." : "Non l'ho fatto: non ho trovato il comando giusto.";
+            if (cb.onSentence) cb.onSentence(answer);
+            if (cb.onText) cb.onText(answer);
+            for (auto& m : turn) {
+                if (m.role == ChatFormat::Message::Role::Tool) m.content = shortened(m.content);
+            }
+            turn.push_back({ ChatFormat::Message::Role::Assistant, answer });
+            turn[0].content = userMessage;
+            m_history.push_back(std::move(turn));
+            return Result::Ok;
         }
         if (falseClaim) {
             Log::info("Detto \"fatto\" senza usare lo strumento, riprovo: " + raw.substr(0, 200));

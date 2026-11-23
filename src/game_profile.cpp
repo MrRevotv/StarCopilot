@@ -313,7 +313,10 @@ GameProfile GameProfile::defaults() {
         cmd("hold", { "alzati", "esci dal sedile", "lascia il sedile", "alzati dal posto di guida", "alzati dal sedile", "esci dal posto di guida",
                       "scendi dal sedile" },
             { { "key", "exit_seat" }, { "ms", "1200" } }),
-        cmd("sequence", { "prepara la nave", "accendi tutto", "check pre volo", "procedura di decollo" },
+        // "Accendi tutti i sistemi" finiva al modello, che diceva "acceso" senza premere niente: le frasi
+        // più comuni stanno qui (niente "accendi tutta la nave": è quasi "accendi la nave", l'alimentazione).
+        cmd("sequence", { "prepara la nave", "accendi tutto", "check pre volo", "procedura di decollo", "accendi tutti i sistemi",
+                          "attiva tutti i sistemi", "accendi tutte le cose della nave", "accendi tutto quanto", "accendi tutti i sistemi della nave" },
             { { "keys", "power,engines,shields,weapons" } }, "Accendo tutto."),
         cmd("quantum_travel", { "quantum", "salto quantico", "vai in quantum", "attiva il quantum", "avvia il salto" }, {}, "Salto quantico."),
         cmd("repeat", { "ancora", "di nuovo", "ripeti", "un'altra volta", "rifallo" }),

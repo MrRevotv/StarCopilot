@@ -12,6 +12,7 @@
 #include "llm_engine.h"
 #include "mining_scanner.h"
 #include "neural_voice.h"
+#include "sc_telemetry.h"
 #include "tools.h"
 #include "tts_engine.h"
 #include "voice_detector.h"
@@ -106,6 +107,9 @@ public:
     std::vector<std::string> memory() const;
     // I comandi di gioco (pagina Star Citizen: stato, prova, calibrazione).
     GameController& game() { return m_game; }
+    // La telemetria di Star Citizen (pagina Star Citizen): com'è il collegamento, in italiano.
+    std::string telemetryStatus() const;
+    bool telemetryConnected() const { return m_telemetry.connected(); }
     // Un comando di gioco scritto nella pagina Star Citizen (come se l'avessi detto).
     void testGameCommand(const std::string& text);
     // Un suono di conferma o di errore (es. F8 della calibrazione, mentre sei nel gioco).
@@ -155,6 +159,15 @@ private:
                      int total = 3);
     bool loadModels();
     void reloadModels();
+    // La voce neurale da sola (risposte a voce accese/spente, voce neurale o di Windows): si carica o si
+    // scarica in un thread suo, senza ricaricare whisper e il modello di linguaggio e senza fermare Iris.
+    void syncNeuralVoice();
+    // Con m_neuralMutex: carica o scarica secondo le impostazioni di adesso. starting = dall'avvio (stato
+    // "Carico la voce neurale..."). true se è cambiato qualcosa.
+    bool applyNeuralVoice(bool starting);
+    void updateGpuSummary();   // "Sulla scheda video: ..." (pagina e registro)
+    // La telemetria del gioco: il client acceso o spento secondo l'impostazione.
+    void applyTelemetry(const AppSettings& s);
     void openAudio(const std::vector<std::string>& deviceNames);
     // Ogni 2 secondi: periferica predefinita di Windows cambiata, microfono staccato e
     // ricollegato, cuffie nuove... si riapre da soli, senza riavviare il programma.
@@ -240,6 +253,7 @@ private:
     LlmEngine m_llm;
     GameChat m_chat{ m_whisper, m_llm };
     GameController m_game;
+    ScTelemetry::Client m_telemetry; // lo stato della nave dal gioco (solo lettura)
     MiningScanner m_mining;
     GameLog::Watcher m_gameLog;
     Refinery::Timers m_refinery;
@@ -256,6 +270,13 @@ private:
     std::atomic<bool> m_startupRunning{ false };
     int m_loadedGpuLimitMb = -2;
     std::string m_loadedModelFile = "\x01";
+    // La voce neurale si carica e si scarica da due parti (avvio/ricarica dei modelli e syncNeuralVoice):
+    // una alla volta, ognuna con le impostazioni di quel momento.
+    std::mutex m_neuralMutex;
+    std::thread m_voiceThread;
+    std::atomic<bool> m_voiceSyncRunning{ false };
+    std::atomic<bool> m_voiceSyncPending{ false };
+    std::atomic<bool> m_rebalanceLlm{ false }; // ricaricare il cervello: la voce neurale arriva o va, con un limite di memoria
 
     // Ascolto
     std::thread m_listenThread;
@@ -290,5 +311,10 @@ private:
     std::atomic<bool> m_warmQueued{ false };
     std::atomic<bool> m_busy{ false };
     std::atomic<bool> m_cancel{ false };
+    // La richiesta che il modello sta seguendo, e i comandi di gioco che ha dato (solo il thread di lavoro):
+    // il verso di un interruttore se il modello non lo dice; il suono di conferma con la voce spenta.
+    std::string m_requestText;
+    int m_requestGameCommands = 0;
+    bool m_requestGameFailed = false;
     Clock::time_point m_lastInteraction = Clock::now();
 };

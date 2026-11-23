@@ -256,6 +256,7 @@ void WebBridge::sendSettings() {
     // Cervello, sfera, aggiornamenti
     j["gpuMemoryLimitMb"] = s.gpuMemoryLimitMb;
     j["gameEnabled"] = s.gameEnabled;
+    j["gameTelemetryEnabled"] = s.gameTelemetryEnabled;
     j["overlayEnabled"] = s.overlayEnabled;
     j["overlayOpacity"] = s.overlayOpacity;
     j["overlaySize"] = s.overlaySize;
@@ -438,7 +439,11 @@ void WebBridge::sendGame() {
                { "dryRun", game.profile().dryRun },
                { "profileError", game.profileError() },
                { "actions", game.recentActions() },
-               { "unrecognized", game.unrecognized() } };
+               { "unrecognized", game.unrecognized() },
+               // La telemetria del gioco: accesa o no, collegata o no, a parole.
+               { "telemetry", { { "on", m_engine.settings().gameTelemetryEnabled },
+                                { "connected", m_engine.telemetryConnected() },
+                                { "text", m_engine.telemetryStatus() } } } };
     const std::string text = dump(j);
     if (text == m_lastGame) return;
     m_lastGame = text;
@@ -487,7 +492,10 @@ void WebBridge::onEngineEvent(int event) {
         sendChatNotice();
         break;
     case Assistant::Event::Conversation: sendConversation(); break;
-    case Assistant::Event::Settings: sendSettings(); break;
+    case Assistant::Event::Settings:
+        sendSettings();
+        if (m_page == "game") sendGame(); // la telemetria accesa o spenta si vede subito
+        break;
     case Assistant::Event::Heard: sendStatus(); break;
     case Assistant::Event::ChatHistory:
         sendChatHistory();
@@ -595,6 +603,7 @@ void WebBridge::setSetting(const std::string& key, const void* valuePtr) {
                  { "wakeWordEnabled", &AppSettings::wakeWordEnabled },
                  { "speechEnabled", &AppSettings::speechEnabled },
                  { "gameEnabled", &AppSettings::gameEnabled },
+                 { "gameTelemetryEnabled", &AppSettings::gameTelemetryEnabled },
                  { "overlayEnabled", &AppSettings::overlayEnabled },
                  { "autoUpdate", &AppSettings::autoUpdate },
                  { "chatEnabled", &AppSettings::chatEnabled },

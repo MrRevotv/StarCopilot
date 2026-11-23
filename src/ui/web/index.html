@@ -98,6 +98,15 @@
           <div class="callout" id="game-status">—</div>
           <div class="row"><div class="row-text"><b>Comandi di gioco attivi</b><small>Quando Star Citizen è aperto, Iris preme i tasti per te.</small></div><label class="switch"><input type="checkbox" data-set="gameEnabled"><i></i></label></div>
           <div class="row"><div class="row-text"><b>Modalità prova</b><small>Scrive cosa farebbe, senza premere tasti.</small></div><label class="switch"><input type="checkbox" id="dry-run"><i></i></label></div>
+          <div class="row"><div class="row-text"><b>Leggi lo stato dal gioco</b><small>Prima di premere guarda com'è la nave: «accendi le armi» con le armi già accese non le spegne.</small><small class="telemetry-state" id="telemetry-state">—</small></div><label class="switch"><input type="checkbox" data-set="gameTelemetryEnabled"><i></i></label></div>
+          <div class="telemetry-help">
+            <p class="note first">La telemetria va accesa nel gioco: aggiungi queste due righe al file <code>user.cfg</code> nella cartella di Star Citizen (LIVE o PTU) e riavvia il gioco. Iris la legge soltanto e non modifica mai i file del gioco. Attenzione: con queste righe il gioco accetta comandi anche da altri programmi del PC.</p>
+            <div class="telemetry-cfg">
+              <pre class="readout small" id="telemetry-cfg">grpc.client.server.enabled = 1
+server.game.telemetry.enabled = 1</pre>
+              <button class="btn small" type="button" id="telemetry-copy">Copia le righe</button>
+            </div>
+          </div>
           <div class="btn-row">
             <button class="btn" data-action="openProfile">Modifica il profilo a mano</button>
             <button class="btn" data-action="gameReload">Ricarica</button>
